@@ -11,8 +11,10 @@
 #include <QRegularExpression>
 #include <cstdio>
 #include <QPushButton>
+#include <QScrollBar>
 #include <QTimer>
 #include <QTranslator>
+#include <QTreeWidget>
 
 int main(int argc, char* argv[]) {
 	QApplication a(argc, argv);
@@ -73,6 +75,41 @@ int main(int argc, char* argv[]) {
 			state.insert(QStringLiteral("graphics_summary"), summary ? summary->text() : QString());
 			state.insert(QStringLiteral("width"), w.width());
 			state.insert(QStringLiteral("height"), w.height());
+			// Preview-only geometry makes clipping at the supported minimum size reviewable.
+			const auto widget_geometry = [&w](const QWidget* widget) {
+				QJsonObject geometry;
+				geometry.insert(QStringLiteral("exists"), widget != nullptr);
+				if (widget == nullptr) {
+					return geometry;
+				}
+				const QRect bounds(widget->mapTo(&w, QPoint(0, 0)), widget->size());
+				QRect visible_bounds = bounds.intersected(w.rect());
+				for (const QWidget* parent = widget->parentWidget(); parent != nullptr && parent != &w;
+				     parent = parent->parentWidget()) {
+					visible_bounds = visible_bounds.intersected(
+					    QRect(parent->mapTo(&w, QPoint(0, 0)), parent->size()));
+				}
+				geometry.insert(QStringLiteral("x"), bounds.x());
+				geometry.insert(QStringLiteral("y"), bounds.y());
+				geometry.insert(QStringLiteral("width"), bounds.width());
+				geometry.insert(QStringLiteral("height"), bounds.height());
+				geometry.insert(QStringLiteral("visible"), widget->isVisibleTo(&w));
+				geometry.insert(QStringLiteral("within_ancestor_bounds"), visible_bounds == bounds);
+				return geometry;
+			};
+			state.insert(QStringLiteral("start_button_geometry"),
+			             widget_geometry(w.findChild<QPushButton*>(QStringLiteral("gt7_start_button"))));
+			const auto* game_list = w.findChild<QTreeWidget*>(QStringLiteral("cfgs_list"));
+			state.insert(QStringLiteral("game_list_geometry"), widget_geometry(game_list));
+			if (game_list != nullptr) {
+				state.insert(QStringLiteral("game_list_viewport_geometry"),
+				             widget_geometry(game_list->viewport()));
+				const auto* horizontal_scrollbar = game_list->horizontalScrollBar();
+				auto scrollbar = widget_geometry(horizontal_scrollbar);
+				scrollbar.insert(QStringLiteral("minimum"), horizontal_scrollbar->minimum());
+				scrollbar.insert(QStringLiteral("maximum"), horizontal_scrollbar->maximum());
+				state.insert(QStringLiteral("game_list_horizontal_scrollbar"), scrollbar);
+			}
 			const auto* checkbox = w.findChild<QCheckBox*>(QStringLiteral("gt7_dlss_checkbox"));
 			state.insert(QStringLiteral("dlss_checked"), checkbox != nullptr && checkbox->isChecked());
 			state.insert(QStringLiteral("vr_entry_present"),

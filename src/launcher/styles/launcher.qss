@@ -23,7 +23,7 @@ QPushButton:hover { background: #333c4c; border-color: #78869d; }
 QPushButton:pressed { background: #151b26; }
 QPushButton:focus { border-color: #ef6578; }
 QPushButton:disabled { color: #707c8e; background: #1b222d; border-color: #333c4b; }
-QPushButton#gt7_start_button { background: #cc2038; color: #ffffff; border: 1px solid #f24c61; font-weight: 700; font-size: 14px; padding: 3px 18px; }
+QPushButton#gt7_start_button { background: #cc2038; color: #ffffff; border: 1px solid #f24c61; font-weight: 700; font-size: 14px; padding: 3px 18px; min-height: 44px; }
 QPushButton#gt7_start_button:hover { background: #e9324b; }
 QPushButton#gt7_start_button:pressed { background: #ad152a; }
 QPushButton#gt7_start_button:disabled { color: #b9838c; background: #58222e; border-color: #78333f; }

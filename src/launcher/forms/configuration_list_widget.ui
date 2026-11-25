@@ -246,6 +246,18 @@
        </item>
        <item>
         <widget class="GameListTreeWidget" name="cfgs_list">
+         <property name="sizePolicy">
+          <sizepolicy hsizetype="Expanding" vsizetype="Ignored">
+           <horstretch>0</horstretch>
+           <verstretch>1</verstretch>
+          </sizepolicy>
+         </property>
+         <property name="minimumSize">
+          <size>
+           <width>0</width>
+           <height>90</height>
+          </size>
+         </property>
          <property name="rootIsDecorated">
           <bool>false</bool>
          </property>

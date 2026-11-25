@@ -23,6 +23,14 @@ constexpr size_t   SectionRing  = 512;
 constexpr uint64_t MaxOwnRows   = 48; // this timeline's command buffers in one report
 constexpr uint64_t MaxOtherRows = 12; // another timeline's
 
+bool PlaytestDiagnostics() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GT7_PERF_DIAGNOSTICS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 uint64_t ThresholdNs() {
 	static const uint64_t ns = [] {
 		const char* value = std::getenv("KYTY_STALL_MS");
@@ -156,6 +164,7 @@ void UpdateMemoryText(const GraphicContext& graphics) {
 	          "{:.1f} GB)",
         gb(graphics.GetDeviceMemoryUsage()), gb(graphics.GetRawMemoryBudget()),
         gb(graphics.GetTotalMemoryBudget()), gb(graphics.MemoryShortfall()));
+	const auto budget_ns = PlaytestDiagnostics() ? NowNs() : 0;
 	// The guest's own direct memory (round 80): a race whose load needs more than it has fails
 	// its allocations, and the game then crashes.
 	if (const auto use = LibKernel::Memory::GetDirectMemoryUse(); use.size != 0) {
@@ -169,9 +178,21 @@ void UpdateMemoryText(const GraphicContext& graphics) {
 			    fmt::format(" ({:.2f} GB of it past the {:.2f})", gb(use.overflow), gb(use.size));
 		}
 	}
+	const auto guest_ns = PlaytestDiagnostics() ? NowNs() : 0;
 	{
 		std::scoped_lock lock(g_memory_mutex);
 		g_memory_text = std::move(text);
+	}
+	if (PlaytestDiagnostics()) {
+		const auto end = NowNs();
+		if (end - now >= 50 * Millisecond) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "GT7 perf memory query: steady_ms={:.3f} displayed_frame={} total_ms={:.3f} "
+			    "driver_budget_ms={:.3f} guest_memory_ms={:.3f} text_lock_ms={:.3f}\n",
+			    double(end) / Millisecond, graphics.presented_frames.load(std::memory_order_relaxed),
+			    double(end-now) / Millisecond, double(budget_ns-now) / Millisecond,
+			    double(guest_ns-budget_ns) / Millisecond, double(end-guest_ns) / Millisecond));
+		}
 	}
 	static std::once_flag registered;
 	std::call_once(registered, [] { Common::PerfStats::SetExtraReporter(&ExtraText); });
@@ -198,8 +219,25 @@ void NoteSectionSlow(Section section, uint64_t begin_ns, uint64_t end_ns, uint64
 		return;
 	}
 	const auto       tid = Common::PerfStats::CurrentOsThreadId();
-	std::scoped_lock lock(g_sections_mutex);
-	g_sections[g_section_count++ % SectionRing] = {begin_ns, end_ns, arg, tid, section};
+	{
+		std::scoped_lock lock(g_sections_mutex);
+		g_sections[g_section_count++ % SectionRing] = {begin_ns, end_ns, arg, tid, section};
+	}
+	// CPU-only stalls need not cause a timeline wait, so report long sections directly too.
+	// At most one line per section per two seconds; no formatting on ordinary frames.
+	if (PlaytestDiagnostics() && end_ns - begin_ns >= ThresholdNs()) {
+		static std::array<std::atomic<uint64_t>, static_cast<size_t>(Section::Count)> next {};
+		auto& gate = next[static_cast<size_t>(section)];
+		auto expected = gate.load(std::memory_order_relaxed);
+		if (end_ns >= expected && gate.compare_exchange_strong(
+		        expected, end_ns + 2000 * Millisecond, std::memory_order_relaxed)) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "GT7 perf section: steady_ms={:.3f} begin_ms={:.3f} duration_ms={:.3f} "
+			    "thread={} section={} arg={}\n", double(end_ns) / Millisecond,
+			    double(begin_ns) / Millisecond, double(end_ns - begin_ns) / Millisecond,
+			    Common::PerfStats::ThreadNameOf(tid), SectionName(section), arg));
+		}
+	}
 }
 
 } // namespace Detail
@@ -854,7 +892,14 @@ void Timeline::Report(uint64_t number, uint64_t tick, uint64_t known, uint64_t w
 		                    "them all\n",
 		                    number);
 	}
-	Log::WriteUnmuted(text);
+	if (PlaytestDiagnostics()) {
+		text.insert(0, fmt::format("GT7 perf stall: steady_ms={:.3f} displayed_frame={}\n",
+		                          double(now) / Millisecond,
+		                          m_graphics.presented_frames.load(std::memory_order_relaxed)));
+		Log::WriteToConsoleAndLog(text);
+	} else {
+		Log::WriteUnmuted(text);
+	}
 }
 
 } // namespace Libs::Graphics::StallWatch

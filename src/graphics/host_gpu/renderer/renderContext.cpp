@@ -1,7 +1,9 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/gt7Dlss.h"
+#include "graphics/presentation/window/gt7FrameGen.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/perfStats.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -14,6 +16,7 @@
 #include "graphics/host_gpu/renderer/frameGraphQueries.h"
 #include "graphics/host_gpu/renderer/occlusionQueries.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "graphics/host_gpu/renderer/stallWatch.h"
 #include "graphics/host_gpu/timeline.h"
 #include "graphics/presentation/videoOut.h"
 #include "kernel/memory.h"
@@ -96,6 +99,60 @@ uint64_t NowMs() {
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
 	                                 std::chrono::steady_clock::now().time_since_epoch())
 	                                 .count());
+}
+
+bool UnmapDiagnosticsEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_GT7_PERF_DIAGNOSTICS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+enum UnmapDrainReason : uint32_t {
+	UnmapBuffer = 1, UnmapDirty = 2, UnmapImage = 4, UnmapCallbacks = 8, UnmapForced = 16,
+};
+
+void NoteUnmapDiagnostic(uint64_t submitted, uint64_t started, uint64_t checked,
+                         uint64_t finished, uint64_t priority_done, uint64_t cleaned,
+                         uint32_t reasons, bool active, uint64_t frame) {
+	struct Stats {
+		uint64_t since = 0, calls = 0, skipped = 0, drained = 0, inactive = 0, over50 = 0;
+		std::array<uint64_t, 5> reasons {};
+		std::array<uint64_t, 6> total {}, maximum {};
+	};
+	// The callback runs on the serialized GPU lane. Shutdown's direct route is only entered
+	// after that lane stops; thread-local stats need no lock on the normal rendering path.
+	static thread_local Stats stats;
+	if (stats.since == 0) stats.since = submitted;
+	stats.calls++;
+	stats.inactive += !active;
+	stats.drained += active && reasons != 0;
+	stats.skipped += active && reasons == 0;
+	stats.over50 += cleaned - submitted >= 50'000'000u;
+	for (size_t i = 0; i < stats.reasons.size(); ++i) stats.reasons[i] += (reasons >> i) & 1u;
+	const std::array<uint64_t, 6> elapsed {started - submitted, checked - started,
+	    finished - checked, priority_done - finished, cleaned - priority_done, cleaned - submitted};
+	for (size_t i = 0; i < elapsed.size(); ++i) {
+		stats.total[i] += elapsed[i];
+		stats.maximum[i] = std::max(stats.maximum[i], elapsed[i]);
+	}
+	if (cleaned - stats.since < 5'000'000'000u) return;
+	const auto ms = [](uint64_t ns) { return double(ns) / 1e6; };
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "GT7 perf unmap: steady_ms={:.3f} frame={} window_s={:.3f} mapped_calls={} "
+	    "skipped_unused={} drained={} inactive={} over50ms={} "
+	    "reasons(buffer/dirty/image/callbacks/forced)={}/{}/{}/{}/{} "
+	    "ms(total/max) queue_wait={:.3f}/{:.3f} check={:.3f}/{:.3f} finish={:.3f}/{:.3f} "
+	    "priority={:.3f}/{:.3f} cleanup={:.3f}/{:.3f} full={:.3f}/{:.3f}\n",
+	    ms(cleaned), frame, ms(cleaned - stats.since) / 1000.0, stats.calls, stats.skipped,
+	    stats.drained, stats.inactive, stats.over50, stats.reasons[0], stats.reasons[1],
+	    stats.reasons[2], stats.reasons[3], stats.reasons[4],
+	    ms(stats.total[0]), ms(stats.maximum[0]), ms(stats.total[1]), ms(stats.maximum[1]),
+	    ms(stats.total[2]), ms(stats.maximum[2]), ms(stats.total[3]), ms(stats.maximum[3]),
+	    ms(stats.total[4]), ms(stats.maximum[4]), ms(stats.total[5]), ms(stats.maximum[5])));
+	stats = {};
+	stats.since = cleaned;
 }
 
 // Whether the block faulted less than 100 ms before; notes this fault. A hint: threads race on
@@ -278,7 +335,10 @@ RenderContext::~RenderContext() {
 }
 
 Gt7Dlss* RenderContext::GetGt7Dlss() {
-	if (!m_graphics.gt7_dlss_device_enabled) return nullptr;
+	// Native mode owns SR independently; this helper only captures FG inputs.
+	if (Config::PssrDlssEnabled()) {
+		if (!Gt7FrameGen::InputsRequested(m_graphics)) return nullptr;
+	} else if (!m_graphics.gt7_dlss_device_enabled) return nullptr;
 	if (!m_gt7_dlss) m_gt7_dlss = std::make_unique<Gt7Dlss>(*this);
 	return m_gt7_dlss.get();
 }
@@ -681,18 +741,55 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		}
 	}
 	NoteMapEvent(MapEventKind::Unmap, vaddr, size, 0);
-	const auto unmap = [this, vaddr, size] {
-		if (m_command_scheduler.Active()) {
+	static const bool skip_unused = [] {
+		const auto* value = std::getenv("KYTY_UNMAP_SKIP_UNUSED");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	const bool diagnose = UnmapDiagnosticsEnabled();
+	const auto submitted = diagnose ? StallWatch::NowNs() : 0;
+	const auto unmap = [this, vaddr, size, diagnose, submitted] {
+		const auto started = diagnose ? StallWatch::NowNs() : 0;
+		const bool active = m_command_scheduler.Active();
+		uint32_t reasons = 0;
+		if (active) {
+			// The upstream ownership fast path, with stronger callback/readback guards for
+			// this renderer. Check on the GPU lane: a registered buffer/image, dirty bytes,
+			// an independent fast readback, or ANY pending callback retains the full drain.
+			// In particular, ordinary callbacks can touch guest memory without a cache entry.
+			if (!skip_unused) reasons |= UnmapForced;
+			if (skip_unused || diagnose) {
+				if (m_buffer_cache.IsRegionRegistered(vaddr, size)) reasons |= UnmapBuffer;
+				if ((reasons == 0 || diagnose) && m_buffer_cache.HasGpuDirtyBytesShared(vaddr, size))
+					reasons |= UnmapDirty;
+				if ((reasons == 0 || diagnose) && m_texture_cache.IsRegionRegistered(vaddr, size))
+					reasons |= UnmapImage;
+				if ((reasons == 0 || diagnose) && m_command_scheduler.HasPendingOperations())
+					reasons |= UnmapCallbacks;
+			}
+		}
+		const auto checked = diagnose ? StallWatch::NowNs() : 0;
+		auto finished = checked;
+		auto priority_done = checked;
+		if (active && reasons != 0) {
 			const auto tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
+			if (diagnose) finished = StallWatch::NowNs();
 			m_command_scheduler.WaitPriorityOperations(tick);
+			if (diagnose) priority_done = StallWatch::NowNs();
 		}
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_buffer_cache.ForgetUnmapped(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
 		m_bindless_table.UnwatchRange(vaddr, size);
-		std::lock_guard lock(m_mapped_ranges_mutex);
-		m_mapped_ranges.Subtract(vaddr, size);
+		{
+			std::lock_guard lock(m_mapped_ranges_mutex);
+			m_mapped_ranges.Subtract(vaddr, size);
+		}
+		if (diagnose) {
+			NoteUnmapDiagnostic(submitted, started, checked, finished, priority_done,
+			    StallWatch::NowNs(), reasons, active,
+			    m_graphics.presented_frames.load(std::memory_order_relaxed));
+		}
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.
@@ -1068,7 +1165,8 @@ void RenderContext::DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, in
 	m_interrupt_eqs.erase(it);
 }
 
-void RenderContext::TriggerInterrupt(int event_id, uint32_t context_id) {
+void RenderContext::TriggerInterrupt(int event_id, uint32_t context_id,
+                                    const Common::EventTrace::CallbackContext* trace) {
 	std::vector<InterruptEqRegistration> registrations;
 	{
 		Common::LockGuard lock(m_interrupt_mutex);
@@ -1080,10 +1178,10 @@ void RenderContext::TriggerInterrupt(int event_id, uint32_t context_id) {
 	}
 
 	for (const auto& registration: registrations) {
-		const auto result = LibKernel::EventQueue::KernelTriggerEvent(
+		const auto result = LibKernel::EventQueue::KernelTriggerEventTraced(
 		    registration.eq, static_cast<uintptr_t>(registration.event_id),
 		    LibKernel::EventQueue::KERNEL_EVFILT_GRAPHICS,
-		    reinterpret_cast<void*>(static_cast<uintptr_t>(context_id)));
+		    reinterpret_cast<void*>(static_cast<uintptr_t>(context_id)), trace);
 		if (result == LibKernel::KERNEL_ERROR_EBADF || result == LibKernel::KERNEL_ERROR_ENOENT) {
 			DeleteInterruptEq(registration.eq, registration.event_id);
 			continue;

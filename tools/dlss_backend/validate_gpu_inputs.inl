@@ -146,7 +146,7 @@ void RunPrepareReplay(HostContext& h,VkPhysicalDevice physical,uint32_t family,c
     report["kind"]="real capture GPU input conversion + external backend host-device replay";
     report["raw_depth_note"]="Captured D32 aspect bytes uploaded as R32F; tests numeric conversion, not original guest depth view lifetime";
     report["validation_policy"]="Every color/depth/MV/mask element must match the independent CPU converter bitwise before NGX submission";
-    report["invalid_motion_policy"]="Zero motion remains an untrusted placeholder; mask is validated separately and is not supplied to preset K; output has no invalid-region fallback composite";
+    report["invalid_motion_policy"]="Zero motion remains an untrusted placeholder; mask is validated separately and is not supplied to DLSS; output has no invalid-region fallback composite";
     report["shader_storage_image_extended_formats_enabled"]=true;
     const std::array<size_t,4> offset {0,pixels*8,pixels*12,pixels*20};
     const std::array<size_t,4> sizes {pixels*8,pixels*4,pixels*8,pixels};

@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/pagedRangeSet.h"
 #include "graphics/host_gpu/renderer/cache/readbackQueue.h"
+#include "graphics/host_gpu/renderer/cache/readbackWait.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/cache/writeTicks.h"
 
@@ -175,6 +176,10 @@ public:
 	// [vaddr, vaddr + size) are put in guest memory now (HasGpuDirtyBytes takes them as
 	// GPU-written until then), for a read of guest memory that cannot wait for a fault's path.
 	void FinishFastReadbacks(uint64_t vaddr, uint64_t size);
+	// GPU thread: finish existing publications for these exact bytes without starting a new
+	// download or lifting page protections. False means the bytes still need the full ReadMemory
+	// path (GPU-dirty bytes or an unavailable publication tick). Fast readbacks complete first.
+	[[nodiscard]] bool FinishPendingBacking(uint64_t vaddr, uint64_t size);
 	// Any thread: none of the bytes is GPU-written, or on its way back from the GPU, so guest
 	// memory holds their current value even when their page is protected.
 	[[nodiscard]] bool              IsCleanForConcurrentRead(uint64_t vaddr, uint64_t size) const;
@@ -571,20 +576,7 @@ private:
 	// Round 135: what a ReadMemoryStep did, read back by ReadMemory's command on the GPU thread
 	// (the counts by instruction and the wait to make), and why the last FastReadback copied
 	// nothing (with the tick of the faulting pages' writer when the GPU was still running it).
-	enum class ReadOutcome : uint8_t {
-		None,
-		Direct,     // nothing to do (a write to memory no buffer covers)
-		Bitmap,     // the write bitmap's wait (RefineWithWriteBitmap)
-		Lifted,     // the pages held no GPU-written bytes: lifted
-		LiftWaited, // the same, once a download of them on its way lands
-		Clean,      // the pages were current already: another thread's read lifted them
-		Fast,       // copied on the readback queue (FastReadback)
-		WaitWriter, // waits for its writer's command buffer, then asks again (readwait:writer)
-		Download,   // downloaded behind the renderer's queue
-		Nothing,    // went to download, and nothing was left to download
-		FastWait,   // waited for another read's copy of its pages to land, then asks again
-		Count
-	};
+	using ReadOutcome = ReadbackWait::Outcome;
 	enum class FastRefusal : uint8_t {
 		None,
 		Unavailable, // no readback queue, or turned off

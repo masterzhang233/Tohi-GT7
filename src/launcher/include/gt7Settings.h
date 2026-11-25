@@ -4,13 +4,14 @@
 #include "configuration.h"
 
 #include <QDir>
+#include <QFileInfo>
 #include <QProcessEnvironment>
 
 inline bool IsGt7Title(const Configuration& info) {
 	return info.title_id.compare(QStringLiteral("PPSA01317"), Qt::CaseInsensitive) == 0;
 }
 
-// Launcher 1.0.0 is desktop-only. Legacy VR keys remain readable for settings compatibility,
+// The release launcher is desktop-only. Legacy VR keys remain readable for settings compatibility,
 // but cannot turn into VR command-line arguments through any launcher entry point.
 inline void ApplyGt7DesktopPreset(Configuration& info) {
 	if (!IsGt7Title(info)) {
@@ -21,8 +22,9 @@ inline void ApplyGt7DesktopPreset(Configuration& info) {
 	if (!info.gt7_dlss_enabled) {
 		return;
 	}
-	info.gt7_desktop_height = 1080;
-	info.screen_resolution = Configuration::Resolution::R2560X1440;
+	// Native PSSR has its own verified 1080p -> 4K patch, not the legacy desktop patch.
+	info.gt7_desktop_height = 0;
+	info.screen_resolution = Configuration::Resolution::R3840X2160;
 	info.present_mode = Configuration::PresentMode::Mailbox;
 	info.tessellation_enabled = true;
 	info.bindless_images_enabled = true;
@@ -51,8 +53,30 @@ inline QStringList Gt7ProfileArguments(const Configuration& info) {
 	if (!HasGt7Profile(info)) {
 		return {};
 	}
-	return {QStringLiteral("--gt7-desktop-height"),
-	        QString::number(info.gt7_dlss_enabled ? 1080 : info.gt7_desktop_height)};
+	if (info.gt7_dlss_enabled) {
+		return {QStringLiteral("--gt7-desktop-height"), QStringLiteral("native"),
+		        QStringLiteral("--ps5-pro"), QStringLiteral("--pssr-dlss"),
+		        QStringLiteral("--gt7-pssr-1080-4k")};
+	}
+	return {QStringLiteral("--gt7-desktop-height"), QString::number(info.gt7_desktop_height)};
+}
+
+// SR and FG share one NGX runtime directory. Missing any plugin must fail before launch.
+inline QStringList Gt7GraphicsRuntimeFiles() {
+	return {QStringLiteral("kyty_dlss_backend.dll"), QStringLiteral("nvngx_dlss.dll"),
+	        QStringLiteral("sl.interposer.dll"), QStringLiteral("sl.common.dll"),
+	        QStringLiteral("sl.dlss_g.dll"), QStringLiteral("sl.reflex.dll"),
+	        QStringLiteral("sl.pcl.dll"), QStringLiteral("nvngx_dlssg.dll"),
+	        QStringLiteral("NvLowLatencyVk.dll")};
+}
+
+inline QStringList MissingGt7GraphicsRuntimeFiles(const QString& runtime_directory) {
+	QStringList missing;
+	const QDir runtime(runtime_directory);
+	for (const auto& name: Gt7GraphicsRuntimeFiles()) {
+		if (!QFileInfo(runtime.absoluteFilePath(name)).isFile()) missing << name;
+	}
+	return missing;
 }
 
 inline QProcessEnvironment Gt7LaunchEnvironment(const Configuration& info,
@@ -70,14 +94,23 @@ inline QProcessEnvironment Gt7LaunchEnvironment(const Configuration& info,
 	}
 	const auto enabled = info.gt7_dlss_enabled ? QStringLiteral("1") : QStringLiteral("0");
 	environment.insert(QStringLiteral("KYTY_FG_MANUAL_ONLY"), QStringLiteral("1"));
-	environment.insert(QStringLiteral("KYTY_GT7_DLSS"), enabled);
-	environment.insert(QStringLiteral("KYTY_GT7_FSR_FG"), enabled);
-	environment.insert(QStringLiteral("KYTY_GT7_FSR_FG_OCCLUSION_GUARD"), enabled);
+	// The old TAA/DLSS hook and FSR FG must never run beside native PSSR + NVIDIA FG.
+	environment.insert(QStringLiteral("KYTY_GT7_DLSS"), QStringLiteral("0"));
+	environment.insert(QStringLiteral("KYTY_GT7_FSR_FG"), QStringLiteral("0"));
+	environment.insert(QStringLiteral("KYTY_GT7_FSR_FG_OCCLUSION_GUARD"), QStringLiteral("0"));
+	environment.insert(QStringLiteral("KYTY_GT7_DLSS_FG"), enabled);
+	environment.insert(QStringLiteral("KYTY_PSSR_DIAGNOSTICS"), QStringLiteral("0"));
+	environment.insert(QStringLiteral("KYTY_GT7_NATIVE_ASYNC_PRESENT"), QStringLiteral("0"));
+	environment.insert(QStringLiteral("KYTY_SAMPLE"), QStringLiteral("0"));
 	if (info.gt7_dlss_enabled) {
 		const QDir runtime(runtime_directory);
 		environment.insert(QStringLiteral("KYTY_GT7_DLSS_BACKEND"),
 		                   runtime.absoluteFilePath(QStringLiteral("kyty_dlss_backend.dll")));
 		environment.insert(QStringLiteral("KYTY_GT7_DLSS_RUNTIME"), runtime.absolutePath());
+		environment.insert(QStringLiteral("KYTY_GT7_DLSS_FG_RUNTIME"), runtime.absolutePath());
+		environment.insert(QStringLiteral("KYTY_GT7_DLSS_PRESET"), QStringLiteral("M"));
+		// Per-process opt-out, matching the tested Streamline Vulkan profile.
+		environment.insert(QStringLiteral("DISABLE_RTSS_LAYER"), QStringLiteral("1"));
 	}
 	return environment;
 }

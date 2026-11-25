@@ -1,4 +1,5 @@
 #include "updateChecker.h"
+#include "cmake_config.h"
 
 #include "kytyGitVersion.h"
 
@@ -91,7 +92,7 @@ void UpdateChecker::FetchUpdateInfo(const char* url, bool fallback, bool manual)
 	QNetworkRequest request(QUrl(QString::fromLatin1(url)));
 	request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
 	                     QNetworkRequest::NoLessSafeRedirectPolicy);
-	request.setRawHeader("User-Agent", "Tohi-GT7-Launcher/1.0.2");
+	request.setRawHeader("User-Agent", "Tohi-GT7-Launcher/" KYTY_VERSION);
 	request.setRawHeader("Accept", "application/vnd.github+json");
 	request.setTransferTimeout(15000);
 

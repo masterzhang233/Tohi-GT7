@@ -142,7 +142,7 @@ if (KYTY_LINKER STREQUAL LD AND NOT LINUX)
 	set(KYTY_LD_OPTIONS "-Wl,--image-base=0x100000000000")
 endif()
 
-project(Kyty${KYTY_PROJECT_NAME}${CMAKE_BUILD_TYPE}${KYTY_COMPILER} VERSION 1.0.2)
+project(Kyty${KYTY_PROJECT_NAME}${CMAKE_BUILD_TYPE}${KYTY_COMPILER} VERSION 1.0.3)
 
 include_directories(
 	${KYTY_THIRD_PARTY_DIR}/gtest/include
@@ -430,6 +430,7 @@ set(gpu_blit_shader_sources
 	"${gpu_tiler_shader_dir}/gpu_blit_ms_stencil_sample0.frag"
 	"${gpu_tiler_shader_dir}/gpu_blit_color_to_ms.frag"
 	"${gpu_tiler_shader_dir}/gpu_video_out_overlay.frag"
+	"${gpu_tiler_shader_dir}/gpu_pssr_linear.comp"
 	"${gpu_tiler_shader_dir}/color_clear_check.comp"
 	"${gpu_tiler_shader_dir}/gpu_conditional_clear_float.frag"
 	"${gpu_tiler_shader_dir}/gpu_conditional_clear_uint.frag"
@@ -457,8 +458,9 @@ list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 # Optional GT7 desktop SR uses project-owned conversion/compositing shaders. NGX itself is
 # an explicitly loaded external backend; normal emulator builds do not link its SDK.
 option(KYTY_ENABLE_GT7_FSR_FG "Build experimental GT7 Vulkan FSR 3.1 frame generation" OFF)
+option(KYTY_ENABLE_GT7_DLSS_FG "Build experimental GT7 native Vulkan NVIDIA frame generation" OFF)
 set(gpu_dlss_generated_dir "${PROJECT_BINARY_DIR}/gpu_dlss_shaders")
-set(gpu_dlss_shader_names gt7_dlss_prepare gt7_dlss_composite)
+set(gpu_dlss_shader_names gt7_dlss_prepare gt7_dlss_composite gt7_native_fg_prepare)
 if(KYTY_ENABLE_GT7_FSR_FG)
 	list(APPEND gpu_dlss_shader_names gt7_fsr_occlusion_mask gt7_fsr_occlusion_resolve)
 endif()
@@ -554,7 +556,7 @@ endif()
 
 set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus)
 if(WIN32)
-	list(APPEND kyty_emulator_link_libraries bcrypt advapi32)
+	list(APPEND kyty_emulator_link_libraries bcrypt advapi32 wintrust crypt32)
 endif()
 
 # Linux system libraries.
@@ -576,6 +578,23 @@ set(inc_headers
 )
 
 # Desktop 2x frame interpolation is loaded at run time; DLSS remains the upscaler.
+set(KYTY_GT7_STREAMLINE_SDK "${CMAKE_CURRENT_SOURCE_DIR}/_Build/deps/streamline" CACHE PATH
+    "External NVIDIA Streamline SDK root containing include/sl.h")
+if(KYTY_ENABLE_GT7_DLSS_FG)
+	if(NOT WIN32)
+		message(FATAL_ERROR "GT7 native DLSS frame generation currently requires Windows")
+	endif()
+	foreach(required_file IN ITEMS include/sl.h include/sl_dlss_g.h include/sl_reflex.h include/sl_helpers_vk.h)
+		if(NOT EXISTS "${KYTY_GT7_STREAMLINE_SDK}/${required_file}")
+			message(FATAL_ERROR "Missing Streamline dependency ${required_file}; supply KYTY_GT7_STREAMLINE_SDK")
+		endif()
+	endforeach()
+	set_property(SOURCE "${KYTY_SOURCE_DIR}/graphics/presentation/window/gt7DlssFrameGen.cpp" APPEND PROPERTY
+	    INCLUDE_DIRECTORIES "${KYTY_GT7_STREAMLINE_SDK}/include")
+	set_property(SOURCE "${KYTY_SOURCE_DIR}/graphics/presentation/window/gt7DlssFrameGen.cpp" APPEND PROPERTY
+	    COMPILE_DEFINITIONS KYTY_GT7_FRAMEGEN_DLSS=1)
+endif()
+
 # Fetch the pinned, signed SDK runtime with tools/Fetch-GT7-FidelityFX.ps1 first.
 set(KYTY_GT7_FIDELITYFX_SDK "${CMAKE_CURRENT_SOURCE_DIR}/_Build/deps/fidelityfx" CACHE PATH
     "FidelityFX SDK 1.1.4 headers, bin/amd_fidelityfx_vk.dll, LICENSE.txt, and provenance.json")
@@ -654,6 +673,72 @@ add_kyty_full_emulator_test(ajm_atrac9_config_tests "${KYTY_TESTS_DIR}/ajmAtrac9
 add_executable(gt7_framegen_camera_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/Gt7FrameGenCameraTests.cpp")
 target_include_directories(gt7_framegen_camera_tests PRIVATE "${KYTY_SOURCE_DIR}")
+add_executable(gt7_dlss_framegen_camera_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/Gt7DlssFrameGenCameraTests.cpp")
+target_include_directories(gt7_dlss_framegen_camera_tests PRIVATE "${KYTY_SOURCE_DIR}")
+add_executable(gt7_native_pssr_inputs_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/Gt7NativePssrInputsTests.cpp")
+target_include_directories(gt7_native_pssr_inputs_tests PRIVATE "${KYTY_SOURCE_DIR}")
+add_executable(gt7_framegen_input_witness_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/Gt7FrameGenInputWitnessTests.cpp")
+target_include_directories(gt7_framegen_input_witness_tests PRIVATE "${KYTY_SOURCE_DIR}")
+add_executable(gt7_framegen_lifecycle_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/Gt7FrameGenLifecycleTests.cpp")
+target_include_directories(gt7_framegen_lifecycle_tests PRIVATE "${KYTY_SOURCE_DIR}")
+add_executable(gt7_opaque_overlay_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/Gt7OpaqueOverlayTests.cpp")
+target_include_directories(gt7_opaque_overlay_tests PRIVATE "${KYTY_SOURCE_DIR}")
+add_executable(gt7_native_attachment_policy_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/Gt7NativeAttachmentPolicyTests.cpp")
+target_include_directories(gt7_native_attachment_policy_tests PRIVATE "${KYTY_SOURCE_DIR}")
+add_executable(gt7_framegen_tonemap_inputs_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/Gt7FrameGenTonemapInputsTests.cpp")
+target_include_directories(gt7_framegen_tonemap_inputs_tests PRIVATE "${KYTY_SOURCE_DIR}")
+add_executable(gt7_native_depth_projection_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/Gt7NativeDepthProjectionTests.cpp")
+target_include_directories(gt7_native_depth_projection_tests PRIVATE "${KYTY_SOURCE_DIR}")
+add_executable(gt7_native_camera_pair_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/Gt7NativeCameraPairTests.cpp")
+target_include_directories(gt7_native_camera_pair_tests PRIVATE "${KYTY_SOURCE_DIR}")
+if(KYTY_ENABLE_GT7_DLSS_FG)
+	add_executable(gt7_dlss_framegen_policy_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/Gt7DlssFrameGenPolicyTests.cpp")
+	target_include_directories(gt7_dlss_framegen_policy_tests PRIVATE "${KYTY_SOURCE_DIR}" "${KYTY_GT7_STREAMLINE_SDK}/include")
+endif()
+add_executable(gt7_dlss_effect_coverage_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/Gt7DlssEffectCoverageTests.cpp")
+target_include_directories(gt7_dlss_effect_coverage_tests PRIVATE "${KYTY_SOURCE_DIR}")
+add_executable(gt7_framegen_association_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/Gt7FrameGenAssociationTests.cpp")
+target_include_directories(gt7_framegen_association_tests PRIVATE "${KYTY_SOURCE_DIR}")
+
+add_executable(source_trace_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/SourceTraceTests.cpp")
+target_include_directories(source_trace_tests PRIVATE "${KYTY_SOURCE_DIR}")
+if(TARGET Threads::Threads)
+	target_link_libraries(source_trace_tests Threads::Threads)
+endif()
+add_executable(source_chain_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/SourceChainTests.cpp")
+target_include_directories(source_chain_tests PRIVATE "${KYTY_SOURCE_DIR}")
+if(TARGET Threads::Threads)
+	target_link_libraries(source_chain_tests Threads::Threads)
+endif()
+add_executable(source_sampler_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/SourceSamplerTests.cpp")
+target_link_libraries(source_sampler_tests common fmt::fmt)
+target_include_directories(source_sampler_tests PRIVATE "${KYTY_SOURCE_DIR}")
+add_executable(source_notifier_sampler_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/SourceNotifierSamplerTests.cpp")
+target_link_libraries(source_notifier_sampler_tests common fmt::fmt)
+target_include_directories(source_notifier_sampler_tests PRIVATE "${KYTY_SOURCE_DIR}")
+add_executable(condition_wait_trace_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/ConditionWaitTraceTests.cpp")
+target_include_directories(condition_wait_trace_tests PRIVATE "${KYTY_SOURCE_DIR}")
+if(TARGET Threads::Threads)
+	target_link_libraries(condition_wait_trace_tests Threads::Threads)
+endif()
+add_executable(event_trace_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/EventTraceTests.cpp")
+target_include_directories(event_trace_tests PRIVATE "${KYTY_SOURCE_DIR}")
+if(TARGET Threads::Threads)
+	target_link_libraries(event_trace_tests Threads::Threads)
+endif()
+add_executable(event_queue_trace_state_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/EventQueueTraceStateTests.cpp")
+target_include_directories(event_queue_trace_state_tests PRIVATE "${KYTY_SOURCE_DIR}")
+add_executable(readback_wait_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/ReadbackWaitTests.cpp")
+target_include_directories(readback_wait_tests PRIVATE "${KYTY_SOURCE_DIR}")
+if(TARGET Threads::Threads)
+	target_link_libraries(readback_wait_tests Threads::Threads)
+endif()
+add_executable(event_trace_transport_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/EventTraceTransportTests.cpp")
+target_include_directories(event_trace_transport_tests PRIVATE "${KYTY_SOURCE_DIR}")
+target_link_libraries(event_trace_transport_tests common fmt::fmt)
 add_executable(gt7_framegen_dcc_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/Gt7FrameGenDccTests.cpp")
 target_include_directories(gt7_framegen_dcc_tests PRIVATE "${KYTY_SOURCE_DIR}")
@@ -863,6 +948,7 @@ target_include_directories(event_queue_lifetime_tests PRIVATE ${inc_headers})
 
 add_kyty_full_emulator_test(kernel_file_system_tests
 	"${KYTY_TESTS_DIR}/KernelFileSystemTests.cpp")
+target_sources(kernel_file_system_tests PRIVATE "${KYTY_TESTS_DIR}/KernelWaitsTests.cpp")
 target_link_libraries(kernel_file_system_tests ZArchive::zarchive)
 
 add_executable(sync_on_address_tests EXCLUDE_FROM_ALL
@@ -879,6 +965,7 @@ target_link_libraries(image_page_table_tests common fmt::fmt)
 target_include_directories(image_page_table_tests PRIVATE ${inc_headers})
 
 add_kyty_full_emulator_test(shader_recompiler_compute_tests "${KYTY_TESTS_DIR}/ShaderRecompilerComputeTests.cpp")
+target_sources(shader_recompiler_compute_tests PRIVATE "${KYTY_TESTS_DIR}/PssrDlssContractTests.cpp")
 if(WIN32)
 	# These fixtures keep full RenderContext objects on the stack. With the new
 	# renderer state and PGO they exceed the default 1 MiB Windows stack; the
@@ -912,6 +999,18 @@ target_sources(shader_recompiler_compute_tests PRIVATE
 	"${gpu_test_ms_depth_header}")
 
 add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/VirtualMemoryAllocationTests.cpp")
+add_library(kyty_test_gtest STATIC EXCLUDE_FROM_ALL
+	"${KYTY_THIRD_PARTY_DIR}/fmt/test/gtest/gmock-gtest-all.cc")
+target_include_directories(kyty_test_gtest PUBLIC "${KYTY_THIRD_PARTY_DIR}/fmt/test/gtest")
+target_sources(virtual_memory_allocation_tests PRIVATE "${KYTY_TESTS_DIR}/TrinityTests.cpp")
+target_link_libraries(virtual_memory_allocation_tests kyty_test_gtest)
+add_executable(psml_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PsmlTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libPsml.cpp"
+	"${KYTY_SOURCE_DIR}/loader/symbolDatabase.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp")
+target_link_libraries(psml_tests common kyty_test_gtest)
+target_include_directories(psml_tests PRIVATE ${inc_headers})
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
@@ -931,6 +1030,61 @@ endif()
 
 if(BUILD_TESTING)
 	add_test(NAME gt7_framegen_camera COMMAND $<TARGET_FILE:gt7_framegen_camera_tests>)
+	add_test(NAME gt7_dlss_framegen_camera COMMAND $<TARGET_FILE:gt7_dlss_framegen_camera_tests>)
+	add_test(NAME gt7_native_pssr_inputs COMMAND $<TARGET_FILE:gt7_native_pssr_inputs_tests>)
+	add_test(NAME gt7_framegen_input_witness COMMAND $<TARGET_FILE:gt7_framegen_input_witness_tests>)
+	add_test(NAME gt7_framegen_lifecycle COMMAND $<TARGET_FILE:gt7_framegen_lifecycle_tests>)
+	add_test(NAME gt7_opaque_overlay COMMAND $<TARGET_FILE:gt7_opaque_overlay_tests>)
+	add_test(NAME gt7_native_attachment_policy COMMAND $<TARGET_FILE:gt7_native_attachment_policy_tests>)
+	add_test(NAME gt7_framegen_tonemap_inputs COMMAND $<TARGET_FILE:gt7_framegen_tonemap_inputs_tests>)
+	add_test(NAME gt7_native_depth_projection COMMAND $<TARGET_FILE:gt7_native_depth_projection_tests>)
+	add_test(NAME gt7_native_camera_pair COMMAND $<TARGET_FILE:gt7_native_camera_pair_tests>)
+	if(TARGET gt7_dlss_framegen_policy_tests)
+		add_test(NAME gt7_dlss_framegen_policy COMMAND $<TARGET_FILE:gt7_dlss_framegen_policy_tests>)
+	endif()
+	add_test(NAME gt7_dlss_effect_coverage COMMAND $<TARGET_FILE:gt7_dlss_effect_coverage_tests>)
+	add_test(NAME gt7_framegen_association COMMAND $<TARGET_FILE:gt7_framegen_association_tests>)
+	add_test(NAME source_trace COMMAND $<TARGET_FILE:source_trace_tests>)
+	add_test(NAME source_chain COMMAND $<TARGET_FILE:source_chain_tests>)
+	set_tests_properties(source_chain PROPERTIES TIMEOUT 20)
+	add_test(NAME condition_wait_trace COMMAND $<TARGET_FILE:condition_wait_trace_tests>)
+	add_test(NAME event_trace COMMAND $<TARGET_FILE:event_trace_tests>)
+	add_test(NAME event_queue_trace_state COMMAND $<TARGET_FILE:event_queue_trace_state_tests>)
+	add_test(NAME readback_wait COMMAND $<TARGET_FILE:readback_wait_tests>)
+	set_tests_properties(readback_wait PROPERTIES TIMEOUT 15)
+	add_test(NAME event_trace_transport COMMAND $<TARGET_FILE:event_trace_transport_tests>)
+	set_tests_properties(event_trace_transport PROPERTIES TIMEOUT 20)
+	if(WIN32)
+		add_test(NAME source_sampler_disabled COMMAND $<TARGET_FILE:source_sampler_tests> --producer-fixture)
+		set_tests_properties(source_sampler_disabled PROPERTIES ENVIRONMENT
+			"KYTY_GT7_SOURCE_TRACE=0;KYTY_SAMPLE_SOURCE=0;KYTY_SAMPLE=0;KYTY_PERF=1")
+		add_test(NAME source_sampler_producer COMMAND $<TARGET_FILE:source_sampler_tests> --producer-fixture --switch-producer)
+		set_tests_properties(source_sampler_producer PROPERTIES ENVIRONMENT
+			"KYTY_GT7_SOURCE_TRACE=1;KYTY_SAMPLE_SOURCE=1;KYTY_SAMPLE=NoFixtureThreadHasThisName;KYTY_SAMPLE_HZ=50;KYTY_SAMPLE_REPORT=1;KYTY_PERF=1;KYTY_GT7_PERF_DIAGNOSTICS=1")
+		find_package(Python3 COMPONENTS Interpreter QUIET)
+		if(Python3_Interpreter_FOUND)
+			foreach(notifier_case selected unknown disabled trace_off source_off)
+				add_test(NAME source_notifier_${notifier_case}
+					COMMAND "${Python3_EXECUTABLE}" "${KYTY_TESTS_DIR}/source_notifier_sampler_log_test.py"
+					"$<TARGET_FILE:source_notifier_sampler_tests>" --case ${notifier_case})
+				set(notifier_trace 1)
+				set(notifier_source 1)
+				if(notifier_case STREQUAL "disabled" OR notifier_case STREQUAL "trace_off")
+					set(notifier_trace 0)
+				endif()
+				if(notifier_case STREQUAL "disabled" OR notifier_case STREQUAL "source_off")
+					set(notifier_source 0)
+				endif()
+				set_tests_properties(source_notifier_${notifier_case} PROPERTIES TIMEOUT 30 ENVIRONMENT
+					"KYTY_GT7_SOURCE_TRACE=${notifier_trace};KYTY_GT7_SOURCE_CHAIN=0;KYTY_SAMPLE_SOURCE=${notifier_source};KYTY_SAMPLE_SOURCE_NOTIFIER=1;KYTY_SAMPLE=NotifierFixtureDecoy;KYTY_SAMPLE_HZ=50;KYTY_SAMPLE_REPORT=1;KYTY_PERF=1;KYTY_GT7_PERF_DIAGNOSTICS=1")
+			endforeach()
+			add_test(NAME source_notifier_selected_chain
+				COMMAND "${Python3_EXECUTABLE}" "${KYTY_TESTS_DIR}/source_notifier_sampler_log_test.py"
+				"$<TARGET_FILE:source_notifier_sampler_tests>" --case selected --chain)
+			set_tests_properties(source_notifier_selected_chain PROPERTIES TIMEOUT 30 ENVIRONMENT
+				"KYTY_GT7_SOURCE_TRACE=1;KYTY_GT7_SOURCE_CHAIN=1;KYTY_SAMPLE_SOURCE=1;KYTY_SAMPLE_SOURCE_NOTIFIER=1;KYTY_SAMPLE=NotifierFixtureDecoy;KYTY_SAMPLE_HZ=50;KYTY_SAMPLE_REPORT=1;KYTY_PERF=1;KYTY_GT7_PERF_DIAGNOSTICS=1")
+		endif()
+	endif()
 	add_test(NAME gt7_framegen_dcc COMMAND $<TARGET_FILE:gt7_framegen_dcc_tests>)
 	add_test(NAME gt7_framegen_status COMMAND $<TARGET_FILE:gt7_framegen_status_tests>)
 	add_test(NAME emulator_user_name_cli
@@ -945,6 +1099,8 @@ if(BUILD_TESTING)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
+	add_test(NAME vertex_prep_safety
+	         COMMAND $<TARGET_FILE:shader_cfg_tests> --vertex-prep-safety-only)
 	add_test(NAME gt7_camera_shader_contract
 	         COMMAND $<TARGET_FILE:shader_cfg_tests> --gt7-camera-only)
 	add_test(NAME font_unicode_fallback COMMAND $<TARGET_FILE:shader_cfg_tests> --font-unicode-only)
@@ -966,6 +1122,9 @@ if(BUILD_TESTING)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
+	add_test(NAME kernel_waits
+		COMMAND $<TARGET_FILE:kernel_file_system_tests> --kernel-waits-only)
+	set_tests_properties(kernel_waits PROPERTIES TIMEOUT 45)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
 	add_test(NAME audio_out_timing COMMAND $<TARGET_FILE:audio_out_timing_tests>)
@@ -988,6 +1147,14 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-offset-only)
 	add_test(NAME virtual_memory_allocation
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
+	add_test(NAME virtual_memory_backing_index
+		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --backing-index-only)
+	set_tests_properties(virtual_memory_backing_index PROPERTIES TIMEOUT 90)
+	add_test(NAME trinity_mode COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --trinity-only)
+	add_test(NAME psml COMMAND $<TARGET_FILE:psml_tests>)
+	add_test(NAME pssr COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --pssr-only)
+	set_tests_properties(pssr PROPERTIES TIMEOUT 90)
+	add_test(NAME pssr_contract COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --pssr-contract-only)
 	add_test(NAME guest_red_zone_patcher
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --red-zone-patcher-only)
 	add_test(NAME command_scheduler_timeline
@@ -996,6 +1163,11 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stream-buffer-only)
 	add_test(NAME gpu_command_lane
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-command-lane-only)
+	add_test(NAME gpu_suspend_point
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --suspend-point-only)
+	set_tests_properties(gpu_suspend_point PROPERTIES TIMEOUT 45)
+	add_test(NAME shader_stage_cache_keys
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --shader-stage-keys-only)
 	add_test(NAME pm4_context_state
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --context-state-only)
 	add_test(NAME gpu_tiler
@@ -1033,6 +1205,19 @@ if(BUILD_TESTING)
 	endif()
 
 	add_custom_target(kyty_tests DEPENDS
+		gt7_native_pssr_inputs_tests
+		gt7_dlss_framegen_camera_tests
+		gt7_dlss_effect_coverage_tests
+		gt7_framegen_association_tests
+		source_trace_tests
+		source_chain_tests
+		source_sampler_tests
+		source_notifier_sampler_tests
+		condition_wait_trace_tests
+		event_trace_tests
+		event_queue_trace_state_tests
+		readback_wait_tests
+		event_trace_transport_tests
 		gt7_framegen_camera_tests
 		gt7_framegen_dcc_tests
 		gt7_framegen_status_tests
@@ -1072,6 +1257,15 @@ if(BUILD_TESTING)
 	if (WIN32)
 		add_dependencies(kyty_tests x64_load_emulation_tests)
 	endif()
+	if(TARGET gt7_dlss_framegen_policy_tests)
+		add_dependencies(kyty_tests gt7_dlss_framegen_policy_tests)
+	endif()
+	add_dependencies(kyty_tests gt7_framegen_input_witness_tests gt7_opaque_overlay_tests)
+	add_dependencies(kyty_tests gt7_framegen_lifecycle_tests)
+	add_dependencies(kyty_tests gt7_native_attachment_policy_tests)
+	add_dependencies(kyty_tests gt7_framegen_tonemap_inputs_tests)
+	add_dependencies(kyty_tests gt7_native_depth_projection_tests)
+	add_dependencies(kyty_tests gt7_native_camera_pair_tests)
 endif()
 
 # Test Darwin signal-context restoration for SSE4a instructions.
@@ -1120,6 +1314,26 @@ if(BUILD_TESTING)
 	add_dependencies(kyty_tests raw_image_dump_tests)
 	find_package(Python3 COMPONENTS Interpreter QUIET)
 	if(Python3_Interpreter_FOUND)
+		set(buffer_backing_read_regression "${PROJECT_BINARY_DIR}/generated/BufferBackingReadRegression.cpp")
+		add_custom_command(OUTPUT "${buffer_backing_read_regression}"
+			COMMAND "${Python3_EXECUTABLE}" "${KYTY_TESTS_DIR}/buffer_backing_read_regression.py"
+				--source "${PROJECT_SOURCE_DIR}" --output "${buffer_backing_read_regression}"
+			DEPENDS "${KYTY_TESTS_DIR}/buffer_backing_read_regression.py"
+				"${KYTY_TESTS_DIR}/BufferBackingReadRegression.cpp.in"
+				"${KYTY_SOURCE_DIR}/graphics/host_gpu/rangeSet.h"
+				"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/cache/bufferCache.cpp"
+				"${KYTY_SOURCE_DIR}/kernel/memory.cpp"
+				"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp"
+				"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/renderCompute.cpp"
+				"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/descriptors.cpp"
+			VERBATIM)
+		add_executable(buffer_backing_read_tests EXCLUDE_FROM_ALL "${buffer_backing_read_regression}")
+		if(TARGET Threads::Threads)
+			target_link_libraries(buffer_backing_read_tests Threads::Threads)
+		endif()
+		add_test(NAME buffer_backing_read COMMAND $<TARGET_FILE:buffer_backing_read_tests>)
+		set_tests_properties(buffer_backing_read PROPERTIES TIMEOUT 15)
+		add_dependencies(kyty_tests buffer_backing_read_tests)
 		add_test(NAME gt7_temporal_inputs
 			COMMAND "${Python3_EXECUTABLE}" "${KYTY_TESTS_DIR}/gt7_temporal_inputs_test.py")
 	endif()
@@ -1174,7 +1388,12 @@ set(KYTY_EMULATOR_PDB_LINK_PATH "${CMAKE_CURRENT_BINARY_DIR}/kyty_emulator.pdb")
 
 if(KYTY_CLANG_CL)
 	target_link_options(kyty_emulator PRIVATE
-		"/DYNAMICBASE:NO"
+		# Disabling ASLR causes NVIDIA NVX binary import device creation to fail
+		# after guest reservations on the tested RTX 5080 driver, even with a
+		# high fixed image base. Host code uses full addresses and module RVAs;
+		# guest mappings retain their own fixed addresses.
+		"/DYNAMICBASE"
+		"/HIGHENTROPYVA"
 		"/DEBUG:FULL"
 		"/PDB:${KYTY_EMULATOR_PDB_LINK_PATH}"
 		"/lldmap:${KYTY_EMULATOR_MAP_LINK_PATH}"
@@ -1227,6 +1446,57 @@ if(KYTY_PACKAGE_DLSS)
 	install(FILES "${KYTY_NGX_SDK_ROOT}/lib/Windows_x86_64/rel/nvngx_dlss.dll" DESTINATION .)
 	install(FILES "${KYTY_NGX_SDK_ROOT}/LICENSE.txt" DESTINATION licenses/nvidia)
 	install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/LICENSES/NVIDIA-DLSS-NOTICE.md" DESTINATION licenses/nvidia)
+
+	# Native SR and Streamline must resolve the same production NGX runtime.
+	# This release was validated with this exact independently built PSSR backend;
+	# stale install caches must not silently select the earlier legacy-only DLL.
+	if(KYTY_ENABLE_GT7_DLSS_FG)
+		function(kyty_require_release_sha256 path expected)
+			if(NOT EXISTS "${path}")
+				message(FATAL_ERROR "Missing native DLSS release dependency: ${path}")
+			endif()
+			file(SHA256 "${path}" actual)
+			if(NOT actual STREQUAL expected)
+				message(FATAL_ERROR "Unvalidated native DLSS release dependency: ${path}")
+			endif()
+		endfunction()
+		kyty_require_release_sha256("${KYTY_DLSS_BACKEND_FILE}"
+			"60cfdbbc405a641570e30c330638e5e662a271f977638bdd2df36f1d80f06ecf")
+		kyty_require_release_sha256("${KYTY_NGX_SDK_ROOT}/lib/Windows_x86_64/rel/nvngx_dlss.dll"
+			"d00b5b0ab29c3ca101b70c3a5ecb3a01b7ef33766a3383a28a18623083e6123e")
+		set(kyty_streamline_release_pins
+			"sl.interposer.dll|b1d7395aebd7b9722841d64dcf7433680020b6a8e421f851c16d5ba0c2182edf"
+			"sl.common.dll|38eea3b4209afc455636ea372b5933d65fcc13becec6c84d101dcfc4d8648f75"
+			"sl.dlss_g.dll|3ed9538df724993bea8a050195a6a78b9c8c8a566d5b05ade477aab3c390e90f"
+			"sl.reflex.dll|443577e869352436ff7ec8f4d9c90418d3e95368436ce219261e0f4f07a38122"
+			"sl.pcl.dll|5698c38e722318681f215c9fe68e45b9bedd51378acc699d8eee26e961e57770"
+			"nvngx_dlssg.dll|8d59d49b36410dd6b62fef2503a5871d347415bd85d943fa0848563a95dd50c7"
+			"NvLowLatencyVk.dll|2a77dc3e1c724b7eea5755be0ae7423752e79a2459fae72181a9f00e3507e5d6")
+		foreach(pin IN LISTS kyty_streamline_release_pins)
+			string(REPLACE "|" ";" fields "${pin}")
+			list(GET fields 0 name)
+			list(GET fields 1 digest)
+			set(runtime "${KYTY_GT7_STREAMLINE_SDK}/bin/x64/${name}")
+			kyty_require_release_sha256("${runtime}" "${digest}")
+			# Deliberately beside nvngx_dlss.dll, never in a separate FG directory.
+			install(FILES "${runtime}" DESTINATION .)
+		endforeach()
+		set(kyty_streamline_license_pins
+			"license.txt|7b6f23e7d6f3ad6292f9308d2b42cdc3d82ae4e9b2abb55f230279d83bedd43d|LICENSE.txt"
+			"3rd-party-licenses.md|cb251639994465f31d2178c16acedf1ff4f9cef1c370a09782ed36d4c86c1dca|THIRD-PARTY-LICENSES.md"
+			"bin/x64/nvngx_dlss.license.txt|3027f23ca5a46dd9cb8183fbd522983a86f64d7daac5982912bf9f214671f294|RTX-SDK-LICENSE.txt"
+			"bin/x64/reflex.license.txt|ebf83c07fb3b2939908c3795d887afde3161c89a28ba391724efc784ce1bdabe|REFLEX-LICENSE.txt")
+		foreach(pin IN LISTS kyty_streamline_license_pins)
+			string(REPLACE "|" ";" fields "${pin}")
+			list(GET fields 0 relative)
+			list(GET fields 1 digest)
+			list(GET fields 2 destination)
+			set(license "${KYTY_GT7_STREAMLINE_SDK}/${relative}")
+			kyty_require_release_sha256("${license}" "${digest}")
+			install(FILES "${license}" DESTINATION licenses/nvidia/streamline RENAME "${destination}")
+		endforeach()
+		install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/LICENSES/NVIDIA-STREAMLINE-NOTICE.md" DESTINATION licenses/nvidia)
+	endif()
 endif()
 if(KYTY_ENABLE_GT7_FSR_FG)
 	add_custom_command(TARGET kyty_emulator POST_BUILD
@@ -1267,6 +1537,9 @@ if(WIN32)
 	install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/docs/RELEASE-1.0.0.zh-CN.md" DESTINATION docs)
 	install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/docs/RELEASE-1.0.1.zh-CN.md" DESTINATION docs)
 	install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/docs/RELEASE-1.0.2.zh-CN.md" DESTINATION docs)
+	install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/docs/RELEASE-1.0.3.zh-CN.md"
+		"${CMAKE_CURRENT_SOURCE_DIR}/docs/NATIVE-PSSR-DLSS.md"
+		"${CMAKE_CURRENT_SOURCE_DIR}/docs/GT7-NVIDIA-FRAME-GENERATION.md" DESTINATION docs)
 	install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/scripts/Start-GT7-Desktop.ps1"
 		"${CMAKE_CURRENT_SOURCE_DIR}/scripts/Start-GT7-Desktop.cmd" DESTINATION .)
 	install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE" DESTINATION .)
@@ -1298,7 +1571,7 @@ endif()
 if(KYTY_CLANG_CL)
 	install(FILES "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" DESTINATION .)
 	# Next to the exe, the PDB symbolises the host stacks fatal errors print; the map lets them
-	# be symbolised afterwards (the image base is fixed: /DYNAMICBASE:NO).
+	# be symbolised afterwards using module-relative addresses when ASLR is active.
 	install(FILES "${KYTY_EMULATOR_PDB_LINK_PATH}" "${KYTY_EMULATOR_MAP_LINK_PATH}" DESTINATION .
 	        OPTIONAL)
 endif()

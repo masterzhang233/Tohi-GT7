@@ -353,6 +353,10 @@ bool ValidateRequest(const Request& request, bool vr, bool custom_patch, std::st
     if (request.vr_scale != 0 && request.vr_scale != 100 && request.vr_scale != 110 &&
         request.vr_scale != 120 && request.vr_scale != 125)
         return Fail(error, "VR scale must be 100, 110, 120, or 125");
+    if (request.native_pssr_1080_4k && request.desktop_height > 0)
+        return Fail(error, "--gt7-pssr-1080-4k cannot be combined with legacy GT7 desktop resolution patches; omit --gt7-desktop-height or use native");
+    if (request.native_pssr_1080_4k && (vr || request.vr_scale != 0))
+        return Fail(error, "--gt7-pssr-1080-4k is desktop-only and cannot be combined with VR profiles");
     if (request.desktop_height >= 0 && (vr || request.vr_scale != 0))
         return Fail(error, "desktop render profiles and VR cannot be combined");
     if (request.vr_scale != 0 && !vr) return Fail(error, "--gt7-vr-scale requires --vr");
@@ -429,7 +433,8 @@ bool Prepare(const Request& request, const std::filesystem::path& eboot,
         else if (file_digest != EbootSha256)
             std::printf("GT7 profile: accepted compatible executable image from alternate container; file SHA-256 %s\n",
                         file_digest.c_str());
-        const auto file_name = request.vr_scale ? "GT7-SteamVR-EyeScale-" + std::to_string(request.vr_scale) + ".json" :
+        const auto file_name = request.native_pssr_1080_4k ? std::string("GT7-PSSR-1080-to-4K.json") :
+            request.vr_scale ? "GT7-SteamVR-EyeScale-" + std::to_string(request.vr_scale) + ".json" :
             "GT7-Desktop-Internal-" + (request.desktop_height ? std::to_string(request.desktop_height) : std::string("Native")) + ".json";
         const auto selected = patch_directory / file_name;
         std::ifstream manifest_file(patch_directory / "patches.json");

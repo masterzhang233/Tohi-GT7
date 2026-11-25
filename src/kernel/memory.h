@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#include <array>
 #include <string>
 #include <utility>
 #include <vector>
@@ -312,13 +313,40 @@ void RemoveLiveThreadStack(uint64_t vaddr, uint64_t size);
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+struct TestBackingApiMetric {
+	uint64_t count = 0, total_ns = 0, max_ns = 0;
+};
+struct TestBackingApiStats {
+	TestBackingApiMetric map_view {}, unmap_view {}, coalesce {};
+};
+// Test-only access to the actual runtime diagnostic, not a second timing path.
+enum TestMunmapHostStage : size_t {
+	TestHostOther, TestHostAddressLock, TestHostBackingLock, TestHostUnmapApi,
+	TestHostCoalesceApi, TestHostRemap, TestHostMapApi, TestHostSplitApi,
+	TestHostProtectApi, TestHostResync, TestHostStages
+};
+struct TestMunmapHostStats {
+	bool enabled = false;
+	int result = 0;
+	uint32_t tid = 0;
+	uint64_t begin_ns = 0, end_ns = 0, covered_ns = 0, spans = 0;
+	std::array<TestBackingApiMetric, TestHostStages> stages {};
+};
+void TestSetMunmapDiagnostics(bool enabled);
+TestMunmapHostStats TestLastMunmapHostStats();
+// Calling-thread-only host API timings for the offline memory benchmark. These
+// declarations and their instrumentation do not exist in the emulator target.
+void TestBeginBackingApiStats();
+TestBackingApiStats TestEndBackingApiStats();
 void     TestBeforeNextBackingMap(callback_func_t callback);
+void TestWithBackingStateLocked(callback_func_t callback, uint64_t vaddr, uint64_t size);
 void     TestFailNextPhysicalMemoryUnmap();
 void     TestFailPhysicalMemoryUnmapAfter(uint32_t successful_unmaps);
 void     TestFailGuestBackingStoreUnmapAfter(uint32_t successful_unmaps);
 void     TestFailNextFixedReserveRangeRegistration();
 void     TestFailNextVirtualRangeReplacement();
 bool     TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size);
+bool     TestVirtualRangeIsReserved(uint64_t vaddr, uint64_t size);
 bool     TestGuestAddressRangeIsOwned(uint64_t vaddr, uint64_t size);
 bool     TestGuestBackingOutsideAddressSpace();
 uint64_t TestGuestBackingSize();

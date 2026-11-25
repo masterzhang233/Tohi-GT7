@@ -23,13 +23,16 @@ $required = @('launcher.exe','kyty_emulator.exe','Start-GT7-Desktop.ps1','Start-
     'Qt6Network.dll','Qt6Svg.dll','Qt6Widgets.dll','libwinpthread-1.dll','msvcp140.dll',
     'vcruntime140.dll','vcruntime140_1.dll','msvcp140_1.dll','msvcp140_2.dll',
     'msvcp140_atomic_wait.dll','msvcp140_codecvt_ids.dll','icuuc.dll',
-    'platforms\qwindows.dll','patches\GT7\patches.json',
-    'kyty_dlss_backend.dll','nvngx_dlss.dll','amd_fidelityfx_vk.dll',
-    'docs\GT7.md','docs\GT7-FSR-FRAME-GENERATION.md',("docs\RELEASE-" + $version + '.zh-CN.md'),'LICENSE',
+    'platforms\qwindows.dll','patches\GT7\patches.json','patches\GT7\GT7-PSSR-1080-to-4K.json',
+    'kyty_dlss_backend.dll','nvngx_dlss.dll','nvngx_dlssg.dll','NvLowLatencyVk.dll',
+    'sl.interposer.dll','sl.common.dll','sl.dlss_g.dll','sl.reflex.dll','sl.pcl.dll',
+    'docs\GT7.md','docs\NATIVE-PSSR-DLSS.md','docs\GT7-NVIDIA-FRAME-GENERATION.md',("docs\RELEASE-" + $version + '.zh-CN.md'),'LICENSE',
     'translations\qt_zh_CN.qm',
     'licenses\Kyty-MIT.txt','licenses\nvidia\LICENSE.txt',
     'licenses\nvidia\NVIDIA-DLSS-NOTICE.md',
-    'licenses\fidelityfx\LICENSE.txt','licenses\fidelityfx\provenance.json',
+    'licenses\nvidia\NVIDIA-STREAMLINE-NOTICE.md',
+    'licenses\nvidia\streamline\LICENSE.txt','licenses\nvidia\streamline\THIRD-PARTY-LICENSES.md',
+    'licenses\nvidia\streamline\RTX-SDK-LICENSE.txt','licenses\nvidia\streamline\REFLEX-LICENSE.txt',
     'licenses\ffmpeg\copyright','licenses\ffmpeg\SOURCE.txt','licenses\opus\COPYING',
     'licenses\qt\Qt-NOTICE.md','licenses\qt\Qt-LGPL-3.0-only.txt',
     'licenses\qt\Qt-GPL-3.0-only.txt','licenses\openvr\LICENSE',
@@ -42,20 +45,88 @@ foreach ($relative in $required) {
     }
 }
 
-# This is the tested full desktop preset, not a generic source-build artifact.
-# Pin the unmodified vendor runtimes so a stale or partial install cannot silently
-# become the default-enabled DLSS + frame-generation release.
+# Pin the exact PSSR backend and production SR/FG bundle used by the native
+# integration. All eight NVIDIA DLLs must share the extracted release directory.
+$backendHash = '60cfdbbc405a641570e30c330638e5e662a271f977638bdd2df36f1d80f06ecf'
+if ((Get-FileHash -LiteralPath (Join-Path $source 'kyty_dlss_backend.dll') -Algorithm SHA256).Hash -ine $backendHash) {
+    throw 'Unvalidated or stale PSSR backend in Windows installation.'
+}
 $vendorHashes = [ordered]@{
     'nvngx_dlss.dll' = 'd00b5b0ab29c3ca101b70c3a5ecb3a01b7ef33766a3383a28a18623083e6123e'
-    'amd_fidelityfx_vk.dll' = 'a1624cc4238fef046f30c4d80ce3f47be63fc5f5373f49e3ee9edb9960f54c78'
+    'sl.interposer.dll' = 'b1d7395aebd7b9722841d64dcf7433680020b6a8e421f851c16d5ba0c2182edf'
+    'sl.common.dll' = '38eea3b4209afc455636ea372b5933d65fcc13becec6c84d101dcfc4d8648f75'
+    'sl.dlss_g.dll' = '3ed9538df724993bea8a050195a6a78b9c8c8a566d5b05ade477aab3c390e90f'
+    'sl.reflex.dll' = '443577e869352436ff7ec8f4d9c90418d3e95368436ce219261e0f4f07a38122'
+    'sl.pcl.dll' = '5698c38e722318681f215c9fe68e45b9bedd51378acc699d8eee26e961e57770'
+    'nvngx_dlssg.dll' = '8d59d49b36410dd6b62fef2503a5871d347415bd85d943fa0848563a95dd50c7'
+    'NvLowLatencyVk.dll' = '2a77dc3e1c724b7eea5755be0ae7423752e79a2459fae72181a9f00e3507e5d6'
 }
-foreach ($relative in $vendorHashes.Keys) {
-    $actualHash = (Get-FileHash -LiteralPath (Join-Path $source $relative) -Algorithm SHA256).Hash
-    if ($actualHash -ine $vendorHashes[$relative]) {
-        throw "Unvalidated vendor runtime in Windows installation: $relative"
+$vendorEvidence = @($vendorHashes.Keys | ForEach-Object {
+    $relative = $_
+    $path = Join-Path $source $relative
+    $actualHash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actualHash -ne $vendorHashes[$relative]) { throw "Unvalidated vendor runtime: $relative" }
+    $signature = Get-AuthenticodeSignature -LiteralPath $path
+    if ($signature.Status -ne 'Valid' -or $null -eq $signature.SignerCertificate -or
+        $signature.SignerCertificate.Subject -notmatch '(^|,\s*)O=NVIDIA Corporation(,|$)') {
+        throw "Vendor runtime lacks a valid NVIDIA signature: $relative"
+    }
+    $file = Get-Item -LiteralPath $path
+    $version = $null
+    if (-not [string]::IsNullOrWhiteSpace($file.VersionInfo.FileVersion)) {
+        $version = '{0}.{1}.{2}.{3}' -f $file.VersionInfo.FileMajorPart, $file.VersionInfo.FileMinorPart,
+            $file.VersionInfo.FileBuildPart, $file.VersionInfo.FilePrivatePart
+    }
+    $expectedVersion = $(if ($relative -eq 'NvLowLatencyVk.dll') { $null }
+        elseif ($relative.StartsWith('sl.')) { '2.14.16.0' } else { '310.9.16.0' })
+    if ($version -ne $expectedVersion) { throw "Vendor runtime version mismatch: $relative" }
+    [ordered]@{name=$relative; sha256=$actualHash; version=$version;
+        signature=$signature.Status.ToString(); signer=$signature.SignerCertificate.Subject}
+})
+# A build may retain the legacy FSR feature; it is not the native preset provider.
+if (Test-Path -LiteralPath (Join-Path $source 'amd_fidelityfx_vk.dll') -PathType Leaf) {
+    $vendorHashes['amd_fidelityfx_vk.dll'] = 'a1624cc4238fef046f30c4d80ce3f47be63fc5f5373f49e3ee9edb9960f54c78'
+    if ((Get-FileHash -LiteralPath (Join-Path $source 'amd_fidelityfx_vk.dll') -Algorithm SHA256).Hash -ine $vendorHashes['amd_fidelityfx_vk.dll']) {
+        throw 'Unvalidated optional legacy FSR runtime.'
+    }
+    foreach ($relative in @('licenses\fidelityfx\LICENSE.txt','licenses\fidelityfx\provenance.json')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $source $relative) -PathType Leaf)) {
+            throw "Missing optional FSR runtime notice: $relative"
+        }
+    }
+}
+$licenseHashes = [ordered]@{
+    'licenses\nvidia\streamline\LICENSE.txt' = '7b6f23e7d6f3ad6292f9308d2b42cdc3d82ae4e9b2abb55f230279d83bedd43d'
+    'licenses\nvidia\streamline\THIRD-PARTY-LICENSES.md' = 'cb251639994465f31d2178c16acedf1ff4f9cef1c370a09782ed36d4c86c1dca'
+    'licenses\nvidia\streamline\RTX-SDK-LICENSE.txt' = '3027f23ca5a46dd9cb8183fbd522983a86f64d7daac5982912bf9f214671f294'
+    'licenses\nvidia\streamline\REFLEX-LICENSE.txt' = 'ebf83c07fb3b2939908c3795d887afde3161c89a28ba391724efc784ce1bdabe'
+}
+foreach ($relative in $licenseHashes.Keys) {
+    if ((Get-FileHash -LiteralPath (Join-Path $source $relative) -Algorithm SHA256).Hash -ine $licenseHashes[$relative]) {
+        throw "Changed or missing vendor license: $relative"
     }
 }
 $dlssVersion = (Get-Item -LiteralPath (Join-Path $source 'nvngx_dlss.dll')).VersionInfo.FileVersion
+
+if ((Get-FileHash -LiteralPath (Join-Path $source 'patches\GT7\GT7-PSSR-1080-to-4K.json') -Algorithm SHA256).Hash -ine
+    '282da91e431164d1c2437bf7071239e2b26ec1cd824bf0a86e938bb6fce32b30') {
+    throw 'Unvalidated native 1080p-to-4K profile.'
+}
+
+$patchManifest = Get-Content -LiteralPath (Join-Path $source 'patches\GT7\patches.json') -Raw | ConvertFrom-Json
+$nativePatch = @($patchManifest.patches | Where-Object { $_.file -ceq 'GT7-PSSR-1080-to-4K.json' })
+if ($nativePatch.Count -ne 1 -or $nativePatch[0].sha256 -cne
+    '282da91e431164d1c2437bf7071239e2b26ec1cd824bf0a86e938bb6fce32b30') {
+    throw 'Native 1080p-to-4K profile is not registered with its validated digest.'
+}
+foreach ($patch in $patchManifest.patches) {
+    if ([string]$patch.file -match '[/\\:]|^\.\.?$' -or [string]::IsNullOrWhiteSpace([string]$patch.file)) {
+        throw 'GT7 patch manifest contains an unsafe filename.'
+    }
+    if ((Get-FileHash -LiteralPath (Join-Path $source ('patches\GT7\' + $patch.file)) -Algorithm SHA256).Hash -ine $patch.sha256) {
+        throw "GT7 patch manifest hash mismatch: $($patch.file)"
+    }
+}
 
 # Only the pinned, unmodified OFL font is distributable through this package.
 # Never enumerate/copy a user's fonts folder or the Windows Fonts directory.
@@ -77,7 +148,7 @@ foreach ($file in @('launcher.exe','kyty_emulator.exe','Start-GT7-Desktop.ps1','
 [void][IO.Directory]::CreateDirectory((Join-Path $stage 'fonts'))
 Copy-Item -LiteralPath (Join-Path $source 'fonts\NotoSansCJKsc-Regular.otf') -Destination (Join-Path $stage 'fonts')
 Get-ChildItem -LiteralPath $source -Filter '*.dll' -File | ForEach-Object {
-    if ($_.Name -notmatch '^(Qt6[A-Za-z0-9_]+|icu[a-z0-9_]*|concrt140|msvcp140(?:_[a-z0-9_]+)?|vcruntime140(?:_[a-z0-9_]+)?|vccorlib140|libwinpthread-1|kyty_dlss_backend|nvngx_dlss|amd_fidelityfx_vk)\.dll$') {
+    if ($_.Name -notmatch '^(Qt6[A-Za-z0-9_]+|icu[a-z0-9_]*|concrt140|msvcp140(?:_[a-z0-9_]+)?|vcruntime140(?:_[a-z0-9_]+)?|vccorlib140|libwinpthread-1|kyty_dlss_backend|nvngx_dlssg?|NvLowLatencyVk|sl\.(?:interposer|common|dlss_g|reflex|pcl)|amd_fidelityfx_vk)\.dll$') {
         throw "Unexpected DLL in release installation: $($_.Name)"
     }
     Copy-Item -LiteralPath $_.FullName -Destination $stage
@@ -116,7 +187,7 @@ $sums = foreach ($file in $files) {
         $file.Extension -in @('.pdb','.map','.log','.dmp','.gpudmp','.bin','.raw','.rgba16f','.ini')) {
         throw "Game, user state or diagnostic content found in release: $relative"
     }
-    if ($file.Extension -in @('.md','.txt','.json','.ps1','.xml')) {
+    if ($file.Extension -in @('.md','.txt','.json','.ps1','.cmd','.xml')) {
         $content = [IO.File]::ReadAllText($file.FullName)
         if ($content -match '(?i)[a-z]:[\\/](Users|Documents and Settings)[\\/]') {
             throw "Builder-specific absolute path found in release: $relative"
@@ -140,11 +211,22 @@ $manifest = [ordered]@{
     sha256 = $digest
     files = $files.Count + 1
     staged_directory = [IO.Path]::GetFileName($stage)
-    desktop_preset = '1920x1080 -> 2560x1440 DLSS Quality/K + Vulkan FSR 3.1.4 2x + occlusion guard'
+    desktop_preset = '1920x1080 -> 3840x2160 native PSSR inputs to NVIDIA DLSS, preset M, optional fixed NVIDIA 2X frame generation'
+    supported_gpu_families = @('GeForce RTX 40','GeForce RTX 50')
+    tested_gpu = 'GeForce RTX 5080'
+    all_supported_gpu_models_verified = $false
+    frame_generation_provider = 'nvidia-streamline-vulkan'
+    frame_generation_requested_multiplier = 2
+    frame_generation_requested_generated_frames_per_real = 1
+    higher_mfg_multipliers_available = $false
+    generation_request_is_not_runtime_verification = $true
+    backend_sha256 = $backendHash
+    nvidia_runtime_verification = $vendorEvidence
+    nvidia_license_sha256 = $licenseHashes
     dlss_runtime_file_version = $dlssVersion
     vendor_runtime_sha256 = $vendorHashes
     font_asset_sha256 = $fontHashes
     created_utc = [DateTime]::UtcNow.ToString('o')
 }
-$manifest | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $output 'release-manifest.json') -Encoding UTF8
-$manifest | ConvertTo-Json -Depth 3
+$manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $output 'release-manifest.json') -Encoding UTF8
+$manifest | ConvertTo-Json -Depth 6

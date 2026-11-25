@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_COMMANDSCHEDULER_H_
 
 #include "common/common.h"
+#include "common/eventTrace.h"
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -198,12 +199,24 @@ public:
 	void                      PopPendingOperations(bool wait = true);
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
+	// GPU-thread ownership checks before an unmap: ordinary callbacks may also access guest
+	// memory, so an empty priority queue alone does not make a full drain unnecessary.
+	[[nodiscard]] bool        HasPendingOperations();
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	// As DeferOperation, also between guest command buffers (no active command buffer): runs
 	// once the GPU has finished the current tick, so work submitted earlier, still running, can
 	// keep using what the operation releases.
 	void                      DeferRelease(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
+	// Explicit context, including an empty pre-arm context, is never recaptured on
+	// the callback thread. Interrupt callbacks also capture this value in their closure.
+	void DeferPriorityOperation(Common::UniqueFunction<void>&& operation,
+	                            const Common::EventTrace::CallbackContext& trace);
+	[[nodiscard]] Common::EventTrace::CallbackContext CapturePriorityCallback(
+	    int32_t event_id, uint32_t context_id) const noexcept {
+		return Common::EventTrace::CaptureCallback(m_event_trace_scheduler_id, CurrentTick(),
+		                                          event_id, context_id, 0);
+	}
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 	// Hands later submissions to a dedicated queue thread, which submits them in tick order, so
 	// vkQueueSubmit (and the queue lock that present also takes) leaves the recording thread.
@@ -292,6 +305,7 @@ private:
 	struct PendingOperation {
 		Common::UniqueFunction<void> callback;
 		uint64_t                     tick = 0;
+		Common::EventTrace::CallbackContext trace {};
 	};
 
 	// A finished command buffer and everything its vkQueueSubmit needs, including the recording
@@ -307,6 +321,9 @@ private:
 		uint32_t          debug_arg2   = 0;
 		uint32_t          debug_arg3   = 0;
 		uint64_t          debug_arg4   = 0;
+		uint64_t          trace_handoff_ns = 0, trace_submission_id = 0, trace_request_id = 0;
+		uint32_t          trace_source_queue = 0, trace_source_type = 0;
+		bool              trace_priority_tick = false;
 	};
 
 	struct RecordedCommand {
@@ -349,7 +366,13 @@ private:
 	void StopSubmitThread();
 	void PriorityOperationsThread(std::stop_token stop);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
+	void RunPriorityOperation(Common::UniqueFunction<void>&& operation,
+	                          const Common::EventTrace::CallbackContext& trace, bool deferred);
 
+	const uint64_t               m_event_trace_scheduler_id = Common::EventTrace::NewIdentity();
+	// Only the command-buffer producer updates/consumes this marker; workers
+	// receive SubmitJob's immutable snapshot and never inspect this member.
+	Common::EventTrace::PriorityTickSelection m_event_trace_tick_selection;
 	MasterSemaphore              m_master;
 	RenderContext&               m_context;
 	GraphicContext&              m_graphics;

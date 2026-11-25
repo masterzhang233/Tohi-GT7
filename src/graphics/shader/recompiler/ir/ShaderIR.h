@@ -615,6 +615,15 @@ struct ResourceBlock {
 	std::vector<uint32_t> srt_reads;
 };
 
+// A native-SSA proof of the full POS0 expression, not a camera-block layout guess.
+// The versioned kind includes row-vector/row-major 4x4 shape and all-path coverage.
+enum class PositionMatrixKind : uint32_t { None, UserDataRowMajor4x4V1 };
+struct PositionMatrixContract {
+	PositionMatrixKind kind = PositionMatrixKind::None;
+	uint32_t user_sgpr = 0;
+	uint32_t byte_offset = 0;
+};
+
 // Stable shader metadata consumed by the renderer after native IR has been discarded.
 // Serialized by the shader disk cache (shaderDiskCache.cpp, Visit): a new field goes there too.
 struct CompiledShaderInfo {
@@ -628,6 +637,7 @@ struct CompiledShaderInfo {
 	bool                          has_address_writes  = false;
 	// Proved on native SSA, before scalar reads become resource snapshots.
 	bool                          gt7_camera_position = false;
+	PositionMatrixContract        position_matrix;
 	ShaderInfo                    info;
 	BindingLayout                 bindings;
 };
@@ -745,6 +755,7 @@ struct Program: ResourcePlan {
 	std::vector<ExportInfo>       export_info;
 	bool                          has_address_writes = false;
 	bool                          gt7_camera_position = false;
+	PositionMatrixContract        position_matrix;
 	bool                          shader_info_complete = false;
 	BindingLayout                 bindings;
 	bool                          binding_layout_complete = false;

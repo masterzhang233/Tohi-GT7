@@ -44,6 +44,10 @@ struct FrameInputs {
 // Opt-in KYTY_GT7_FSR_FG=1. Requested loads only the adjacent AMD runtime,
 // once, before device creation; missing dependencies leave frame generation off.
 [[nodiscard]] bool Requested();
+// Shared capture contract for either FSR or native NVIDIA presentation. Native
+// DLSS-G does not use the FidelityFX queues; their absence must not suppress
+// real camera/depth/motion/HUD-less capture.
+[[nodiscard]] bool InputsRequested(const GraphicContext& graphics);
 void OnQueues(GraphicContext& graphics);
 [[nodiscard]] bool OwnsSwapchain();
 // True only after a recent successful, non-reset interpolation dispatch.

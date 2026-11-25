@@ -4,11 +4,11 @@
  <widget class="QDialog" name="MainDialog">
   <property name="geometry"><rect><x>0</x><y>0</y><width>1120</width><height>760</height></rect></property>
   <property name="minimumSize"><size><width>900</width><height>660</height></size></property>
-  <property name="windowTitle"><string>Tohi-GT7 1.0.0</string></property>
+  <property name="windowTitle"><string>Tohi-GT7</string></property>
   <layout class="QVBoxLayout" name="mainLayout">
-   <property name="spacing"><number>14</number></property>
+   <property name="spacing"><number>12</number></property>
    <property name="leftMargin"><number>26</number></property>
-   <property name="topMargin"><number>26</number></property>
+   <property name="topMargin"><number>22</number></property>
    <property name="rightMargin"><number>26</number></property>
    <property name="bottomMargin"><number>20</number></property>
    <item>
@@ -16,39 +16,46 @@
      <layout class="QVBoxLayout" name="gt7FeatureLayout">
       <property name="spacing"><number>12</number></property>
       <property name="leftMargin"><number>22</number></property>
-      <property name="topMargin"><number>22</number></property>
+      <property name="topMargin"><number>18</number></property>
       <property name="rightMargin"><number>22</number></property>
-      <property name="bottomMargin"><number>22</number></property>
+      <property name="bottomMargin"><number>18</number></property>
       <item><layout class="QHBoxLayout" name="gt7TitleLayout">
        <item><widget class="QLabel" name="gt7_feature_title"><property name="text"><string>Tohi-GT7</string></property></widget></item>
        <item><spacer name="titleSpacer"><property name="orientation"><enum>Qt::Horizontal</enum></property><property name="sizeHint" stdset="0"><size><width>40</width><height>20</height></size></property></spacer></item>
-       <item><widget class="QLabel" name="gt7_release_badge"><property name="text"><string>1.0.0  /  RELEASE</string></property></widget></item>
+       <item><widget class="QLabel" name="gt7_release_badge"><property name="text"><string>RELEASE</string></property></widget></item>
       </layout></item>
-      <item><widget class="QLabel" name="gt7_feature_hint"><property name="text"><string>Ready for your next drive.</string></property></widget></item>
+      <item><widget class="QLabel" name="gt7_feature_hint"><property name="text"><string>Ready for your next drive.</string></property><property name="wordWrap"><bool>true</bool></property></widget></item>
       <item><widget class="QLabel" name="gt7_feature_credit"><property name="text"><string>masterzhang233 · based on KytyPS5-GT7</string></property></widget></item>
      </layout>
     </widget>
    </item>
    <item>
     <widget class="QFrame" name="gt7_graphics_panel">
-     <layout class="QHBoxLayout" name="gt7ActionLayout">
+     <layout class="QHBoxLayout" name="gt7ActionLayout" stretch="1,0">
       <property name="leftMargin"><number>20</number></property>
       <property name="topMargin"><number>16</number></property>
       <property name="rightMargin"><number>18</number></property>
       <property name="bottomMargin"><number>16</number></property>
       <property name="spacing"><number>22</number></property>
-      <item><widget class="QCheckBox" name="gt7_dlss_checkbox">
-       <property name="text"><string>DLSS</string></property>
-       <property name="checked"><bool>true</bool></property>
-       <property name="toolTip"><string>Fixed 1080p to 1440p DLSS with FSR 2x frame generation and wheel ghosting correction. Requires NVIDIA RTX. Changes apply on the next launch.</string></property>
-      </widget></item>
-      <item><widget class="QLabel" name="gt7_feature_summary">
-       <property name="text"><string>1920 x 1080 → 2560 x 1440 · DLSS + FSR 2x frame generation</string></property>
-       <property name="wordWrap"><bool>true</bool></property>
-       <property name="sizePolicy"><sizepolicy hsizetype="Expanding" vsizetype="Preferred"><horstretch>1</horstretch><verstretch>0</verstretch></sizepolicy></property>
-      </widget></item>
+      <item><layout class="QVBoxLayout" name="graphicsDetailsLayout">
+       <property name="spacing"><number>7</number></property>
+       <item><widget class="QCheckBox" name="gt7_dlss_checkbox">
+        <property name="text"><string>4K + NVIDIA 2X</string></property>
+        <property name="checked"><bool>true</bool></property>
+        <property name="toolTip"><string>Uses native PSSR inputs with the PC DLSS backend at 1920 x 1080 to 3840 x 2160. NVIDIA fixed 2X adds one generated frame per rendered frame. Supports NVIDIA GeForce RTX 40/50 series only. Changes apply on the next launch.</string></property>
+       </widget></item>
+       <item><widget class="QLabel" name="gt7_feature_summary">
+        <property name="text"><string>1080p → 4K · Native PSSR inputs + DLSS · Fixed 2X frame generation</string></property>
+        <property name="wordWrap"><bool>true</bool></property>
+        <property name="sizePolicy"><sizepolicy hsizetype="Expanding" vsizetype="Preferred"><horstretch>1</horstretch><verstretch>0</verstretch></sizepolicy></property>
+       </widget></item>
+       <item><widget class="QLabel" name="gt7_graphics_support">
+        <property name="text"><string>GeForce RTX 40/50 series only · Applies on next launch</string></property>
+        <property name="wordWrap"><bool>true</bool></property>
+       </widget></item>
+      </layout></item>
       <item><widget class="QPushButton" name="gt7_start_button">
-       <property name="minimumSize"><size><width>160</width><height>44</height></size></property>
+       <property name="minimumSize"><size><width>180</width><height>52</height></size></property>
        <property name="text"><string>Start game</string></property>
        <property name="autoDefault"><bool>false</bool></property>
       </widget></item>
@@ -73,9 +80,9 @@
       <property name="leftMargin"><number>16</number></property><property name="topMargin"><number>12</number></property><property name="rightMargin"><number>16</number></property><property name="bottomMargin"><number>12</number></property>
       <item><widget class="QLabel" name="label_settings_file"><property name="text"><string notr="true">Settings</string></property></widget></item>
       <item><widget class="QLabel" name="label_Interpreter"><property name="text"><string notr="true">Runtime</string></property></widget></item>
-      <item><widget class="QLabel" name="graphics_credit"><property name="text"><string notr="true">NVIDIA DLSS / NVIDIA GeForce RTX™ · AMD FidelityFX FSR 3.1.4</string></property></widget></item>
+      <item><widget class="QLabel" name="graphics_credit"><property name="wordWrap"><bool>true</bool></property><property name="text"><string>NVIDIA DLSS Super Resolution + Frame Generation</string></property></widget></item>
       <item><layout class="QHBoxLayout" name="versionLayout">
-       <item><widget class="QLabel" name="label_Version"><property name="text"><string>Tohi-GT7 1.0.0</string></property></widget></item>
+       <item><widget class="QLabel" name="label_Version"><property name="text"><string>Tohi-GT7</string></property></widget></item>
        <item><spacer name="versionSpacer"><property name="orientation"><enum>Qt::Horizontal</enum></property><property name="sizeHint" stdset="0"><size><width>40</width><height>20</height></size></property></spacer></item>
        <item><widget class="QLabel" name="check_updates_link"><property name="text"><string>&lt;a href=&quot;check&quot;&gt;Check for updates&lt;/a&gt;</string></property><property name="textFormat"><enum>Qt::RichText</enum></property></widget></item>
        <item><widget class="QCheckBox" name="check_updates_on_startup"><property name="text"><string>Check for updates on startup</string></property></widget></item>

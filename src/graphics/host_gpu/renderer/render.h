@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "graphics/host_gpu/renderer/indirectDispatch.h"
+#include "graphics/host_gpu/renderer/dlss.h"
 #include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -245,6 +246,7 @@ public:
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                      uint32_t mode);
+	void ProcessPssr(CommandBuffer& buffer, const Pssr::Request& request);
 	// Round 99: one dispatch of a shader whose call is partitioned runs once per partition
 	// (PipelineCache::GetComputeProgram): these run the partition of partition->target (0: the
 	// first), and receive every partition's target.
@@ -291,6 +293,16 @@ public:
 
 private:
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
+	void ShutdownPssr();
+	[[nodiscard]] bool Upscale(vk::CommandBuffer command, const Pssr::Request& request,
+	                           Dlss::Inputs& inputs, bool& reset_used);
+	[[nodiscard]] Dlss::Resource PssrResource(const TextureBinding& binding, bool write) const;
+	struct DlssContext {
+		uint64_t context;
+		Dlss::Creation creation;
+		Dlss::Feature* feature;
+		bool reset_pending = true;
+	};
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 
 	struct GraphicsBindings {
@@ -416,6 +428,13 @@ private:
 	uint32_t                                m_mesh_indirect_next = 0;
 	// Experimental GT7 chain: one verified blur draw followed by one verified overlay draw.
 	uint32_t m_gt7_dlss_effects = 0;
+	vk::DescriptorSetLayout m_pssr_descriptor_layout = nullptr;
+	vk::PipelineLayout m_pssr_pipeline_layout = nullptr;
+	vk::Pipeline m_pssr_pipeline = nullptr;
+	std::vector<DlssContext> m_dlss_contexts;
+	uint64_t m_pssr_requests = 0;
+	uint64_t m_pssr_dlss_evaluations = 0;
+	uint64_t m_pssr_linear_fallbacks = 0;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

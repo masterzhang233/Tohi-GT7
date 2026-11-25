@@ -39,7 +39,7 @@ bool CleanBytesEqual(RenderContext& context, uint64_t address,
 	constexpr auto size = sizeof(expected);
 	if (address == 0 || address > std::numeric_limits<uint64_t>::max() - size ||
 	    Libs::LibKernel::Memory::TryClampRangeSize(address, size) != size ||
-	    context.GetBufferCache().HasGpuDirtyBytes(address, size)) {
+	    !context.GetBufferCache().IsCleanForConcurrentRead(address, size)) {
 		return false;
 	}
 	std::array<float, N> actual {};

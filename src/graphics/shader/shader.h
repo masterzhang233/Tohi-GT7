@@ -48,11 +48,15 @@ enum class ShaderType {
 
 namespace ShaderRecompiler::IR {
 struct CompiledShaderInfo;
+struct ResourcePlan;
 } // namespace ShaderRecompiler::IR
 
 struct ShaderStageRuntime {
 	const ShaderRecompiler::IR::CompiledShaderInfo* program = nullptr;
 	const ShaderRecompiler::IR::ResourceSnapshot*   resources = nullptr;
+	// Immutable scalar-read expressions belonging to this exact snapshot source.
+	// The owner/lifetime is the same SourceEntry as resources; not serialized.
+	const ShaderRecompiler::IR::ResourcePlan*       resource_plan = nullptr;
 
 	[[nodiscard]] explicit operator bool() const {
 		return program != nullptr && resources != nullptr;

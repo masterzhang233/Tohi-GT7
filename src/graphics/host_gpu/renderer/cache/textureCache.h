@@ -117,11 +117,22 @@ public:
 		return image;
 	}
 	void MarkGpuWritten(ImageId id);
+	// Optional snapshot of the first fail-closed/overlap branch. No image is
+	// resolved or read from guest memory to fill this diagnostic.
+	struct WriteOverlapDiagnostic {
+		const char* reason = "none";
+		const char* source = "none";
+		ImageId image {}, via {};
+		GuestRange data {}, stencil {}, metadata {};
+		ImageMetadataKind metadata_kind = ImageMetadataKind::None;
+		bool present = false, registered = false;
+	};
 	// Whether a guest write can change a watched image, directly or through a cached
 	// pixel/stencil alias's metadata. Invalid ranges or a retired watched ID fail closed.
 	// Takes m_lock; do not call while holding the texture-cache lock.
 	[[nodiscard]] bool WriteOverlapsImage(GuestRange write, ImageId watched,
-	                                      GuestRange watched_range);
+	                                      GuestRange watched_range,
+	                                      WriteOverlapDiagnostic* diagnostic = nullptr);
 	// Ownership only: the complete write is exactly DCC metadata of a live pixel
 	// alias, and cannot reach pixel/stencil bytes or another metadata kind. The caller
 	// must separately prove the written bytes cannot encode a clear (expanded 0xff).
@@ -166,6 +177,8 @@ public:
 	// bytes over its own.
 	[[nodiscard]] std::vector<std::pair<uint64_t, uint64_t>> PendingWriteBacks() const;
 
+	// GPU-thread ownership query, including every live image overlapping the exact byte range.
+	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
 	void UnmapMemory(uint64_t address, uint64_t size);
 	// Whether the GPU's writes to an image like this go back to guest memory after each
 	// submission, for the CPU to read: linear images up to KYTY_READBACK_SMALL_IMAGES_KB, or every
@@ -402,6 +415,8 @@ private:
 		bool     fill_known = false;
 		// The HTile's size (its depth target's last binding), 0 when not known.
 		uint64_t size = 0;
+		// Depth bindings sharing this HTile keep its clear/fill state alive together.
+		std::vector<ImageId> owners;
 	};
 
 	struct OverlapResult {
@@ -462,6 +477,9 @@ private:
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);
+	// Caller holds m_lock. Use the registered binding, not mutable image.info.metadata.
+	void                      UnregisterHtileOwner(ImageId id);
+	void                      RegisterHtileOwner(ImageId id, const ImageInfo& info);
 	void                      ReleaseImage(ImageId id);
 	// `why` is logged when the image held pixels the GPU wrote that guest memory does not and
 	// that were not copied elsewhere (`copied`): they are lost. And for an image KYTY_TRACE_IMAGES
@@ -589,6 +607,7 @@ private:
 	std::unordered_map<ImageId, std::vector<SubExtentCopyEntry>> m_sub_extent_copies;
 	std::unordered_set<ImageId>                       m_bindless_evictable;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	std::unordered_map<ImageId, uint64_t>             m_image_htile_metas;
 	// The addresses color targets' CMASK and DCC start at (IsColorMeta).
 	std::unordered_set<uint64_t> m_color_metas;
 	// Image write-backs still to land, one entry each (PendingWriteBacks); shared with their

@@ -6,6 +6,7 @@
 #include "common/slotVector.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
+#include "graphics/host_gpu/renderer/image/externalWriteState.h"
 
 #include <mutex>
 #include <compare>
@@ -93,18 +94,31 @@ public:
 
 	void InvalidateCpuWrite(uint64_t vaddr, uint64_t size) {
 		if (ImageRangeOverlaps(info.data.address, info.data.size, vaddr, size)) {
-			m_cpu_dirty        = true;
-			m_maybe_cpu_dirty  = false;
-			m_maybe_hash_valid = false;
+			MarkCpuDirty();
 		} else if (ImagePageRangesOverlap(info.data.address, info.data.size, vaddr, size)) {
+			NoteExternalWrite();
 			m_maybe_cpu_dirty = true;
 		}
 	}
+
+	// CPU/page invalidations and buffer alias writes invalidate a retained scene snapshot even
+	// after ResolveSurface uploads the replacement and clears its dirty flags. Completion advances
+	// it too: a CPU fault can precede the snapshot's version read while its upload occurs later.
+	// Ordinary image draws, clears, copies and UI writes are ordered/verified separately and do not advance this
+	// revision. It is per Image lifetime: callers must also compare the complete resource identity.
+	// The atomic is an observation counter, not synchronization for image pixels or dirty flags.
+	[[nodiscard]] uint64_t ExternalWriteVersion() const noexcept {
+		return m_external_writes.Version();
+	}
+	// Unlike Version, this does not advance when already-dirty bytes finish
+	// uploading. Used only to finalize a first, pending camera attachment witness.
+	[[nodiscard]] uint64_t ExternalWriteEpoch() const noexcept { return m_external_writes.Epoch(); }
 
 	[[nodiscard]] bool IsCpuDirty() const { return m_cpu_dirty || m_maybe_cpu_dirty; }
 	[[nodiscard]] bool IsDefinitelyCpuDirty() const { return m_cpu_dirty; }
 	[[nodiscard]] bool IsMaybeCpuDirty() const { return m_maybe_cpu_dirty; }
 	void               MarkMaybeCpuDirty() {
+		NoteExternalWrite();
 		if (!m_cpu_dirty) {
 			m_maybe_cpu_dirty = true;
 		}
@@ -125,13 +139,17 @@ public:
 		}
 		m_maybe_cpu_dirty  = false;
 		m_maybe_hash_valid = false;
-		m_cpu_dirty |= hash != m_maybe_cpu_hash;
+		if (hash != m_maybe_cpu_hash) {
+			NoteExternalWrite();
+			m_cpu_dirty = true;
+		}
 		return m_cpu_dirty;
 	}
 
 	// TextureCache::RefreshByContent: the guest bytes changed (definitely dirty), or they did not
 	// (a maybe-dirty mark is dropped).
 	void MarkCpuDirty() {
+		NoteExternalWrite();
 		m_cpu_dirty        = true;
 		m_maybe_cpu_dirty  = false;
 		m_maybe_hash_valid = false;
@@ -145,6 +163,7 @@ public:
 		if (!IsCpuDirty()) {
 			EXIT("clean image cannot complete a refresh\n");
 		}
+		m_external_writes.NoteRefresh();
 		m_cpu_dirty        = false;
 		m_maybe_cpu_dirty  = false;
 		m_maybe_hash_valid = false;
@@ -155,8 +174,16 @@ public:
 	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
-	void               MarkBufferModified() noexcept { m_buffer_modified = true; }
-	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
+	void               MarkBufferModified() noexcept {
+		NoteExternalWrite();
+		m_buffer_modified = true;
+	}
+	void               ClearBufferModified() noexcept {
+		if (m_buffer_modified) {
+			m_external_writes.NoteRefresh();
+			m_buffer_modified = false;
+		}
+	}
 
 	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size,
 	                            bool pages = false) const noexcept {
@@ -235,6 +262,10 @@ public:
 private:
 	friend struct ImageTestAccess;
 
+	void NoteExternalWrite() noexcept {
+		m_external_writes.NoteWrite();
+	}
+
 	[[nodiscard]] static vk::ImageAspectFlags FullAspectMask(vk::Format format) noexcept;
 	[[nodiscard]] static uint32_t             CopyRows(uint64_t row_size, uint32_t rows,
 	                                                   uint64_t capacity) noexcept;
@@ -243,6 +274,7 @@ private:
 
 	GraphicContext&   m_graphics;
 	CommandScheduler& m_scheduler;
+	ImageExternalWriteState m_external_writes;
 	uint64_t          m_maybe_cpu_hash   = 0;
 	bool              m_cpu_dirty        = false;
 	bool              m_maybe_cpu_dirty  = false;

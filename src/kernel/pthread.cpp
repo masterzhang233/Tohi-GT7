@@ -6,12 +6,15 @@
 #include "common/emulatorConfig.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/profiler.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "kernel/conditionWaitTrace.h"
 #include "kernel/memory.h"
+#include "kernel/signalSleep.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/runtimeLinker.h"
@@ -402,6 +405,7 @@ struct PthreadPrivate {
 	uintptr_t             guest_host_rbp;
 	uint64_t              cond_sequence = 0;
 	std::condition_variable cond_cv;
+	ConditionWaitTrace::State source_cond_wait;
 	std::atomic<uint64_t> pending_signal_mask {0};
 	// Round 127: the stack of the game's memory this thread runs on, while it is a live stack
 	// (Memory::AddLiveThreadStack); zero for one of the emulator's.
@@ -480,6 +484,7 @@ static void CondRemoveWaiter(PthreadCondPrivate* cond, Pthread thread) {
 
 static void CondWakeWaiter(PthreadCondPrivate* cond, Pthread thread) {
 	EXIT_IF(cond == nullptr);
+	const uint32_t source_wake_kind = thread != nullptr ? 2u : 1u;
 
 	if (thread == nullptr) {
 		if (cond->waiters.empty()) {
@@ -495,8 +500,11 @@ static void CondWakeWaiter(PthreadCondPrivate* cond, Pthread thread) {
 
 	cond->waiters.erase(it);
 	thread->cond_sequence++;
+	const auto source_wake = ConditionWaitTrace::MakeWake(
+	    thread->source_cond_wait, cond, thread->cond_sequence, source_wake_kind);
 	// Notify while holding cond->m so the selected waiter cannot exit and be freed first.
 	thread->cond_cv.notify_one();
+	ConditionWaitTrace::PublishWake(source_wake);
 }
 
 void PthreadWakeForSignal(Pthread thread) {
@@ -560,33 +568,10 @@ static void CondWaitUntil(Lock& lock, std::condition_variable& cv, const Ready& 
 	}
 }
 
-static void SleepMicroWithSignalPoll(uint64_t microseconds) {
-	if (microseconds == 0) {
-		KernelDispatchPendingSignalForCurrentThread();
-		return;
-	}
-
-	while (microseconds > 0) {
-		const auto step = std::min<uint64_t>(microseconds, SIGNAL_APC_POLL_MICROS);
-		Common::Thread::SleepMicro(step);
-		microseconds -= step;
-		KernelDispatchPendingSignalForCurrentThread();
-	}
-}
-
 static void SleepNanoWithSignalPoll(uint64_t nanoseconds) {
-	if (nanoseconds == 0) {
-		KernelDispatchPendingSignalForCurrentThread();
-		return;
-	}
-
 	constexpr uint64_t poll_nanos = static_cast<uint64_t>(SIGNAL_APC_POLL_MICROS) * 1000ull;
-	while (nanoseconds > 0) {
-		const auto step = std::min<uint64_t>(nanoseconds, poll_nanos);
-		Common::Thread::SleepNano(step);
-		nanoseconds -= step;
-		KernelDispatchPendingSignalForCurrentThread();
-	}
+	Detail::SleepWithSignalPoll(nanoseconds, poll_nanos, Detail::SteadyNs,
+	                           Common::Thread::SleepNano, KernelDispatchPendingSignalForCurrentThread);
 }
 
 struct PthreadStaticObject {
@@ -2805,7 +2790,10 @@ int KYTY_SYSV_ABI PthreadCondBroadcast(PthreadCond* cond) {
 	std::lock_guard lock((*cond)->m);
 	for (auto* thread: (*cond)->waiters) {
 		thread->cond_sequence++;
+		const auto source_wake = ConditionWaitTrace::MakeWake(
+		    thread->source_cond_wait, *cond, thread->cond_sequence, 3);
 		thread->cond_cv.notify_one();
+		ConditionWaitTrace::PublishWake(source_wake);
 	}
 	(*cond)->waiters.clear();
 	return OK;
@@ -2945,6 +2933,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
 	CondAddWaiter(cond_value, thread);
+	(void)ConditionWaitTrace::NoteNested(thread->source_cond_wait);
 
 	uint32_t recurse = 0;
 	int      result  = NativeMutexUnlock(mutex_value, &recurse);
@@ -3015,6 +3004,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
 	CondAddWaiter(cond_value, thread);
+	(void)ConditionWaitTrace::NoteNested(thread->source_cond_wait);
 
 	uint32_t recurse = 0;
 	int      result  = NativeMutexUnlock(mutex_value, &recurse);
@@ -3072,11 +3062,19 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 	auto*            thread          = g_pthread_self;
 	const auto       thread_sequence = thread->cond_sequence;
 	CondAddWaiter(cond_value, thread);
+	const bool source_trace_active = ConditionWaitTrace::Begin(
+	    thread->source_cond_wait, cond_value,
+	    Common::SourceTrace::Enabled() ? Common::PerfStats::CurrentOsThreadId() : 0, 1);
+	uint64_t source_poll_returns = 0;
 
 	uint32_t recurse = 0;
 	int      result  = NativeMutexUnlock(mutex_value, &recurse);
 	if (result != OK) {
+		const auto source_wait = source_trace_active
+		    ? ConditionWaitTrace::CaptureReady(thread->source_cond_wait, cond_value, true)
+		    : Common::SourceTrace::Event {};
 		CondRemoveWaiter(cond_value, thread);
+		ConditionWaitTrace::Complete(source_wait, source_poll_returns, result);
 		return (result == EPERM ? KERNEL_ERROR_EPERM : KERNEL_ERROR_EINVAL);
 	}
 
@@ -3084,16 +3082,21 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 
 	while (!ready()) {
 		thread->cond_cv.wait_for(cond_lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
+		if (source_trace_active) ++source_poll_returns;
 		if (!ready()) {
 			cond_lock.unlock();
 			KernelDispatchPendingSignalForCurrentThread();
 			cond_lock.lock();
 		}
 	}
+	const auto source_wait = source_trace_active
+	    ? ConditionWaitTrace::CaptureReady(thread->source_cond_wait, cond_value)
+	    : Common::SourceTrace::Event {};
 	CondRemoveWaiter(cond_value, thread);
 	cond_lock.unlock();
 
 	result = NativeMutexLockRecurse(mutex_value, recurse);
+	ConditionWaitTrace::Complete(source_wait, source_poll_returns, result);
 
 	switch (result) {
 		case 0: return OK;
@@ -3117,6 +3120,10 @@ Pthread PthreadSelfOrNull() {
 
 Pthread PthreadSwapSelfForSignal(Pthread thread) {
 	auto* previous = g_pthread_self;
+	if (Common::SourceTrace::Enabled() && thread != nullptr &&
+	    Common::PerfStats::CurrentOsThreadId() != thread->host_thread_id) {
+		ConditionWaitTrace::MarkBorrowed(thread->source_cond_wait);
+	}
 	g_pthread_self = thread;
 	return previous;
 }
@@ -3901,12 +3908,12 @@ void KYTY_SYSV_ABI KernelSetThreadDtors(thread_dtors_func_t dtors) {
 }
 
 int KYTY_SYSV_ABI KernelUsleep(KernelUseconds microseconds) {
-	SleepMicroWithSignalPoll(microseconds);
+	SleepNanoWithSignalPoll(static_cast<uint64_t>(microseconds) * 1000ull);
 	return OK;
 }
 
 unsigned int KYTY_SYSV_ABI KernelSleep(unsigned int seconds) {
-	SleepMicroWithSignalPoll(static_cast<uint64_t>(seconds) * 1000000ull);
+	SleepNanoWithSignalPoll(static_cast<uint64_t>(seconds) * 1000000000ull);
 	return OK;
 }
 

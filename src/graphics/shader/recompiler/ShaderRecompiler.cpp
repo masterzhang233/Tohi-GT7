@@ -771,6 +771,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	// Scalar-address provenance and the final position expression are both present here.
 	// Resource tracking may replace these reads with snapshotted flat-buffer slots.
 	ir.gt7_camera_position = IR::HasGt7CameraPositionContract(ir);
+	ir.position_matrix = IR::ProvePositionMatrixContract(ir);
 	KYTY_PROFILER_PHASE(phases, "Shader: resource tracking", profiler::colors::Amber300);
 	const auto tracking_begin = std::chrono::steady_clock::now();
 	const bool tracked        = IR::TrackResources(ir, decoded, native_cfg);

@@ -100,7 +100,8 @@ public:
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
 	void DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
-	void TriggerInterrupt(int event_id, uint32_t context_id);
+	void TriggerInterrupt(int event_id, uint32_t context_id,
+	                      const Common::EventTrace::CallbackContext* trace = nullptr);
 
 private:
 	struct InterruptEqRegistration {

@@ -4,6 +4,7 @@
 #include "common/hostSymbols.h"
 #include "common/logging/log.h"
 #include "common/perfStats.h"
+#include "common/sourceTrace.h"
 #include "common/x64MemoryOperand.h"
 
 #include <algorithm>
@@ -11,6 +12,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <fmt/format.h>
 #include <functional>
 #include <map>
@@ -34,6 +36,37 @@
 namespace Common::Sampler {
 
 namespace {
+
+bool MirrorSilentDiagnostics() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GT7_PERF_DIAGNOSTICS");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	return enabled;
+}
+
+bool SourceMode() {
+	const char* sample = std::getenv("KYTY_SAMPLE_SOURCE");
+	const char* trace  = std::getenv("KYTY_GT7_SOURCE_TRACE");
+	return sample != nullptr && std::string_view(sample) == "1" &&
+	       trace != nullptr && std::string_view(trace) == "1";
+}
+
+bool NotifierModeRequested() {
+	const char* value = std::getenv("KYTY_SAMPLE_SOURCE_NOTIFIER");
+	return value != nullptr && std::string_view(value) == "1";
+}
+
+void WriteDiagnostic(std::string_view text) {
+	// Sampling remains separately opt-in through KYTY_SAMPLE. Preserve normal logging
+	// unless the performance diagnostic run explicitly needs output in Silent mode.
+	if (MirrorSilentDiagnostics() && Log::IsSilent() &&
+	    Log::GetDirection() == Log::Direction::Silent) {
+		Log::WriteToConsoleAndLog(text);
+	} else {
+		Log::WriteUnmuted(text);
+	}
+}
 
 std::vector<std::string> Patterns() {
 	std::vector<std::string> patterns;
@@ -91,6 +124,10 @@ std::vector<std::string> Patterns() {
 constexpr size_t MaxFrames  = 48;
 constexpr size_t PathFrames = 6; // a "paths" entry: the leaf and five frames below it
 constexpr size_t ChainDepth = 5; // a "waits" entry: the leaf and four emulator frames
+constexpr size_t SourceBufferSize = 256;
+constexpr size_t SourceTargetLimit = 64;
+constexpr size_t SourceSymbolLimit = 4096;
+constexpr uint64_t SourceCaptureLimit = 120'000;
 // The stack copied at each sample, and zeroed room after it (what a sample did not copy is zeroed
 // too): the unwinder reads a frame's saved registers above its stack pointer, so a frame that
 // starts in the copy and runs past its end reads zeros instead of memory past the buffer (a frame
@@ -125,6 +162,23 @@ struct PathKeyHash {
 	}
 };
 
+// Written only after ResumeThread and the stack walk. Even failed capture intervals consume
+// the lifetime budget; no target is suspended once that budget or its buffer is full.
+struct TimedSample {
+	uint64_t begin_ns = 0, end_ns = 0, unwind_end_ns = 0;
+	uint32_t status = 0, producer = 0, notifier = 0, guest = 0, frames = 0, copied = 0;
+	uint32_t observed_producer_tid = 0, observed_notifier_tid = 0;
+	std::array<uint64_t, PathFrames> path {};
+	std::array<uint64_t, ChainDepth> chain {};
+};
+
+struct SourceTarget {
+	uint64_t generation = 0, created = 0;
+	bool pattern_target = false;
+	std::array<TimedSample, SourceBufferSize> buffer {};
+	size_t size = 0;
+};
+
 struct Target {
 	uint32_t    tid = 0;
 	std::string name;
@@ -145,6 +199,7 @@ struct Target {
 	// Round 107: samples in the game's code by the instruction they stopped at (past the red zone
 	// trampolines' stack adjustments) and the address its memory operand names (GuestOperand).
 	std::map<std::pair<uint64_t, uint64_t>, uint32_t> guest_loads;
+	std::unique_ptr<SourceTarget> source;
 };
 
 // Round 107: the memory operand of the instruction a guest sample stopped at, and that
@@ -226,8 +281,14 @@ struct Capture {
 	size_t                                               copied = 0;
 };
 
-bool CaptureThread(HANDLE thread, Capture& capture) {
+bool CaptureThread(HANDLE thread, Capture& capture, uint32_t* status = nullptr) {
+	if (status != nullptr) {
+		*status = 0;
+		capture.context = {};
+		capture.copied = 0;
+	}
 	if (SuspendThread(thread) == static_cast<DWORD>(-1)) {
+		if (status != nullptr) *status |= 1u;
 		return false;
 	}
 	capture.context              = {};
@@ -256,7 +317,25 @@ bool CaptureThread(HANDLE thread, Capture& capture) {
 			}
 		}
 	}
-	ResumeThread(thread);
+	const auto resumed = ResumeThread(thread);
+	if (status != nullptr) {
+		if (!ok) *status |= 2u;
+		if (resumed == static_cast<DWORD>(-1)) {
+			*status |= 4u;
+			// Do not return to formatting, unwinding or heap cleanup while our suspend
+			// may still be held. A failed resume consumes no suspend count. Retrying is
+			// safe until one succeeds; an exited thread needs no resume. This exceptional
+			// recovery uses only kernel calls, and source sampling stops afterward.
+			for (;;) {
+				if (WaitForSingleObject(thread, 0) == WAIT_OBJECT_0 ||
+				    ResumeThread(thread) != static_cast<DWORD>(-1)) {
+					break;
+				}
+				Sleep(1);
+			}
+		}
+		if (ok && capture.copied == 0) *status |= 8u;
+	}
 	// Nothing of an earlier sample (another thread's, maybe) past this copy.
 	if (capture.copied < StackCopyBytes) {
 		std::memset(capture.stack.data() + capture.copied, 0, StackCopyBytes - capture.copied);
@@ -418,9 +497,10 @@ size_t UnwindFrames(const Capture& capture, std::array<uint64_t, MaxFrames>& fra
 
 class Sampler {
 public:
-	Sampler(std::vector<std::string> patterns, uint32_t hz, uint32_t report_seconds)
+	Sampler(std::vector<std::string> patterns, uint32_t hz, uint32_t report_seconds, bool source,
+	        bool notifier)
 	    : m_patterns(std::move(patterns)), m_hz(hz), m_report_seconds(report_seconds),
-	      m_image(EmulatorImage()) {}
+	      m_image(EmulatorImage()), m_source(source), m_source_notifier(notifier) {}
 
 	void Run() {
 		HANDLE timer = CreateWaitableTimerExW(
@@ -442,14 +522,34 @@ public:
 				Sleep(1);
 			}
 			const auto now = std::chrono::steady_clock::now();
-			if (now - last_scan >= std::chrono::seconds(1)) {
+			// PerfStats starts this thread before initializing the trace. Do not spend the
+			// bounded capture budget until an actual flip caller has been observed.
+			const auto identities = m_source ? SourceTrace::ObservedThreadIds() : SourceTrace::ThreadIds {};
+			const auto selected = m_source_notifier ? identities.notifier_tid : identities.producer_tid;
+			const auto identity_key = (static_cast<uint64_t>(identities.producer_tid) << 32u) | selected;
+			if (m_source && (!SourceTrace::Enabled() ||
+			                 (!m_source_notifier && identities.producer_tid == 0))) {
+				continue;
+			}
+			if (now - last_scan >= std::chrono::seconds(1) ||
+			    (m_source && identity_key != m_last_identity_key)) {
 				Scan();
 				last_scan = now;
+				m_last_identity_key = identity_key;
 			}
 			for (auto& target: m_targets) {
 				if (target->handle != nullptr) {
 					Sample(*target, *capture);
 				}
+			}
+			if (m_source && (m_attempts >= SourceCaptureLimit || m_resume_failed)) {
+				// Drain the final partial window, then retire the diagnostic thread entirely.
+				ReportSource(true);
+				for (const auto& target: m_targets) {
+					if (target->handle != nullptr) CloseHandle(target->handle);
+				}
+				if (timer != nullptr) CloseHandle(timer);
+				return;
 			}
 			if (now - last_report >= std::chrono::seconds(m_report_seconds)) {
 				Report(std::chrono::duration<double>(now - last_report).count());
@@ -461,6 +561,10 @@ public:
 private:
 	// New threads with the names asked for; ended ones are let go.
 	void Scan() {
+		if (m_source) {
+			ScanSource();
+			return;
+		}
 		const auto self = GetCurrentThreadId();
 		for (const auto& [tid, name]: PerfStats::NamedThreads()) {
 			if (tid == self || !Matches(name, m_patterns) ||
@@ -477,7 +581,7 @@ private:
 			target->tid    = tid;
 			target->name   = name;
 			target->handle = handle;
-			Log::WriteUnmuted(fmt::format("Sample: sampling {} (tid {})\n", name, tid));
+			WriteDiagnostic(fmt::format("Sample: sampling {} (tid {})\n", name, tid));
 			m_targets.push_back(std::move(target));
 		}
 		for (auto& target: m_targets) {
@@ -491,6 +595,10 @@ private:
 	}
 
 	void Sample(Target& target, Capture& capture) {
+		if (m_source) {
+			SampleSource(target, capture);
+			return;
+		}
 		if (!CaptureThread(target.handle, capture)) {
 			return;
 		}
@@ -542,6 +650,269 @@ private:
 			}
 		}
 		target.chains[chain]++;
+	}
+
+	// JSON string escaping keeps dictionaries and thread names on a single, bounded line.
+	static std::string Quote(std::string_view text) {
+		std::string out = "\"";
+		for (const unsigned char ch: text.substr(0, 90)) {
+			if (ch == '\\' || ch == '"') {
+				out += '\\';
+				out += static_cast<char>(ch);
+			} else if (ch < 0x20) {
+				out += fmt::format("\\u{:04x}", static_cast<unsigned>(ch));
+			} else {
+				out += static_cast<char>(ch);
+			}
+		}
+		out += '"';
+		return out;
+	}
+
+	void ScanSource() {
+		const auto identities = SourceTrace::ObservedThreadIds();
+		const auto producer = identities.producer_tid;
+		const auto selected = m_source_notifier ? identities.notifier_tid : producer;
+		const auto identity_key = (static_cast<uint64_t>(producer) << 32u) | selected;
+		if (m_source_notifier && identity_key != m_notifier_selection_key) {
+			m_notifier_selection_key = identity_key;
+			m_unavailable_notifier_key = 0;
+		}
+		bool retired = false;
+		// Check handles before deduplicating IDs. A closed handle must not suppress a new
+		// thread which happens to reuse its ID, nor retain the old thread's name.
+		for (auto& target: m_targets) {
+			DWORD code = 0;
+			const bool unavailable = WaitForSingleObject(target->handle, 0) == WAIT_OBJECT_0 ||
+			    GetExitCodeThread(target->handle, &code) == FALSE || code != STILL_ACTIVE;
+			if (unavailable || (target->tid != selected && !target->source->pattern_target) ||
+			    (m_source_notifier && selected == producer)) {
+				if (m_source_notifier && unavailable && target->tid == selected) {
+					m_unavailable_notifier_key = identity_key;
+				}
+				CloseHandle(target->handle);
+				target->handle = nullptr;
+				retired = true;
+			}
+		}
+		if (retired) {
+			ReportSource(false); // flush partial buffers before retiring their identities
+			std::erase_if(m_targets, [](const auto& target) { return target->handle == nullptr; });
+		}
+		const auto named = m_source_notifier ? std::vector<std::pair<uint32_t, std::string>> {}
+		                                     : PerfStats::NamedThreads();
+		const auto add = [&](uint32_t tid, std::string_view name) {
+			if (tid == 0 || tid == GetCurrentThreadId() ||
+			    (m_source_notifier && (tid == producer || identity_key == m_unavailable_notifier_key)) ||
+			    std::ranges::any_of(m_targets, [tid](const auto& t) { return t->tid == tid; })) {
+				return;
+			}
+			if (m_targets.size() >= (m_source_notifier ? 1u : SourceTargetLimit)) {
+				++m_target_cap_skipped;
+				return;
+			}
+			HANDLE handle = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+			                               THREAD_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+			                           FALSE, tid);
+			if (handle == nullptr) {
+				++m_open_failed;
+				if (m_source_notifier) m_unavailable_notifier_key = identity_key;
+				return;
+			}
+			DWORD code = 0;
+			if (GetProcessIdOfThread(handle) != GetCurrentProcessId() ||
+			    WaitForSingleObject(handle, 0) == WAIT_OBJECT_0 ||
+			    GetExitCodeThread(handle, &code) == FALSE || code != STILL_ACTIVE) {
+				CloseHandle(handle);
+				++m_open_failed;
+				if (m_source_notifier) m_unavailable_notifier_key = identity_key;
+				return;
+			}
+			auto target = std::make_unique<Target>();
+			target->tid = tid;
+			target->name = name.substr(0, 90);
+			target->handle = handle;
+			target->source = std::make_unique<SourceTarget>();
+			// The registry outlives threads. Read the handle's current description so a
+			// reused TID cannot silently inherit a retired thread's registered name.
+			using GetDescription = HRESULT(WINAPI*)(HANDLE, PWSTR*);
+			static const auto get_description = reinterpret_cast<GetDescription>(
+			    GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetThreadDescription"));
+			bool verified_name = false;
+			PWSTR description = nullptr;
+			if (get_description != nullptr && SUCCEEDED(get_description(handle, &description))) {
+				verified_name = true;
+				target->name = "<unnamed>";
+				if (description != nullptr && description[0] != L'\0') {
+					const auto length = static_cast<int>(std::min<size_t>(std::wcslen(description), 90));
+					std::array<char, 361> utf8 {};
+					const int bytes = WideCharToMultiByte(CP_UTF8, 0, description, length,
+					                                          utf8.data(), 360, nullptr, nullptr);
+					if (bytes > 0) target->name.assign(utf8.data(), static_cast<size_t>(bytes));
+				}
+			}
+			if (description != nullptr) LocalFree(description);
+			target->source->pattern_target = !m_source_notifier && Matches(target->name, m_patterns);
+			if (tid != selected && !target->source->pattern_target) {
+				CloseHandle(handle);
+				return;
+			}
+			target->source->generation = ++m_next_target;
+			FILETIME created {}, exited {}, kernel {}, user {};
+			if (GetThreadTimes(handle, &created, &exited, &kernel, &user) != FALSE) {
+				target->source->created = (static_cast<uint64_t>(created.dwHighDateTime) << 32u) |
+				                          created.dwLowDateTime;
+			}
+			WriteDiagnostic(fmt::format(
+			    "GT7 source sample target: target={} tid={} created={} name_verified={} name={}\n",
+			    target->source->generation, tid, target->source->created, verified_name ? 1 : 0,
+			    Quote(target->name)));
+			m_targets.push_back(std::move(target));
+		};
+		if (m_source_notifier) {
+			// Only the observed notifier is eligible. Unknown/ended/inaccessible targets
+			// never fall back to the producer or the named-worker patterns.
+			add(selected, "<unnamed>");
+			return;
+		}
+		// The actual caller has priority over optional pattern targets at the fixed cap.
+		if (!std::ranges::any_of(m_targets, [producer](const auto& t) { return t->tid == producer; }) &&
+		    m_targets.size() >= SourceTargetLimit) {
+			ReportSource(false);
+			CloseHandle(m_targets.back()->handle);
+			m_targets.pop_back();
+			++m_target_cap_skipped;
+		}
+		std::string_view producer_name = "<unnamed>";
+		for (const auto& [tid, name]: named) {
+			if (tid == producer) producer_name = name;
+		}
+		add(producer, producer_name);
+		for (const auto& [tid, name]: named) {
+			if (Matches(name, m_patterns)) add(tid, name);
+		}
+	}
+
+	void SampleSource(Target& target, Capture& capture) {
+		if (m_attempts >= SourceCaptureLimit || m_resume_failed) return;
+		const auto identities = SourceTrace::ObservedThreadIds();
+		const auto identity_key = (static_cast<uint64_t>(identities.producer_tid) << 32u) |
+		                          identities.notifier_tid;
+		if (m_source_notifier) {
+			if (target.tid != identities.notifier_tid || target.tid == identities.producer_tid ||
+			    identity_key == m_unavailable_notifier_key) return;
+			if (WaitForSingleObject(target.handle, 0) == WAIT_OBJECT_0) {
+				m_unavailable_notifier_key = identity_key;
+				return;
+			}
+		}
+		auto& source = *target.source;
+		if (source.size == source.buffer.size()) {
+			++m_buffer_dropped;
+			return;
+		}
+		TimedSample sample;
+		sample.producer = target.tid == identities.producer_tid ? 1u : 0u;
+		sample.notifier = target.tid == identities.notifier_tid ? 1u : 0u;
+		sample.observed_producer_tid = identities.producer_tid;
+		sample.observed_notifier_tid = identities.notifier_tid;
+		sample.begin_ns = SourceTrace::NowNs();
+		const bool captured = CaptureThread(target.handle, capture, &sample.status);
+		sample.end_ns = SourceTrace::NowNs();
+		++m_attempts;
+		m_watermark_ns = sample.end_ns;
+		const auto capture_ns = sample.end_ns - sample.begin_ns;
+		m_capture_ns += capture_ns;
+		m_capture_max_ns = std::max(m_capture_max_ns, capture_ns);
+		// All walking, allocation, symbol resolution and output are after ResumeThread.
+		if (captured && (sample.status & 7u) == 0) {
+			std::array<uint64_t, MaxFrames> frames {};
+			sample.guest = IsGuestCode(capture.context.Rip) ? 1u : 0u;
+			const auto count = sample.guest != 0 ? WalkFramePointers(capture, frames)
+			                                     : UnwindFrames(capture, frames);
+			sample.unwind_end_ns = SourceTrace::NowNs();
+			sample.frames = static_cast<uint32_t>(count);
+			sample.copied = static_cast<uint32_t>(capture.copied);
+			std::copy_n(frames.begin(), std::min(count, PathFrames), sample.path.begin());
+			sample.chain[0] = frames[0];
+			size_t depth = 1;
+			for (size_t i = 1; i < count && depth < ChainDepth; ++i) {
+				if (m_image.Contains(frames[i])) sample.chain[depth++] = frames[i];
+			}
+			++m_captured;
+			if ((sample.status & 8u) != 0) ++m_stack_empty;
+		} else {
+			sample.unwind_end_ns = sample.end_ns;
+			++m_failed;
+			m_resume_failed = (sample.status & 4u) != 0;
+		}
+		const auto unwind_ns = sample.unwind_end_ns - sample.end_ns;
+		m_unwind_ns += unwind_ns;
+		m_unwind_max_ns = std::max(m_unwind_max_ns, unwind_ns);
+		source.buffer[source.size++] = sample;
+	}
+
+	template <size_t Size>
+	static std::string Addresses(const std::array<uint64_t, Size>& frames) {
+		std::string text;
+		for (const auto frame: frames) {
+			if (frame == 0) break;
+			text += fmt::format("{}0x{:x}", text.empty() ? "" : ",", frame);
+		}
+		return text.empty() ? "0x0" : text;
+	}
+
+	void SourceSymbol(uint64_t address, std::string& text) {
+		if (address == 0 || m_names.contains(address)) return;
+		if (m_names.size() >= SourceSymbolLimit) {
+			// Count unresolved occurrences, not unique addresses (which would need a growing set).
+			++m_symbol_capped;
+			return;
+		}
+		text += fmt::format("GT7 source sample symbol: address=0x{:x} name={}\n",
+		                    address, Quote(Name(address)));
+	}
+
+	void ReportSource(bool final) {
+		const auto begin_ns = SourceTrace::NowNs();
+		const auto report = ++m_report_sequence;
+		for (auto& target: m_targets) {
+			auto& source = *target->source;
+			std::string text;
+			for (size_t i = 0; i < source.size; ++i) {
+				const auto& sample = source.buffer[i];
+				for (const auto frame: sample.path) SourceSymbol(frame, text);
+				for (const auto frame: sample.chain) SourceSymbol(frame, text);
+				text += fmt::format(
+				    "GT7 source sample: target={} tid={} begin_ns={} end_ns={} unwind_end_ns={} "
+				    "status={} producer={} notifier={} observed_producer_tid={} observed_notifier_tid={} "
+				    "guest={} frames={} copied={} leaf=0x{:x} path={} chain={}\n",
+				    source.generation, target->tid, sample.begin_ns, sample.end_ns,
+				    sample.unwind_end_ns, sample.status, sample.producer, sample.notifier,
+				    sample.observed_producer_tid, sample.observed_notifier_tid, sample.guest,
+				    sample.frames, sample.copied, sample.path[0], Addresses(sample.path),
+				    Addresses(sample.chain));
+			}
+			if (!text.empty()) WriteDiagnostic(text);
+			m_reported += source.size;
+			source.size = 0;
+		}
+		WriteDiagnostic(fmt::format(
+		    "GT7 source sample summary: report={} attempts={} captured={} reported={} failed={} "
+		    "stack_empty={} buffer_dropped={} target_cap_skipped={} open_failed={} symbols={} "
+		    "symbol_capped={} capture_ns={} capture_max_ns={} unwind_ns={} unwind_max_ns={} "
+		    "watermark_ns={} exhausted={} resume_failed={} notifier_unavailable={} tail_may_be_lost={}\n",
+		    report, m_attempts, m_captured, m_reported, m_failed, m_stack_empty, m_buffer_dropped,
+		    m_target_cap_skipped, m_open_failed, m_names.size(), m_symbol_capped, m_capture_ns,
+		    m_capture_max_ns, m_unwind_ns, m_unwind_max_ns, m_watermark_ns,
+		    m_attempts >= SourceCaptureLimit ? 1 : 0, m_resume_failed ? 1 : 0,
+		    m_source_notifier && m_unavailable_notifier_key != 0 ? 1 : 0, final ? 0 : 1));
+		const auto end_ns = SourceTrace::NowNs();
+		// This line's own output cost is excluded; the bracket covers dictionary resolution,
+		// formatting, sample output and summary output, with no target left suspended.
+		WriteDiagnostic(fmt::format(
+		    "GT7 source sample report: report={} begin_ns={} end_ns={} cost_ns={}\n",
+		    report, begin_ns, end_ns, end_ns - begin_ns));
 	}
 
 	const std::string& Name(uint64_t address) {
@@ -776,7 +1147,7 @@ private:
 				}
 			}
 			const auto hottest = exact.empty() ? bucket : exact.front().first;
-			Log::WriteUnmuted(fmt::format(
+			WriteDiagnostic(fmt::format(
 			    "Sample {} guest {}: {:.1f}% at 0x{:x}: {} | called from {} | code 0x{:x}: {} | "
 			    "call 0x{:x}: {}\n",
 			    target.name, rank + 1, share(count), bucket, addresses, callers, hottest - 32,
@@ -815,36 +1186,47 @@ private:
 			                readable ? fmt::format("0x{:016x}", value) : std::string("?"));
 		}
 		if (!text.empty()) {
-			Log::WriteUnmuted(fmt::format("Sample {} loads:{}\n", target.name, text));
+			WriteDiagnostic(fmt::format("Sample {} loads:{}\n", target.name, text));
 		}
 	}
 
 	void Report(double seconds) {
+		if (m_source) {
+			ReportSource(false);
+			return;
+		}
+		if (MirrorSilentDiagnostics()) {
+			const auto now_ms = std::chrono::duration<double, std::milli>(
+			                        std::chrono::steady_clock::now().time_since_epoch())
+			                        .count();
+			WriteDiagnostic(fmt::format("Sample batch: steady_ms={:.3f} window_s={:.3f}\n",
+			                            now_ms, seconds));
+		}
 		for (auto& target: m_targets) {
 			if (target->samples == 0) {
 				continue;
 			}
 			ReportGuest(*target);
-			Log::WriteUnmuted(fmt::format(
+			WriteDiagnostic(fmt::format(
 			    "Sample {} (tid {}): {} samples in {:.0f} s, {:.0f}% in the emulator's code | "
 			    "self:{}\n",
 			    target->name, target->tid, target->samples, seconds,
 			    Share(target->in_image, target->samples), Top(target->self, target->samples, 50)));
-			Log::WriteUnmuted(fmt::format("Sample {} (tid {}) total:{}\n", target->name,
+			WriteDiagnostic(fmt::format("Sample {} (tid {}) total:{}\n", target->name,
 			                              target->tid, Top(target->total, target->samples, 70)));
-			Log::WriteUnmuted(fmt::format(
+			WriteDiagnostic(fmt::format(
 			    "Sample {} (tid {}) depth: {:.1f} frames a sample, {:.0f}% walked 4 or more\n",
 			    target->name, target->tid,
 			    static_cast<double>(target->frames) / static_cast<double>(target->samples),
 			    Share(target->deep, target->samples)));
 			uint64_t   waited = 0;
 			const auto waits  = TopWaits(*target, 16, waited);
-			Log::WriteUnmuted(fmt::format("Sample {} (tid {}) waits: {:.1f}% of its samples |{}\n",
+			WriteDiagnostic(fmt::format("Sample {} (tid {}) waits: {:.1f}% of its samples |{}\n",
 			                              target->name, target->tid,
 			                              Share(waited, target->samples), waits));
-			Log::WriteUnmuted(fmt::format("Sample {} (tid {}) paths:{}\n", target->name,
+			WriteDiagnostic(fmt::format("Sample {} (tid {}) paths:{}\n", target->name,
 			                              target->tid, TopPaths(*target, 40)));
-			Log::WriteUnmuted(fmt::format("Sample {} (tid {}) lines:{}\n", target->name,
+			WriteDiagnostic(fmt::format("Sample {} (tid {}) lines:{}\n", target->name,
 			                              target->tid, TopLines(*target, 24, 6)));
 			target->samples  = 0;
 			target->in_image = 0;
@@ -877,6 +1259,13 @@ private:
 	std::unordered_map<uint64_t, std::string> m_names;
 	std::unordered_map<uint64_t, std::string> m_lines;
 	std::unordered_map<uint64_t, std::string> m_chains;
+	bool m_source = false, m_source_notifier = false, m_resume_failed = false;
+	uint64_t m_last_identity_key = 0, m_notifier_selection_key = 0, m_unavailable_notifier_key = 0;
+	uint64_t m_next_target = 0, m_attempts = 0, m_captured = 0, m_reported = 0;
+	uint64_t m_failed = 0, m_stack_empty = 0, m_buffer_dropped = 0;
+	uint64_t m_target_cap_skipped = 0, m_open_failed = 0, m_symbol_capped = 0;
+	uint64_t m_capture_ns = 0, m_capture_max_ns = 0, m_unwind_ns = 0, m_unwind_max_ns = 0;
+	uint64_t m_watermark_ns = 0, m_report_sequence = 0;
 };
 
 #endif
@@ -887,7 +1276,10 @@ void Start() {
 	static std::once_flag started;
 	std::call_once(started, [] {
 		auto patterns = Patterns();
-		if (patterns.empty()) {
+		const bool source = SourceMode();
+		const bool notifier = NotifierModeRequested();
+		if (notifier && !source) return; // The narrower opt-in never activates legacy sampling.
+		if (patterns.empty() && !source) {
 			return;
 		}
 		std::string list;
@@ -895,19 +1287,28 @@ void Start() {
 			list += (list.empty() ? "" : ", ") + pattern;
 		}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		const auto hz      = EnvNumber("KYTY_SAMPLE_HZ", 1000, 10, 5000);
-		const auto seconds = EnvNumber("KYTY_SAMPLE_REPORT", 10, 1, 3600);
-		Log::WriteUnmuted(fmt::format("Sample: {} times a second: {}; a report every {} s "
+		const auto hz      = EnvNumber("KYTY_SAMPLE_HZ", source ? 50 : 1000, 10, 5000);
+		const auto seconds = EnvNumber("KYTY_SAMPLE_REPORT", source ? 1 : 10, 1, 3600);
+		if (source) {
+			WriteDiagnostic(fmt::format(
+			    "GT7 source sample start: version=1 hz={} report_s={} target_limit={} "
+			    "buffer_limit={} capture_limit={} symbol_limit={} clock=steady_ns "
+			    "path_frames={} chain_frames={} notifier_only={} tail_may_be_lost=1\n",
+			    hz, seconds, notifier ? 1 : SourceTargetLimit, SourceBufferSize, SourceCaptureLimit,
+			    SourceSymbolLimit, PathFrames, ChainDepth, notifier ? 1 : 0));
+		} else {
+			WriteDiagnostic(fmt::format("Sample: {} times a second: {}; a report every {} s "
 		                              "(KYTY_SAMPLE, KYTY_SAMPLE_HZ, KYTY_SAMPLE_REPORT); stacks "
 		                              "walked with the unwind data\n",
 		                              hz, list, seconds));
-		std::thread([patterns = std::move(patterns), hz, seconds]() mutable {
+		}
+		std::thread([patterns = std::move(patterns), hz, seconds, source, notifier]() mutable {
 			PerfStats::NameThread("Sampler");
-			Sampler sampler(std::move(patterns), hz, seconds);
+			Sampler sampler(std::move(patterns), hz, seconds, source, notifier);
 			sampler.Run();
 		}).detach();
 #else
-		Log::WriteUnmuted(fmt::format("Sample: KYTY_SAMPLE ({}) only samples on Windows\n", list));
+		WriteDiagnostic(fmt::format("Sample: KYTY_SAMPLE ({}) only samples on Windows\n", list));
 #endif
 	});
 }

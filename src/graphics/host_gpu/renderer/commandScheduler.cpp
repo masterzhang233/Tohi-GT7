@@ -484,24 +484,38 @@ void CommandScheduler::DeferRelease(Common::UniqueFunction<void>&& operation) {
 }
 
 void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation) {
+	const auto trace = Common::EventTrace::CaptureCallback(m_event_trace_scheduler_id, CurrentTick());
+	DeferPriorityOperation(std::move(operation), trace);
+}
+
+void CommandScheduler::DeferPriorityOperation(
+    Common::UniqueFunction<void>&& operation, const Common::EventTrace::CallbackContext& trace) {
 	CheckActive();
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
-		m_priority_operations.push({std::move(operation), CurrentTick()});
+		const auto queued_tick = CurrentTick();
+		m_priority_operations.push({std::move(operation), queued_tick, trace});
+		// This scheduling call, like CurrentTick/Submit, belongs to the current
+		// command-buffer producer. Closed inline callbacks do not mark a tick.
+		m_event_trace_tick_selection.ObserveQueued(trace, m_event_trace_scheduler_id, queued_tick);
+		Common::EventTrace::EmitCallback(Common::EventTrace::Kind::CallbackQueued, trace);
 		lock.unlock();
 		m_operation_available.notify_one();
 		return;
 	}
+	auto inline_trace = trace;
+	inline_trace.flags |= Common::EventTrace::Direct | Common::EventTrace::Closed;
+	Common::EventTrace::EmitCallback(Common::EventTrace::Kind::CallbackQueued, inline_trace);
 	if (g_deferred_callback_scheduler == this) {
 		lock.unlock();
-		operation();
+		RunPriorityOperation(std::move(operation), inline_trace, false);
 		return;
 	}
 	m_operation_available.wait(lock,
 	                           [this] { return m_operation_state == OperationState::Closed; });
 	lock.unlock();
-	operation();
+	RunPriorityOperation(std::move(operation), inline_trace, false);
 }
 
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
@@ -534,13 +548,17 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 		const auto wait_begin = StallWatch::NowNs();
 		m_master.Wait(operation.tick);
 		const auto wait_end = StallWatch::NowNs();
+		// The CPU's semaphore-wait return, before any synchronous stall report.
+		// It is not a hardware completion timestamp.
+		Common::EventTrace::EmitCallback(Common::EventTrace::Kind::TickWait, operation.trace,
+		                                 wait_begin, wait_end);
 		if (m_timeline) {
 			m_timeline->OnWait(operation.tick, known, wait_end - wait_begin);
 		}
 		Timeline::Mark("tick-done", operation.tick);
 		Common::PerfStats::TickCompleted(operation.tick);
 		if (!stop.stop_requested()) {
-			RunOperation(std::move(operation.callback));
+			RunPriorityOperation(std::move(operation.callback), operation.trace, true);
 			StallWatch::NoteSection(StallWatch::Section::Callback, wait_end, StallWatch::NowNs(),
 			                        operation.tick);
 		}
@@ -577,11 +595,28 @@ void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 	}
 }
 
+bool CommandScheduler::HasPendingOperations() {
+	std::lock_guard lock(m_operation_mutex);
+	return !m_pending_operations.empty() || !m_priority_operations.empty() || m_priority_active;
+}
+
 void CommandScheduler::RunOperation(Common::UniqueFunction<void>&& operation) {
 	auto* previous                = g_deferred_callback_scheduler;
 	g_deferred_callback_scheduler = this;
 	operation();
 	g_deferred_callback_scheduler = previous;
+}
+
+void CommandScheduler::RunPriorityOperation(
+    Common::UniqueFunction<void>&& operation, const Common::EventTrace::CallbackContext& trace,
+    bool deferred) {
+	const auto begin = trace.id != 0 && Common::EventTrace::Enabled()
+	                       ? Common::EventTrace::NowNs() : 0;
+	Common::EventTrace::EmitCallback(Common::EventTrace::Kind::CallbackBegin, trace, begin, begin);
+	if (deferred) RunOperation(std::move(operation));
+	else operation();
+	Common::EventTrace::EmitCallback(Common::EventTrace::Kind::CallbackEnd, trace, begin,
+	                                 begin != 0 ? Common::EventTrace::NowNs() : 0);
 }
 
 bool CommandScheduler::IsFree(uint64_t tick) {
@@ -682,6 +717,17 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	    .debug_arg3   = m_command.m_debug_arg3,
 	    .debug_arg4   = m_command.m_debug_arg4,
 	};
+	// Consume once before any direct/queue-thread/recording-thread branch. A
+	// worker must not read the producer's marker after the next tick has begun.
+	job.trace_priority_tick = m_event_trace_tick_selection.Take(CurrentTick());
+	if (Common::EventTrace::Enabled()) {
+		job.trace_handoff_ns = Common::EventTrace::NowNs();
+		const auto source = Common::SourceTrace::t_context;
+		job.trace_submission_id = source.submission_id;
+		job.trace_request_id = source.request_id;
+		job.trace_source_queue = source.queue_id;
+		job.trace_source_type = source.type;
+	}
 	m_command.m_buffer                = nullptr;
 	m_command.m_open                  = false;
 	m_recorded_release_mem_writes     = 0;
@@ -739,6 +785,9 @@ void CommandScheduler::QueueSubmit(SubmitJob& job) {
 	const auto lock_begin = StallWatch::NowNs();
 	uint64_t   locked     = 0;
 	uint64_t   submitted  = 0;
+	uint64_t   trace_submit_begin = 0, trace_submit_end = 0;
+	const bool trace_selected = Common::EventTrace::Enabled() && job.trace_priority_tick;
+	if (!job.trace_priority_tick) Common::EventTrace::NoteUnselectedTick(job.trace_handoff_ns);
 	{
 		Common::LockGuard lock(graphics.queue_mutex);
 		locked = StallWatch::NowNs();
@@ -764,8 +813,28 @@ void CommandScheduler::QueueSubmit(SubmitJob& job) {
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
+		if (trace_selected) trace_submit_begin = Common::EventTrace::NowNs();
 		result    = graphics.queue.submit(1, &submit_info, nullptr);
+		if (trace_submit_begin != 0) trace_submit_end = Common::EventTrace::NowNs();
 		submitted = StallWatch::NowNs();
+	}
+	if (trace_submit_begin != 0) {
+		Common::EventTrace::Event event {};
+		event.kind = Common::EventTrace::Kind::TickSubmit;
+		event.flags = job.trace_handoff_ns != 0 ? 0u :
+		              Common::EventTrace::PreArm | Common::EventTrace::Unknown;
+		event.scheduler_id = m_event_trace_scheduler_id;
+		event.tick = job.tick;
+		event.submission_id = job.trace_submission_id;
+		event.request_id = job.trace_request_id;
+		event.index = job.trace_source_queue;
+		event.mode = job.trace_source_type;
+		// CPU handoff to the recording/submission lane, not the interrupt's origin.
+		event.extra = job.trace_handoff_ns;
+		event.begin_ns = trace_submit_begin;
+		event.time_ns = trace_submit_end;
+		event.result = static_cast<int32_t>(result);
+		Common::EventTrace::Record(event);
 	}
 	Timeline::Mark("vk-submit", job.tick);
 	Common::PerfStats::TickSubmitted(job.tick);

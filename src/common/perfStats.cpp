@@ -5,15 +5,19 @@
 #include "common/hostSymbols.h"
 #include "common/logging/log.h"
 #include "common/sampler.h"
+#include "common/sourceTrace.h"
+#include "common/eventTrace.h"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdlib>
+#include <filesystem>
 #include <fmt/format.h>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -35,6 +39,25 @@
 namespace Common::PerfStats {
 
 namespace {
+
+bool MirrorSilentDiagnostics() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GT7_PERF_DIAGNOSTICS");
+		return value != nullptr && std::string_view(value) == "1";
+	}();
+	return enabled;
+}
+
+void WriteDiagnostic(std::string_view text) {
+	// WriteUnmuted still obeys the Silent sink. Only explicit performance diagnostics
+	// also reach the launcher's redirected stdout; ordinary Silent play stays silent.
+	if (MirrorSilentDiagnostics() && Log::IsSilent() &&
+	    Log::GetDirection() == Log::Direction::Silent) {
+		Log::WriteToConsoleAndLog(text);
+	} else {
+		Log::WriteUnmuted(text);
+	}
+}
 
 uint32_t IntervalSeconds() {
 	static const uint32_t seconds = [] {
@@ -274,6 +297,10 @@ std::string Percent(uint64_t part, uint64_t whole) {
 }
 
 void Report(double seconds, std::unordered_map<uint32_t, uint64_t>& last_cpu) {
+	if (MirrorSilentDiagnostics()) {
+		WriteDiagnostic(fmt::format("Perf batch: steady_ms={:.3f} window_s={:.3f}\n",
+		                            static_cast<double>(NowNs()) / 1e6, seconds));
+	}
 	auto&      c    = g_counters;
 	const auto take = [](std::atomic<uint64_t>& value) {
 		return value.exchange(0, std::memory_order_relaxed);
@@ -302,7 +329,7 @@ void Report(double seconds, std::unordered_map<uint32_t, uint64_t>& last_cpu) {
 		std::scoped_lock lock(g_configuration_mutex);
 		configuration = g_configuration.empty() ? std::string() : " [" + g_configuration + "]";
 	}
-	Log::WriteUnmuted(fmt::format(
+	WriteDiagnostic(fmt::format(
 	    "Perf: {:.1f} s, {:.1f} fps{} | GPU thread: busy {} (host GPU {}), idle {}, blocked {} | "
 	    "{} draws, {} dispatches a frame, {:.1f} us each | faults {:.0f}/s ({:.0f} reads, "
 	    "{:.0f} emulated), {:.0f} ms/s in handlers, {:.0f}/s of 1 ms or more, longest {:.1f} ms "
@@ -358,7 +385,7 @@ void Report(double seconds, std::unordered_map<uint32_t, uint64_t>& last_cpu) {
 		    reporter != nullptr) {
 			extra = reporter();
 		}
-		Log::WriteUnmuted(fmt::format(
+		WriteDiagnostic(fmt::format(
 		    "Perf GPU:{} command buffers {:.0f}/s, done {:.1f} ms after submission (longest "
 		    "{:.1f}) "
 		    "| readbacks {:.0f}/s: taken up in {:.0f} us, {:.0f} us on the GPU thread, landed "
@@ -402,7 +429,7 @@ void Report(double seconds, std::unordered_map<uint32_t, uint64_t>& last_cpu) {
 			                    static_cast<double>(longest_wait) / 1e6);
 		}
 		line += SpinLocks() ? " (spinning as before round 65)" : "";
-		Log::WriteUnmuted(line + "\n");
+		WriteDiagnostic(line + "\n");
 	}
 
 	// The busiest threads, and those that spent longest in faults.
@@ -445,7 +472,7 @@ void Report(double seconds, std::unordered_map<uint32_t, uint64_t>& last_cpu) {
 			                    static_cast<double>(stalled[i].first) / 1e6);
 		}
 	}
-	Log::WriteUnmuted(line + "\n");
+	WriteDiagnostic(line + "\n");
 }
 
 void Run() {
@@ -453,8 +480,15 @@ void Run() {
 	auto       last     = std::chrono::steady_clock::now();
 	auto       cpu      = ThreadCpuTimes();
 	for (;;) {
-		std::this_thread::sleep_for(interval);
+		if (Common::SourceTrace::Enabled()) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(250));
+			Common::SourceTrace::Drain();
+			Common::EventTrace::Drain();
+		} else {
+			std::this_thread::sleep_for(interval);
+		}
 		const auto now     = std::chrono::steady_clock::now();
+		if (now - last < interval) continue;
 		const auto seconds = std::chrono::duration<double>(now - last).count();
 		last               = now;
 		Report(seconds, cpu);
@@ -730,12 +764,15 @@ void Start() {
 		}
 		SetSpinLocks(SpinLocksFromEnvironment());
 		Common::Sampler::Start();
+		Common::SourceTrace::Initialize(Enabled());
+		Common::EventTrace::Initialize(Enabled());
 		if (!Enabled()) {
 			return;
 		}
 		Detail::g_enabled.store(true, std::memory_order_relaxed);
-		LOGF("Perf: a summary every %u s (KYTY_PERF=<seconds>, 0 turns it off)\n",
-		     IntervalSeconds());
+		WriteDiagnostic(fmt::format(
+		    "Perf: a summary every {} s (KYTY_PERF=<seconds>, 0 turns it off)\n",
+		    IntervalSeconds()));
 		std::thread([] {
 			NameThread("PerfReport");
 			Run();
@@ -744,3 +781,265 @@ void Start() {
 }
 
 } // namespace Common::PerfStats
+
+namespace Common::SourceTrace {
+namespace {
+// Process-lifetime storage, initialized before producers are enabled. No pointer
+// to live guest or renderer objects is retained. The process tail after the last
+// completed drain is deliberately incomplete (<=250 ms normally), not fabricated.
+Detail::Ring<4096> g_ring;
+Detail::Ring<8192> g_extra_condition_ring;
+Detail::RecordBudget<Detail::BaseRecordBudget> g_base_budget;
+uint64_t g_drained = 0, g_extra_drained = 0, g_last_report_ns = 0;
+bool g_budget_reported = false, g_extra_budget_reported = false;
+std::array<bool, Detail::ConditionThreadLimit> g_identity_reported {};
+uint64_t g_identity_unavailable = 0;
+std::filesystem::path g_arm_file;
+
+std::string QuoteThreadName(std::string_view name) {
+	std::string result = "\"";
+	for (const unsigned char ch: name) {
+		if (ch == '"' || ch == '\\') { result += '\\'; result += static_cast<char>(ch); }
+		else if (ch < 0x20) result += fmt::format("\\u{:04x}", ch);
+		else result += static_cast<char>(ch);
+	}
+	result += '"';
+	return result;
+}
+
+void AppendConditionThreadIdentities(std::string& batch) {
+	if (!ChainEnabled()) return;
+	for (size_t slot = 0; slot != Detail::ConditionThreadLimit; ++slot) {
+		const auto tid = Detail::g_condition_threads.At(slot);
+		if (tid == 0 || g_identity_reported[slot]) continue;
+		g_identity_reported[slot] = true;
+		const auto query_ns = NowNs();
+		uint64_t created = 0;
+		bool live = false, name_verified = false, name_truncated = false;
+		std::string name = "<unavailable>";
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// Query only, on the reporter. This is the current handle's identity, not
+		// proof that an older event with the same numeric TID belongs to its lifetime.
+		HANDLE handle = OpenThread(THREAD_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, tid);
+		if (handle != nullptr) {
+			live = GetProcessIdOfThread(handle) == GetCurrentProcessId() &&
+			       WaitForSingleObject(handle, 0) == WAIT_TIMEOUT;
+			if (live) {
+				FILETIME creation {}, exited {}, kernel {}, user {};
+				if (GetThreadTimes(handle, &creation, &exited, &kernel, &user) != FALSE) {
+					created = (static_cast<uint64_t>(creation.dwHighDateTime) << 32u) | creation.dwLowDateTime;
+				}
+				using GetDescription = HRESULT(WINAPI*)(HANDLE, PWSTR*);
+				static const auto get_description = reinterpret_cast<GetDescription>(
+				    GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetThreadDescription"));
+				PWSTR description = nullptr;
+				if (get_description != nullptr && SUCCEEDED(get_description(handle, &description))) {
+					name_verified = true;
+					name = "<unnamed>";
+					if (description != nullptr) {
+						size_t length = 0;
+						while (length < 90 && description[length] != L'\0') ++length;
+						name_truncated = length == 90 && description[length] != L'\0';
+						std::array<char, 361> utf8 {};
+						const int bytes = length == 0 ? 0 : WideCharToMultiByte(
+						    CP_UTF8, 0, description, static_cast<int>(length), utf8.data(), 360, nullptr, nullptr);
+						if (bytes > 0) name.assign(utf8.data(), static_cast<size_t>(bytes));
+					}
+				}
+				if (description != nullptr) LocalFree(description);
+			}
+			CloseHandle(handle);
+		}
+#endif
+		if (!live) ++g_identity_unavailable;
+		batch += fmt::format(
+		    "GT7 source chain thread: slot={} tid={} query_ns={} live={} created={} "
+		    "name_verified={} name_truncated={} name={}\n",
+		    slot, tid, query_ns, live ? 1 : 0, created, name_verified ? 1 : 0,
+		    name_truncated ? 1 : 0, QuoteThreadName(name));
+	}
+}
+}
+
+void Initialize(bool reporter_enabled) {
+	const char* value = std::getenv("KYTY_GT7_SOURCE_TRACE");
+	if (!reporter_enabled || value == nullptr || std::string_view(value) != "1") return;
+	// Initialize clock and platform thread-id facilities outside exception paths.
+	g_last_report_ns = NowNs();
+	(void)Common::PerfStats::CurrentOsThreadId();
+	const char* chain_value = std::getenv("KYTY_GT7_SOURCE_CHAIN");
+	const bool chain = chain_value != nullptr && std::string_view(chain_value) == "1";
+	Detail::g_chain_enabled.store(chain, std::memory_order_relaxed);
+	if (const char* arm_file = std::getenv("KYTY_GT7_SOURCE_ARM_FILE"); arm_file != nullptr && *arm_file != '\0') {
+		g_arm_file = std::filesystem::u8path(arm_file);
+		Detail::g_arm_ns.store(0, std::memory_order_relaxed);
+	}
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "GT7 source trace: version=1 clock=steady_ns slots={} budget={} slow_ns=10000000 drain_ms=250 "
+	    "tail_incomplete=1 prepare_text_suppressed=1 chain_enabled={} chain_limit={} "
+	    "base_slots=4096 base_budget={} extra_slots={} extra_budget={}\n",
+	    chain ? 12288 : 4096, Detail::BaseRecordBudget + (chain ? Detail::ExtraConditionRecordBudget : 0),
+	    chain ? 1 : 0, Detail::ConditionThreadLimit, Detail::BaseRecordBudget,
+	    chain ? 8192 : 0, chain ? Detail::ExtraConditionRecordBudget : 0));
+	Detail::g_enabled.store(true, std::memory_order_release);
+	if (!g_arm_file.empty()) {
+		Log::WriteToConsoleAndLog("GT7 source trace arm: waiting=1 one_shot=1 pre_arm_events=excluded\n");
+	}
+}
+
+void Record(Event event) noexcept {
+	if (!Armed() || event.begin_ns < ArmTimestamp()) return;
+	if (event.tid == 0) event.tid = Common::PerfStats::CurrentOsThreadId();
+	Detail::ObserveThreadEvent(event);
+	if (Detail::UseExtraConditionBucket(event, ProducerThreadId())) {
+		if (Detail::g_extra_condition_budget.TryAdmit()) (void)g_extra_condition_ring.TryPush(event);
+	} else if (g_base_budget.TryAdmit()) {
+		(void)g_ring.TryPush(event);
+	}
+}
+
+void Drain() {
+	if (!Armed()) {
+		// Only the existing reporter touches the filesystem; gameplay lanes merely
+		// check the atomic timestamp. A fresh run has a fresh arm-file path.
+		std::error_code error;
+		if (g_arm_file.empty() || !std::filesystem::is_regular_file(g_arm_file, error) || error) return;
+		const auto arm_ns = NowNs();
+		if (!TryArm(arm_ns)) return;
+		g_last_report_ns = arm_ns;
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "GT7 source trace arm: waiting=0 arm_ns={} one_shot=1 pre_arm_events=excluded\n", arm_ns));
+	}
+	const bool chain = ChainEnabled();
+	const auto report_begin_ns = chain ? NowNs() : 0;
+	std::string batch;
+	const auto append_event = [&](const Event& event) {
+		batch += fmt::format(
+		    "GT7 source event: kind={} tid={} flags={} begin_ns={} work_end_ns={} "
+		    "end_ns={} submission={} request={} arg0={} arg1={}\n",
+		    static_cast<uint32_t>(event.kind), event.tid, event.flags, event.begin_ns,
+		    event.work_end_ns, event.end_ns, event.submission_id, event.request_id,
+		    event.arg0, event.arg1);
+	};
+	const auto base_events = g_ring.Drain(append_event);
+	const auto extra_events = chain ? g_extra_condition_ring.Drain(append_event) : 0;
+	g_drained += base_events;
+	g_extra_drained += extra_events;
+	AppendConditionThreadIdentities(batch);
+	const auto now = NowNs();
+	// Ordered samples, not an atomic transaction: admitted attempts may still be
+	// in flight. Reading attempts last preserves captured+dropped <= attempted.
+	const auto base_captured = g_ring.Captured(), extra_captured = g_extra_condition_ring.Captured();
+	const auto base_dropped = g_ring.Dropped(), extra_dropped = g_extra_condition_ring.Dropped();
+	const auto base_attempted = g_base_budget.Attempted();
+	const auto extra_attempted = Detail::g_extra_condition_budget.Attempted();
+	const bool base_exhausted = base_attempted >= Detail::BaseRecordBudget;
+	const bool extra_exhausted = ChainEnabled() && extra_attempted >= Detail::ExtraConditionRecordBudget;
+	if (now - g_last_report_ns >= 5'000'000'000ull || (base_exhausted && !g_budget_reported) ||
+	    (extra_exhausted && !g_extra_budget_reported)) {
+		const auto base_skipped = base_attempted > Detail::BaseRecordBudget ? base_attempted - Detail::BaseRecordBudget : 0;
+		const auto extra_skipped = extra_attempted > Detail::ExtraConditionRecordBudget
+		                               ? extra_attempted - Detail::ExtraConditionRecordBudget : 0;
+		const auto chain_admitted = Detail::g_condition_threads.Admitted();
+		batch += fmt::format(
+		    "GT7 source trace summary: steady_ns={} attempted={} captured={} drained={} "
+		    "dropped={} budget_skipped={} exhausted={} tail_incomplete=1 "
+		    "base_attempted={} base_captured={} base_drained={} base_dropped={} base_budget_skipped={} base_exhausted={} "
+		    "extra_attempted={} extra_captured={} extra_drained={} extra_dropped={} extra_budget_skipped={} extra_exhausted={} "
+		    "chain_enabled={} chain_limit={} chain_count={} chain_admitted={} chain_rejected={} "
+		    "chain_budget_blocked={} chain_identity_unavailable={}\n",
+		    now, base_attempted + extra_attempted, base_captured + extra_captured, g_drained + g_extra_drained,
+		    base_dropped + extra_dropped, base_skipped + extra_skipped, (base_exhausted || extra_exhausted) ? 1 : 0,
+		    base_attempted, base_captured, g_drained, base_dropped, base_skipped, base_exhausted ? 1 : 0,
+		    extra_attempted, extra_captured, g_extra_drained, extra_dropped, extra_skipped, extra_exhausted ? 1 : 0,
+		    chain ? 1 : 0, Detail::ConditionThreadLimit, chain_admitted,
+		    chain_admitted, Detail::g_condition_threads.Rejected(),
+		    Detail::g_chain_budget_blocked.load(std::memory_order_relaxed), g_identity_unavailable);
+		g_last_report_ns = now;
+		g_budget_reported = base_exhausted;
+		g_extra_budget_reported = extra_exhausted;
+	}
+	// Only the existing background reporter formats or flushes output. Slots are
+	// already released before this I/O; full/contended slots drop without waiting.
+	if (!batch.empty()) Log::WriteToConsoleAndLog(batch);
+	if (chain) {
+		const auto report_end_ns = NowNs();
+		// Reporter wall time includes formatting, identity queries, and the main
+		// batch write. Formatting/writing this separate timing line is excluded.
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "GT7 source trace report: begin_ns={} end_ns={} wall_ns={} base_events={} extra_events={}\n",
+		    report_begin_ns, report_end_ns, report_end_ns - report_begin_ns, base_events, extra_events));
+	}
+}
+} // namespace Common::SourceTrace
+
+namespace Common::EventTrace {
+namespace {
+constexpr uint64_t RecordLimit = 1'500'000;
+constexpr size_t RingCapacity = 8192;
+SourceTrace::Detail::Ring<RingCapacity, Event> g_ring;
+SourceTrace::Detail::RecordBudget<RecordLimit> g_budget;
+uint64_t g_drained = 0, g_last_report_ns = 0;
+bool g_exhaustion_reported = false;
+}
+
+void Initialize(bool reporter_enabled) {
+	const char* value = std::getenv("KYTY_GT7_EVENT_TRACE");
+	if (!reporter_enabled || !SourceTrace::ChainEnabled() || value == nullptr ||
+	    std::string_view(value) != "1") return;
+	g_last_report_ns = NowNs();
+	Detail::g_enabled.store(true, std::memory_order_release);
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "GT7 event trace: version=1 clock=steady_ns slots={} budget={} drain_ms=250 "
+	    "tail_incomplete=1 separate_source_budget=1 ids=opaque_process_local "
+	    "tick_scope=captured_priority_callbacks_only callback_scope=all_priority_callbacks "
+	    "unselected_tick_is_drop=0\n", RingCapacity, RecordLimit));
+}
+
+void Record(Event event) noexcept {
+	if (!Enabled()) return;
+	if (event.time_ns == 0) event.time_ns = NowNs();
+	const auto arm_ns = SourceTrace::ArmTimestamp();
+	if (event.time_ns < arm_ns || (event.begin_ns != 0 && event.begin_ns < arm_ns)) return;
+	if (event.tid == 0) event.tid = ThreadId();
+	if (g_budget.TryAdmit()) (void)g_ring.TryPush(event);
+}
+
+void Drain() {
+	if (!Enabled()) return;
+	const auto begin_ns = NowNs();
+	std::string batch;
+	const auto drained = g_ring.Drain([&](const Event& event) {
+		batch += fmt::format(
+		    "GT7 event trace event: kind={} flags={} tid={} filter={} result={} count={} index={} "
+		    "fflags={} event_flags={} mode={} time_ns={} begin_ns={} id={} parent_id={} queue_id={} "
+		    "registration_id={} scheduler_id={} tick={} submission_id={} request_id={} ident={} data={} extra={}\n",
+		    static_cast<uint32_t>(event.kind), event.flags, event.tid, event.filter, event.result,
+		    event.count, event.index, event.fflags, event.event_flags, event.mode, event.time_ns,
+		    event.begin_ns, event.id, event.parent_id, event.queue_id, event.registration_id,
+		    event.scheduler_id, event.tick, event.submission_id, event.request_id,
+		    event.ident, event.data, event.extra);
+	});
+	g_drained += drained;
+	const auto now = NowNs();
+	const auto captured = g_ring.Captured(), dropped = g_ring.Dropped();
+	const auto attempted = g_budget.Attempted();
+	const auto skipped = attempted > RecordLimit ? attempted - RecordLimit : 0;
+	const bool exhausted = attempted >= RecordLimit;
+	if (now - g_last_report_ns >= 5'000'000'000ull || (exhausted && !g_exhaustion_reported)) {
+		batch += fmt::format(
+		    "GT7 event trace summary: steady_ns={} attempted={} captured={} drained={} dropped={} "
+		    "budget_skipped={} exhausted={} arm_ns={} unselected_tick={} tail_incomplete=1\n",
+		    now, attempted, captured, g_drained, dropped, skipped,
+		    exhausted ? 1 : 0, SourceTrace::ArmTimestamp(),
+		    Detail::g_unselected_ticks.load(std::memory_order_relaxed));
+		g_last_report_ns = now;
+		g_exhaustion_reported = exhausted;
+	}
+	if (!batch.empty()) Log::WriteToConsoleAndLog(batch);
+	const auto end_ns = NowNs();
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "GT7 event trace report: begin_ns={} end_ns={} wall_ns={} events={}\n",
+	    begin_ns, end_ns, end_ns - begin_ns, drained));
+}
+} // namespace Common::EventTrace

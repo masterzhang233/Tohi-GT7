@@ -1,6 +1,8 @@
 #include "graphics/presentation/window/gt7FrameGen.h"
+#include "graphics/presentation/window/gt7DlssFrameGen.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 
 #include <algorithm>
@@ -852,7 +854,14 @@ const char* InputProblem(const FrameInputs* inputs, vk::Rect2D region, const Vul
 } // namespace
 
 bool Requested() {
+    if (Config::PssrDlssEnabled()) return false;
     std::call_once(g_initialize, [] {
+        // Both runtimes replace presentation. Never nest their swapchain hooks,
+        // including when NVIDIA initialization fails after intercepting Vulkan.
+        if (Gt7DlssFrameGen::Requested()) {
+            std::printf("GT7 FSR FG: disabled while native NVIDIA frame generation is requested\n");
+            return;
+        }
         const auto* value = std::getenv("KYTY_GT7_FSR_FG");
         if (value == nullptr || std::string_view(value) != "1") {
             std::printf("GT7 FSR FG: disabled by configuration (KYTY_GT7_FSR_FG is not 1)\n");
@@ -904,6 +913,11 @@ bool Requested() {
         std::fflush(stdout);
     });
     return g_requested;
+}
+
+bool InputsRequested(const GraphicContext& graphics) {
+    return Gt7DlssFrameGen::DeviceReady() ||
+           (graphics.gt7_fsr_present_queue != nullptr && Requested());
 }
 
 void OnQueues(GraphicContext& graphics) {

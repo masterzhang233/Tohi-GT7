@@ -1,6 +1,8 @@
 // Deliberately built with /MD, without NGX includes/import libraries. All Vulkan
 // objects and submission belong to this host; the external DLL only records NGX.
 #include "kyty_dlss_backend.h"
+#include "kyty_dlss_pssr.h"
+#include "model_preset.h"
 #include <windows.h>
 #include <nlohmann/json.hpp>
 #include <algorithm>
@@ -39,8 +41,14 @@ struct HostContext {
     VkDevice device {};
     KytyDlssApi api {};
     KytyDlssContext* ngx {};
+    KytyDlssPssrApi native_api {};
+    KytyDlssPssrSession* native_session {};
+    std::vector<KytyDlssPssrFeature*> native_features;
     ~HostContext() {
         if (device && device_wait_idle) device_wait_idle(device); // shutdown only
+        KytyDlssError native_error {};
+        for (auto* feature:native_features) native_api.destroy_feature(feature,1,&native_error);
+        if (native_session) native_api.destroy_session(native_session,1,&native_error);
         if (ngx) { KytyDlssError error {}; api.destroy_context(ngx,1,&error); }
         if (device && destroy_device) destroy_device(device,nullptr);
         if (instance && destroy_instance) destroy_instance(instance,nullptr);
@@ -51,6 +59,7 @@ struct HostContext {
 #include "smoke_gpu.inl"
 #include "validate_gpu_inputs.inl"
 #include "validate_gpu_composite.inl"
+#include "smoke_pssr.inl"
 
 std::vector<const char*> ExtensionNames(const KytyDlssExtensions& list) {
     std::vector<const char*> result;
@@ -60,7 +69,7 @@ std::vector<const char*> ExtensionNames(const KytyDlssExtensions& list) {
 void Run(const std::filesystem::path& dll, const std::filesystem::path& runtime,
          const std::filesystem::path& output, Json& report, const PrepareReplay* prepare=nullptr,
          const std::filesystem::path* composite=nullptr, bool quality_1440p=false,
-         bool resampled_composite=false) {
+         bool resampled_composite=false, bool native_pssr=false, bool v1_reentry=false) {
     HostContext h;
     h.backend=LoadLibraryExW(dll.c_str(),nullptr,LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!h.backend) throw std::runtime_error("Cannot load external backend DLL");
@@ -110,7 +119,7 @@ void Run(const std::filesystem::path& dll, const std::filesystem::path& runtime,
     if (!supported12.bufferDeviceAddress || !supported.features.shaderInt64) throw std::runtime_error("Missing required device features");
     VkPhysicalDeviceVulkan12Features enabled12 {}; enabled12.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
     enabled12.bufferDeviceAddress=VK_TRUE; VkPhysicalDeviceFeatures enabled {}; enabled.shaderInt64=VK_TRUE;
-    if (prepare||composite) {
+    if (prepare||composite||native_pssr) {
         if (!supported.features.shaderStorageImageExtendedFormats) throw std::runtime_error("Prepare requires shaderStorageImageExtendedFormats");
         enabled.shaderStorageImageExtendedFormats=VK_TRUE;
     }
@@ -136,11 +145,24 @@ void Run(const std::filesystem::path& dll, const std::filesystem::path& runtime,
     ci.enabled_feature_flags=3;ci.enabled_device_extension_count=static_cast<uint32_t>(de.size());ci.enabled_device_extensions=de.data();
     ci.input_width=iw;ci.input_height=ih;ci.output_width=ow;ci.output_height=oh;
     ci.quality=quality_mode?KYTY_DLSS_QUALITY:KYTY_DLSS_PERFORMANCE;
+    if (native_pssr) { RunPssrSynthetic(h,physical,family,ci,report); return; }
     report["input"]={iw,ih};report["output"]={ow,oh};report["quality"]=quality_mode?"quality":"performance";
     report["fixed_input_fraction"]=double(iw)/ow;
     auto bad_ci=ci;bad_ci.enabled_device_extension_count=0;KytyDlssContext* rejected_ctx {};
     if (h.api.create_context(&bad_ci,&rejected_ctx,&error)!=KYTY_DLSS_UNSUPPORTED || rejected_ctx)
         throw std::runtime_error("Missing enabled extension rejection failed");
+    // Check a typo cannot silently start K and be misreported as DLSS 4.5.
+    const auto requested_preset = kyty_dlss::ReadModelPreset();
+    if (!SetEnvironmentVariableW(kyty_dlss::PresetEnvironment, L"invalid"))
+        throw std::runtime_error("Cannot set invalid preset for rejection check");
+    const auto invalid_preset_status = h.api.create_context(&ci,&rejected_ctx,&error);
+    const wchar_t restore_preset[] {static_cast<wchar_t>(requested_preset.letter), 0};
+    if (!SetEnvironmentVariableW(kyty_dlss::PresetEnvironment,
+                                 requested_preset.explicitly_requested ? restore_preset : nullptr))
+        throw std::runtime_error("Cannot restore preset after rejection check");
+    if (invalid_preset_status != KYTY_DLSS_INVALID_ARGUMENT || rejected_ctx)
+        throw std::runtime_error("Invalid model preset rejection failed");
+    report["invalid_preset_rejected"]=true;
     Check(h.api.create_context(&ci,&h.ngx,&error),error,"Create context on host device");
     KytyDlssOptimalSettings optimal {};optimal.struct_size=sizeof(optimal);
     Check(h.api.query_optimal(h.ngx,&optimal,&error),error,"Optimal settings");
@@ -238,22 +260,33 @@ void Run(const std::filesystem::path& dll, const std::filesystem::path& runtime,
         raw.write(reinterpret_cast<const char*>(rgba.data()),static_cast<std::streamsize>(rgba.size()*2));
     }
     Check(h.api.destroy_context(h.ngx,1,&error),error,"Destroy after host fence completion");h.ngx=nullptr;
+    if (v1_reentry) {
+        Check(h.api.create_context(&ci,&h.ngx,&error),error,"v1-only re-entry after v1 shutdown");
+        Check(h.api.destroy_context(h.ngx,1,&error),error,"Destroy re-entered v1 context");h.ngx=nullptr;
+        report["v1_only_reentry"]=true;
+    }
     report["input"]={iw,ih};report["output"]={ow,oh};report["passed"]=true;
 }
 } // namespace
 
 int wmain(int argc,wchar_t** argv) {
+    const bool native_pssr=argc==5&&std::wstring(argv[4])==L"--pssr";
+    const bool v1_reentry=argc==5&&std::wstring(argv[4])==L"--v1-reentry";
     const bool quality_1440p=argc==5&&std::wstring(argv[4])==L"--quality-1440p";
     const bool composite_mode=argc==6&&(std::wstring(argv[4])==L"--composite"||std::wstring(argv[4])==L"--composite-resized");
-    if(argc!=4 && !(argc==7 && std::wstring(argv[4])==L"--prepare") && !composite_mode && !quality_1440p) {
-        std::wcerr<<L"Usage: kyty_dlss_backend_smoke <absolute backend DLL> <absolute runtime directory> <absolute output directory> [--quality-1440p | --prepare <absolute sequence.json> <absolute prepare.spv> | --composite <absolute composite.spv> | --composite-resized <absolute composite.spv>]\n";return 2;
+    if(argc!=4 && !(argc==7 && std::wstring(argv[4])==L"--prepare") && !composite_mode && !quality_1440p && !native_pssr && !v1_reentry) {
+        std::wcerr<<L"Usage: kyty_dlss_backend_smoke <absolute backend DLL> <absolute runtime directory> <absolute output directory> [--pssr | --v1-reentry | --quality-1440p | --prepare <absolute sequence.json> <absolute prepare.spv> | --composite <absolute composite.spv> | --composite-resized <absolute composite.spv>]\n";return 2;
     }
     Json report={{"schema",1},{"kind","external C ABI reuse-host Vulkan synthetic smoke"},{"passed",false},
         {"gt7_data_used",false},{"in_game_integration_tested",false},{"validation_layer_enabled",false},
         {"backend_submits_or_waits",false},{"host_readback_waits_on_fences",true},
-        {"host_crt","MD"},{"backend_crt","MT"},{"requested_preset","K"},{"effective_preset_verified",false}};
+        {"host_crt","MD"},{"backend_crt","MT"},{"effective_preset_verified",false}};
     const std::filesystem::path dll(argv[1]),runtime(argv[2]),output(argv[3]);
     try {
+        const auto preset=kyty_dlss::ReadModelPreset();
+        report["requested_preset"]=std::string(1,preset.letter);
+        report["requested_model_generation"]=preset.generation();
+        report["preset_request_source"]=preset.explicitly_requested?"KYTY_GT7_DLSS_PRESET":"default";
         if(!dll.is_absolute()||!runtime.is_absolute()||!output.is_absolute())throw std::runtime_error("All paths must be absolute");
         PrepareReplay prepare;std::filesystem::path composite;
         if(argc==7) {
@@ -270,7 +303,7 @@ int wmain(int argc,wchar_t** argv) {
         }
         if(argc==6) {composite=argv[5];if(!composite.is_absolute())throw std::runtime_error("Composite path must be absolute");}
         std::filesystem::create_directories(output);Run(dll,runtime,output,report,argc==7?&prepare:nullptr,
-            composite_mode?&composite:nullptr,quality_1440p,composite_mode&&std::wstring(argv[4])==L"--composite-resized");
+            composite_mode?&composite:nullptr,quality_1440p,composite_mode&&std::wstring(argv[4])==L"--composite-resized",native_pssr,v1_reentry);
     }catch(const std::exception& e){report["error"]=e.what();}
     try {std::ofstream file(output/L"smoke-report.json");file.exceptions(std::ios::failbit|std::ios::badbit);file<<report.dump(2)<<'\n';}
     catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}

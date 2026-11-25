@@ -1,6 +1,7 @@
 #include "mainDialog.h"
 
 #include "configuration.h"
+#include "cmake_config.h"
 #include "configurationItem.h"
 #include "configurationListWidget.h"
 #include "controllerLightbar.h"
@@ -197,6 +198,9 @@ void MainDialogPrivate::ShowAbnormalExit(int exit_code, QProcess::ExitStatus exi
 void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	m_ui = new Ui::MainDialog;
 	m_ui->setupUi(main_dialog);
+	main_dialog->setWindowTitle(QStringLiteral("Tohi-GT7 " KYTY_VERSION));
+	m_ui->label_Version->setText(main_dialog->windowTitle());
+	m_ui->gt7_release_badge->setText(tr("%1 / RELEASE").arg(QStringLiteral(KYTY_VERSION)));
 
 	m_main_dialog = main_dialog;
 	m_update_checker = new UpdateChecker(main_dialog);
@@ -282,8 +286,8 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 			if (m_running_item != nullptr) {
 				m_running_item->SetRunning(false);
 			}
-			Update();
 		}
+		Update();
 	});
 	connect(&m_process, &QProcess::started, this, [this]() {
 		if (m_diagnostic_run != nullptr) {
@@ -339,7 +343,7 @@ void MainDialogPrivate::FindInterpreter() {
 		auto lines  = output.split(QRegularExpression("[\r\n]"), Qt::SkipEmptyParts);
 
 		if (lines.count() >= 2) {
-			m_ui->label_Version->setText(QStringLiteral("Tohi-GT7 1.0.2"));
+			m_ui->label_Version->setText(m_main_dialog->windowTitle());
 			m_ui->label_Version->setToolTip(
 			    tr("Version: ") + (lines.at(0).startsWith("exe_name") ? lines.at(1) : lines.at(0)) +
 			    QStringLiteral("\n") + m_interpreter);
@@ -605,15 +609,10 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& requeste
 	                                               QProcessEnvironment::systemEnvironment());
 	process->setProcessEnvironment(environment);
 	if (gt7_title && info.gt7_dlss_enabled) {
-		QStringList missing;
-		for (const auto* name: {"kyty_dlss_backend.dll", "nvngx_dlss.dll", "amd_fidelityfx_vk.dll"}) {
-			if (!QFileInfo::exists(dir.absoluteFilePath(QString::fromLatin1(name)))) {
-				missing << QString::fromLatin1(name);
-			}
-		}
+		const auto missing = MissingGt7GraphicsRuntimeFiles(dir.absolutePath());
 		if (!missing.isEmpty()) {
-			const auto detail = tr("The DLSS preset needs the complete Tohi-GT7 release package.\n"
-			                       "Missing files: %1\n\nExtract the full package, or turn off DLSS.")
+			const auto detail = tr("The 4K + NVIDIA 2X preset needs the complete Tohi-GT7 release package.\n"
+			                       "Missing files: %1\n\nExtract the full package, or turn off the graphics preset.")
 			                        .arg(missing.join(QStringLiteral(", ")));
 			if (diagnostics != nullptr) {
 				diagnostics->RecordRejected(QStringLiteral("graphics_runtime"), detail);
@@ -866,7 +865,7 @@ void MainDialogPrivate::Run() {
 		details.title_id          = info->title_id;
 		details.game_version      = info->gameVersion;
 		details.output_resolution = EnumToText(info->screen_resolution);
-		details.mode = info->gt7_dlss_enabled ? QStringLiteral("Desktop DLSS + FSR 2x")
+		details.mode = info->gt7_dlss_enabled ? QStringLiteral("Native PSSR inputs / DLSS 1080p to 4K + NVIDIA fixed 2X")
 		                                      : QStringLiteral("Desktop");
 		details.desktop_height = info->gt7_desktop_height;
 		details.vr_scale       = info->gt7_vr_scale;
@@ -908,8 +907,12 @@ void MainDialogPrivate::Update() {
 	const bool gt7_selected = item != nullptr &&
 	    item->GetInfo().title_id.compare(QStringLiteral("PPSA01317"), Qt::CaseInsensitive) == 0;
 	m_ui->gt7_start_button->setEnabled(run_enabled && gt7_selected);
-	m_ui->gt7_start_button->setText(m_process.state() == QProcess::NotRunning
-	                                  ? tr("Start game") : tr("Running..."));
+	m_ui->gt7_start_button->setText(m_process.state() == QProcess::Starting ? tr("Starting...") :
+	    m_process.state() == QProcess::Running ? tr("Running...") : tr("Start game"));
+	m_ui->gt7_feature_hint->setText(m_process.state() == QProcess::Starting ? tr("Preparing the game...") :
+	    m_process.state() == QProcess::Running ? tr("Game running. Graphics settings are locked until it closes.")
+	    : gt7_selected ? tr("Ready to start Gran Turismo 7.")
+	                   : tr("Select Gran Turismo 7 in the game library to start."));
 	m_ui->gt7_dlss_checkbox->setEnabled(m_process.state() == QProcess::NotRunning);
 	{
 		const QSignalBlocker blocker(m_ui->gt7_dlss_checkbox);
@@ -920,8 +923,8 @@ void MainDialogPrivate::Update() {
 	m_export_logs_button->setEnabled(has_logs);
 	m_ui->gt7_feature_summary->setText(
 	    m_ui->widget->Gt7DlssEnabled()
-	        ? tr("1920 x 1080 → 2560 x 1440 · DLSS + FSR 2x frame generation")
-	        : tr("DLSS and frame generation off · desktop rendering"));
+	        ? tr("1080p → 4K · Native PSSR inputs + DLSS · Fixed 2X frame generation")
+	        : tr("4K upscaling and frame generation off · Desktop rendering"));
 	m_ui->gt7_start_button->setToolTip(
 	    gt7_selected ? QString {} : tr("Select Gran Turismo 7 in the game library to start."));
 	if (m_process.state() != QProcess::NotRunning) {

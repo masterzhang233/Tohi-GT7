@@ -111,6 +111,7 @@ struct PipelineVertexInputState {
 	struct Attribute {
 		uint32_t offset                             = 0;
 		uint8_t  binding                            = 0;
+		uint8_t  format                             = 0; // Exact guest vertex format.
 		bool     operator==(const Attribute&) const = default;
 	};
 

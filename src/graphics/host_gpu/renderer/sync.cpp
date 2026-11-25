@@ -221,10 +221,11 @@ void WriteAtEndOfPipeWithInterruptWriteBackFlip32(uint64_t submit_id, CommandBuf
 	auto& renderer  = buffer.GetContext();
 	auto& scheduler = renderer.GetCommandScheduler();
 	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
-	scheduler.DeferPriorityOperation([&renderer, event_id, request_id] {
+	const auto trace = scheduler.CapturePriorityCallback(event_id, 0);
+	scheduler.DeferPriorityOperation([&renderer, event_id, request_id, trace] {
 		renderer.GetVideoOut().CompleteFlip(request_id);
-		renderer.TriggerInterrupt(event_id, 0);
-	});
+		renderer.TriggerInterrupt(event_id, 0, &trace);
+	}, trace);
 }
 
 void WriteAtEndOfPipeWithFlip32(uint64_t submit_id, CommandBuffer& buffer, uint32_t* dst_gpu_addr,
@@ -262,8 +263,11 @@ void TriggerEopEventAtEndOfPipe(CommandBuffer& buffer, int event_id, uint32_t co
 	auto& renderer  = buffer.GetContext();
 	auto& scheduler = renderer.GetCommandScheduler();
 	EXIT_IF(!scheduler.Active() || &buffer != &scheduler.Current());
+	const auto trace = scheduler.CapturePriorityCallback(event_id, context_id);
 	scheduler.DeferPriorityOperation(
-	    [&renderer, event_id, context_id] { renderer.TriggerInterrupt(event_id, context_id); });
+	    [&renderer, event_id, context_id, trace] {
+		    renderer.TriggerInterrupt(event_id, context_id, &trace);
+	    }, trace);
 }
 
 static void InterruptEventResetFunc(LibKernel::EventQueue::KernelEqueueEvent* event) {

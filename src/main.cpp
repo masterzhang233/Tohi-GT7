@@ -111,6 +111,7 @@ static void PrintUsage() {
 	::printf("  --game <dir|elf|zar>                 Game directory, ELF, or ZArchive to load.\n");
 	::printf("  --game-patch <json>                  ETAHen cheat file.\n");
 	::printf("  --gt7-desktop-height <value>         Internal GT7 3D height: native, 1080, 1440, 2160.\n");
+	::printf("  --gt7-pssr-1080-4k                   Request GT7 Native PSSR 1080p-to-4K preset; requires --ps5-pro --pssr-dlss.\n");
 	::printf("  --gt7-vr-scale <value>               GT7 eye render scale: 100, 110, 120, 125; requires --vr.\n");
 	::printf("  --gt7-check-only                     Validate the selected GT7 profile without starting the game.\n");
 	::printf("  --graphics-check-only               Initialize the real Vulkan graphics path, then exit without loading guest code.\n");
@@ -132,6 +133,8 @@ static void PrintUsage() {
 	::printf(
 	    "  --hide-cursor                        Hide the cursor after 2 s idle. Default: off.\n");
 	::printf("  --vr                                 Enable the SteamVR headset bridge.\n");
+	::printf("  --ps5-pro                            Enable experimental PS5 Pro mode for supported titles.\n");
+	::printf("  --pssr-dlss                          Use DLSS for native PSSR requests; requires --ps5-pro, desktop only.\n");
 	::printf("  --wheel <true|false>                 Show the game a racing wheel fed by host\n"
 	         "                                       devices (see --wheel-config).\n");
 	::printf("  --wheel-config <json>                Wheel mapping file. Default: wheel.json in\n"
@@ -291,6 +294,14 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			gt7.check_only = true;
 			continue;
 		}
+		if (arg == "--gt7-pssr-1080-4k") {
+			if (gt7.native_pssr_1080_4k) {
+				::printf("--gt7-pssr-1080-4k can only be specified once\n");
+				return false;
+			}
+			gt7.native_pssr_1080_4k = true;
+			continue;
+		}
 		if (arg == "--graphics-check-only") {
 			options.graphics_check_only = true;
 			continue;
@@ -313,6 +324,14 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 
 		if (arg == "--vr") {
 			options.config.vr_enabled = true;
+			continue;
+		}
+		if (arg == "--ps5-pro") {
+			options.config.pro_enabled = true;
+			continue;
+		}
+		if (arg == "--pssr-dlss") {
+			options.config.pssr_dlss_enabled = true;
 			continue;
 		}
 
@@ -601,6 +620,24 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		::printf("--gt7-check-only and --graphics-check-only are mutually exclusive\n");
 		return false;
 	}
+	if (!show_help && gt7.native_pssr_1080_4k &&
+	    (!options.config.pro_enabled || !options.config.pssr_dlss_enabled)) {
+		::printf("--gt7-pssr-1080-4k requires both --ps5-pro and --pssr-dlss\n");
+		return false;
+	}
+	if (!show_help && options.config.pssr_dlss_enabled && !options.config.pro_enabled) {
+		::printf("--pssr-dlss requires --ps5-pro\n");
+		return false;
+	}
+	if (!show_help && options.config.pssr_dlss_enabled && options.config.vr_enabled) {
+		::printf("--pssr-dlss is desktop-only and cannot be combined with --vr\n");
+		return false;
+	}
+	if (!show_help && options.config.pssr_dlss_enabled &&
+	    (gt7.desktop_height > 0 || gt7.vr_scale != 0)) {
+		::printf("--pssr-dlss requires native game dimensions; legacy GT7 resolution patches are incompatible\n");
+		return false;
+	}
 	if (options.config.gpu_assisted_validation_enabled) {
 		options.config.vulkan_validation_enabled = true;
 	}
@@ -633,9 +670,10 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 // a DLL, CUDA threads and startup time). KYTY_CUDA_VA_FLOOR_GB: the floor in
 // GiB, 1024 (the default) to 65536. Without nvcuda.dll (no NVIDIA driver) nothing happens.
 // From Jetsku/KytyPS5 (Luiz Henrique, PR 58, and Jetsku's opt-in, ec9943e6).
-static void InitCudaEarly() {
+static void InitCudaEarly(bool native_pssr_requested) {
 	const auto* dlss_value = std::getenv("KYTY_GT7_DLSS");
-	const bool dlss_requested = dlss_value && std::strcmp(dlss_value, "1") == 0;
+	const bool dlss_requested = native_pssr_requested ||
+	                            (dlss_value && std::strcmp(dlss_value, "1") == 0);
 	const auto* early_value = std::getenv("KYTY_CUDA_EARLY_INIT");
 	if (!dlss_requested && (!early_value || std::strcmp(early_value, "1") != 0)) {
 		return;
@@ -647,7 +685,8 @@ static void InitCudaEarly() {
 		return;
 	}
 	if (dlss_requested) {
-		::printf("GT7 DLSS: preparing NVIDIA driver before guest address reservation\n");
+		::printf("%s DLSS: preparing NVIDIA driver before guest address reservation\n",
+		         native_pssr_requested ? "PSSR" : "GT7");
 	}
 	using CuInit    = int(__stdcall*)(unsigned int);
 	const auto init = reinterpret_cast<CuInit>(GetProcAddress(cuda, "cuInit"));
@@ -723,8 +762,13 @@ static bool PrepareGt7Profile(const Loader::Gt7Profile::Request& request,
 	}
 	::printf("GT7 profile: verified executable image and original patch bytes; %s; disk game unchanged\n",
 	         options.game_patch.filename().string().c_str());
-	::printf("GT7 profile: internal height=%d VR scale=%d; output=%ux%u (independent window size)\n",
-	         request.desktop_height, request.vr_scale, options.config.screen_width, options.config.screen_height);
+	if (request.native_pssr_1080_4k) {
+		::printf("GT7 profile: requested Native PSSR preset=1080p-to-4K; window output=%ux%u; actual PSSR input/output dimensions require runtime verification\n",
+		         options.config.screen_width, options.config.screen_height);
+	} else {
+		::printf("GT7 profile: internal height=%d VR scale=%d; output=%ux%u (independent window size)\n",
+		         request.desktop_height, request.vr_scale, options.config.screen_width, options.config.screen_height);
+	}
 	return true;
 }
 
@@ -742,7 +786,21 @@ static int Main(int argc, char* argv[]) {
 		return PrepareGt7Profile(request, options, argv[0]) ? 0 : 1;
 	}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	InitCudaEarly();
+	// Configuration is loaded after reserving the guest address space. Native PSSR DLSS
+	// needs the same NVIDIA address reservation workaround as the legacy environment path.
+	bool early_pro = false, early_pssr = false, early_vr = false;
+	bool skip_early_cuda = argc < 2;
+	for (int i = 1; i < argc; ++i) {
+		early_pro |= std::strcmp(argv[i], "--ps5-pro") == 0;
+		early_pssr |= std::strcmp(argv[i], "--pssr-dlss") == 0;
+		early_vr |= std::strcmp(argv[i], "--vr") == 0;
+		skip_early_cuda |= std::strcmp(argv[i], "--help") == 0 ||
+		                   std::strcmp(argv[i], "-h") == 0 ||
+		                   std::strcmp(argv[i], "--graphics-check-only") == 0;
+	}
+	if (!skip_early_cuda) {
+		InitCudaEarly(early_pro && early_pssr && !early_vr);
+	}
 #endif
 	VirtualMemory::Init();
 	InitializeThreads();

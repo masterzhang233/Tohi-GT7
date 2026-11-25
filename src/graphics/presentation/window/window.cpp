@@ -14,6 +14,7 @@
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/bisect.h"
+#include "graphics/host_gpu/renderer/dlss.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -24,6 +25,7 @@
 #include "graphics/presentation/window/hostInput.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/presentation/window/gt7FrameGen.h"
+#include "graphics/presentation/window/gt7DlssFrameGen.h"
 #include "kytyGitVersion.h"
 #include "libs/controller.h"
 #include "libs/wheelHost.h"
@@ -512,6 +514,27 @@ void WindowContext::ProcessDisplayEvent(const SDL_DisplayEvent& display) {
 void WindowContext::ProcessEvent(double time_s) {
 	auto& game  = loop;
 	auto* event = &game.event;
+	if (title_event_type != 0 && event->type == title_event_type) {
+		std::string  text;
+		SDL_WindowID window_id = 0;
+		{
+			std::scoped_lock lock(title_mutex);
+			if (!title_event_queued || title_window_id == 0 ||
+			    event->user.windowID != title_window_id) {
+				return;
+			}
+			window_id          = title_window_id;
+			text               = std::move(latest_title);
+			title_event_queued = false;
+		}
+		// Window lookup and title changes happen on the SDL main thread, without
+		// the mailbox lock. A destroyed window is harmless, including direct context
+		// destruction: the queued event owns no pointer and has a private event type.
+		if (auto* target = SDL_GetWindowFromID(window_id); target != nullptr) {
+			SDL_SetWindowTitle(target, text.c_str());
+		}
+		return;
+	}
 	if ((event->type == SDL_EVENT_KEY_DOWN || event->type == SDL_EVENT_KEY_UP) &&
 	    event->key.key == SDLK_F7) {
 		if (event->type == SDL_EVENT_KEY_DOWN && event->key.repeat == 0) {
@@ -840,6 +863,14 @@ static void WindowCreate(WindowContext& context) {
 		EXIT("%s\n", SDL_GetError());
 	}
 
+	// Register before publishing the context to the presenter. A distinct event
+	// type per context also makes old events harmless if a window ID is reused.
+	context.title_window_id  = SDL_GetWindowID(context.window);
+	context.title_event_type = SDL_RegisterEvents(1);
+	if (context.title_event_type == 0) {
+		LOGF("Window title updates disabled: SDL could not reserve a user event\n");
+	}
+
 	SDL_SetWindowPosition(context.window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
 	HostInputInit(context.window);
 	InitializeSystemOverlayInput(context.window);
@@ -881,6 +912,12 @@ void WindowRun() {
 
 void WindowShutdown() {
 	if (g_window != nullptr) {
+		{
+			std::scoped_lock lock(g_window->title_mutex);
+			g_window->title_window_id    = 0;
+			g_window->title_event_queued = false;
+			g_window->latest_title.clear();
+		}
 		HostInputShutdown();
 		Controller::EmergencyShutdown();
 		g_window.reset();
@@ -997,35 +1034,78 @@ void WindowContext::UpdateTitle() {
 		fps_frames  = 0;
 	}
 
+	// Presenter::present_mutex serializes publishers. Keep counting every guest
+	// frame above, but publish status at most four times a second. A slow main
+	// event loop must not stall rendering or accumulate one title job per frame.
+	if (title_event_type == 0 ||
+	    (title_publish_time != 0 && now - title_publish_time < frequency / 4)) {
+		return;
+	}
+	title_publish_time = now;
+
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
 	// Put graphics status before hardware/build details so it stays visible in
 	// a normal-sized window. FPS remains the guest/game cadence, not display FPS.
 	auto text = fmt::format("Tohi-GT7 | game fps: {:.0f}", current_fps);
-	const auto fg = Gt7FrameGen::GetStatus();
-	if (fg.reason == Gt7FrameGen::StatusReason::Off) {
-		text += " [FSR FG: off]";
+	if (Config::PssrDlssEnabled()) {
+		switch (Dlss::GetSessionState()) {
+		case Dlss::SessionState::NotStarted:
+			text += " [DLSS SR: waiting for native PSSR]";
+			break;
+		case Dlss::SessionState::Ready:
+			text += " [DLSS SR: initialized; frames unverified]";
+			break;
+		case Dlss::SessionState::Failed:
+			text += " [DLSS SR: initialization failed; linear fallback]";
+			break;
+		}
+	}
+	if (Gt7DlssFrameGen::Requested()) {
+		const auto native = Gt7DlssFrameGen::GetStatus();
+		text += Gt7DlssFrameGen::IsGenerating()
+		    ? " [DLSS FG: 2x active]"
+		    : fmt::format(" [DLSS FG: {}]", Gt7DlssFrameGen::StatusReasonText(native.reason));
 	} else {
-		const auto* state = fg.reason == Gt7FrameGen::StatusReason::ActiveDispatch ? "active"
-		    : Gt7FrameGen::IsStatusError(fg.reason) ? "error" : "standby";
-		text += fg.reason == Gt7FrameGen::StatusReason::ActiveDispatch
-		    ? " [FSR FG: 2x active]"
-		    : fmt::format(" [FSR FG: {} / {}]", state, Gt7FrameGen::StatusReasonText(fg.reason));
+		const auto fg = Gt7FrameGen::GetStatus();
+		if (fg.reason == Gt7FrameGen::StatusReason::Off) {
+			text += " [FSR FG: off]";
+		} else {
+			const auto* state = fg.reason == Gt7FrameGen::StatusReason::ActiveDispatch ? "active"
+			    : Gt7FrameGen::IsStatusError(fg.reason) ? "error" : "standby";
+			text += fg.reason == Gt7FrameGen::StatusReason::ActiveDispatch
+			    ? " [FSR FG: 2x active]"
+			    : fmt::format(" [FSR FG: {} / {}]", state, Gt7FrameGen::StatusReasonText(fg.reason));
+		}
 	}
 	text += fmt::format(" | {}{}{}{}{} | [{} | {}] [{}] [{}], frame: {}",
 	    (has_title ? title : ""), (has_title_id ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_app_ver ? ", " : ""), (has_app_ver ? app_ver : ""),
 	    KYTY_BUILD_LABEL, build_type, device_name, processor_name, frame_num);
 
-	struct TitleUpdate {
-		SDL_Window*  window;
-		std::string* text;
-	} update {window, &text};
-	EXIT_IF(!SDL_RunOnMainThread(
-	    [](void* data) {
-		    auto& title = *static_cast<TitleUpdate*>(data);
-		    SDL_SetWindowTitle(title.window, title.text->c_str());
-	    },
-	    &update, true));
+	SDL_Event event {};
+	{
+		std::scoped_lock lock(title_mutex);
+		if (title_window_id == 0) {
+			return;
+		}
+		latest_title = std::move(text);
+		if (title_event_queued) {
+			return;
+		}
+		title_event_queued   = true;
+		event.type          = title_event_type;
+		event.user.windowID = title_window_id;
+	}
+	// SDL_PushEvent wakes HostInputWaitEvent even when it is waiting indefinitely.
+	// The event contains values only: no async callback can outlive stack storage.
+	if (!SDL_PushEvent(&event)) {
+		{
+			std::scoped_lock lock(title_mutex);
+			title_event_queued = false;
+		}
+		// A full queue or event filter is nonfatal; retry on a later (250 ms) update.
+		LOGF("Window title event was not queued: %s\n", SDL_GetError());
+	}
 }
 
 } // namespace Libs::Graphics

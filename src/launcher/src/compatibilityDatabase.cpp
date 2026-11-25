@@ -1,4 +1,5 @@
 #include "compatibilityDatabase.h"
+#include "cmake_config.h"
 
 #include <QDebug>
 #include <QDir>
@@ -125,7 +126,7 @@ void CompatibilityDatabase::Fetch(int attempt) {
 	QNetworkRequest request(QUrl(QString::fromLatin1(URL)));
 	request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
 	                     QNetworkRequest::NoLessSafeRedirectPolicy);
-	request.setRawHeader("User-Agent", "Tohi-GT7-Launcher/1.0.2");
+	request.setRawHeader("User-Agent", "Tohi-GT7-Launcher/" KYTY_VERSION);
 	request.setTransferTimeout(15000);
 	auto* reply = m_network.get(request);
 	connect(reply, &QNetworkReply::finished, this, [this, reply, attempt] {

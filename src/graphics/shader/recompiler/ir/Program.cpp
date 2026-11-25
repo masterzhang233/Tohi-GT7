@@ -148,6 +148,7 @@ CompiledShaderInfo Program::TakeCompiledInfo() && {
 	    .scratch_dwords  = scratch_dwords,
 	    .has_address_writes = has_address_writes,
 	    .gt7_camera_position = gt7_camera_position,
+	    .position_matrix = position_matrix,
 	    .info            = std::move(info),
 	    .bindings        = std::move(bindings),
 	};

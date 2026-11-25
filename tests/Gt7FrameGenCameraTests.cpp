@@ -143,8 +143,70 @@ int main(int argc, char** argv) {
     }
     single_layer.indexed_viewport = true;
     check(!CompatibleRaster(single_layer), "one-layer attachment does not prove viewport routing");
+    Parameters original, effective;
+    check(Decode(vp, view, projection, 1920, 1080, original) &&
+          DecodeNative(vp, view, projection, captured_raster, 1920, 1080, effective),
+          "native identity projection accepted");
+    check(original.near_plane == effective.near_plane && original.far_plane == effective.far_plane,
+          "identity viewport preserves original endpoints exactly");
+    auto native_raster = captured_raster;
+    // Runtime log showed this nonidentity viewport. Rounded log values are a
+    // synthetic contract case, not a reconstruction of the captured register bits.
+    native_raster.z_scale = 0.999998f;
+    native_raster.z_offset = 2.00658e-6f;
+    check(!CompatibleRaster(native_raster) && CompatibleNativeRaster(native_raster),
+          "native affine does not broaden legacy raster acceptance");
+    check(DecodeNative(vp, view, projection, native_raster, 1920, 1080, effective),
+          "nonidentity viewport has a verified effective projection");
+    const auto range = ViewportDepthRange(native_raster);
+    const auto mapped = Libs::Graphics::ViewportTransform::Resolve(0x43f, 960, -540,
+        native_raster.z_scale, 960, 540, native_raster.z_offset, true);
+    check(range.minimum == mapped.min_depth && range.maximum == mapped.max_depth,
+          "camera uses exactly the float Vulkan viewport endpoints");
+    const double scale = double(range.maximum) - range.minimum;
+    check(scale != double(native_raster.z_scale),
+          "regression exercises viewport endpoint addition rounding");
+    check(effective.fov_y == original.fov_y && effective.position == original.position &&
+          effective.right == original.right && effective.up == original.up &&
+          effective.forward == original.forward && effective.jitter_ndc_x == original.jitter_ndc_x &&
+          effective.jitter_ndc_y == original.jitter_ndc_y,
+          "native depth affine leaves pose FOV and jitter unchanged");
+    check(effective.far_plane > 7000.0f && effective.far_plane < 8000.0f,
+          "small viewport offset materially changes depth reconstruction");
+    for (const double distance : {0.01, 0.1, 1.0, 10.0, 100.0, 1000.0, 3000.0}) {
+        const double raw = scale * (-double(projection[10]) + double(projection[14])/distance) + range.minimum;
+        const double reconstructed = double(effective.near_plane)*effective.far_plane /
+            (double(effective.near_plane) + raw*(double(effective.far_plane)-effective.near_plane));
+        check(std::abs(distance-reconstructed) <= distance*2e-7,
+              "effective camera reconstructs actual window depth across distance range");
+    }
+    const double ea = double(effective.near_plane)/(double(effective.far_plane)-effective.near_plane);
+    const double eb = double(effective.near_plane)*effective.far_plane /
+        (double(effective.far_plane)-effective.near_plane);
+    check(std::abs(-ea + eb/effective.near_plane - 1.0) < 1e-12 &&
+          std::abs(-ea + eb/effective.far_plane) < 1e-12,
+          "effective near and far map to one and raw clear zero");
+    const auto reject_native = [&](auto mutate, const char* name) {
+        auto raster = native_raster;
+        mutate(raster);
+        check(!DecodeNative(vp, view, projection, raster, 1920, 1080, effective) &&
+              effective.near_plane == 0.0f, name);
+    };
+    reject_native([](auto& r) { r.z_scale = 0; }, "collapsed native depth range rejected");
+    reject_native([](auto& r) { r.z_scale = -1; r.z_offset = 1; }, "double reversed depth rejected");
+    reject_native([](auto& r) { r.z_scale = 1; r.z_offset = -0.001f; }, "negative viewport endpoint rejected");
+    reject_native([](auto& r) { r.z_scale = 1; r.z_offset = 0.1f; }, "out of range viewport endpoint rejected");
+    reject_native([](auto& r) { r.z_scale = 0.5f; r.z_offset = 0.5f; }, "negative effective far plane rejected");
+    reject_native([](auto& r) { r.z_offset = std::numeric_limits<float>::quiet_NaN(); }, "NaN viewport rejected");
+    reject_native([](auto& r) { r.z_scale = std::numeric_limits<float>::infinity(); }, "infinite viewport rejected");
+    reject_native([](auto& r) { r.poly_offset_front = true; }, "native affine does not accept polygon bias");
+    auto changed_range = native_raster;
+    changed_range.z_offset = std::nextafter(changed_range.z_offset, 1.0f);
+    check(!(ViewportDepthRange(changed_range) == range), "one ULP affine change is not an epsilon match");
     auto wrong_vp = vp;
     wrong_vp[12] += 1.0f;
+    check(!DecodeNative(wrong_vp, view, projection, native_raster, 1920, 1080, effective),
+          "native remapping never bypasses original shader VP evidence");
     check(!Decode(wrong_vp, view, projection, 1920, 1080, camera), "stale view-projection rejected");
     check(camera.near_plane == 0.0f, "rejection clears old camera");
     wrong_vp = vp;

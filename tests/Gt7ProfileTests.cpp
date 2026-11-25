@@ -197,6 +197,28 @@ int main(int argc, char* argv[]) {
 	Require(!ValidateRequest(invalid, false, false, error), "unsupported desktop height accepted");
 	Request check_only{.check_only = true};
 	Require(!ValidateRequest(check_only, false, false, error), "empty preflight accepted");
+	Request native_pssr{.native_pssr_1080_4k = true};
+	Require(native_pssr.Active() && ValidateRequest(native_pssr, false, false, error),
+	        "dedicated Native PSSR request was inactive or rejected");
+	Require(!ValidateRequest(native_pssr, true, false, error), "Native PSSR/VR conflict accepted");
+	Require(!ValidateRequest(native_pssr, false, true, error), "Native PSSR/custom patch conflict accepted");
+	native_pssr.check_only = true;
+	Require(ValidateRequest(native_pssr, false, false, error), "Native PSSR preflight rejected");
+	native_pssr.desktop_height = 0;
+	Require(ValidateRequest(native_pssr, false, false, error), "Native PSSR with native desktop height rejected");
+	for (const int height : {1080, 1440, 2160, 720}) {
+		native_pssr.desktop_height = height;
+		Require(!ValidateRequest(native_pssr, false, false, error),
+		        "Native PSSR with legacy or invalid desktop height accepted");
+	}
+	native_pssr.desktop_height = -1;
+	for (const int scale : {100, 110, 120, 125}) {
+		native_pssr.vr_scale = scale;
+		Require(!ValidateRequest(native_pssr, false, false, error) &&
+		        !ValidateRequest(native_pssr, true, false, error),
+		        "Native PSSR with VR scale accepted");
+	}
+	native_pssr.vr_scale = 0;
 
 	const auto sample = std::filesystem::temp_directory_path() / "kyty_gt7_profile_sha256_test.bin";
 	{
@@ -211,6 +233,8 @@ int main(int argc, char* argv[]) {
 	std::filesystem::path patch = "untouched";
 	Require(!Prepare(desktop, sample, {}, patch, error) && patch == "untouched",
 	        "unsupported eboot was accepted or output patch changed");
+	Require(!Prepare(native_pssr, sample, {}, patch, error) && patch == "untouched",
+	        "Native PSSR accepted an unsupported eboot or changed the output patch");
 	std::filesystem::remove(sample);
 
 	const auto plain = std::filesystem::temp_directory_path() / "kyty_gt7_profile_plain_elf_test.bin";
@@ -272,7 +296,7 @@ int main(int argc, char* argv[]) {
 		Request request;
 		const char* file_name;
 	};
-	const std::array<ProfileCase, 8> profiles {{
+	const std::array<ProfileCase, 10> profiles {{
 	    {{.desktop_height = 0}, "GT7-Desktop-Internal-Native.json"},
 	    {{.desktop_height = 1080}, "GT7-Desktop-Internal-1080.json"},
 	    {{.desktop_height = 1440}, "GT7-Desktop-Internal-1440.json"},
@@ -281,6 +305,8 @@ int main(int argc, char* argv[]) {
 	    {{.vr_scale = 110}, "GT7-SteamVR-EyeScale-110.json"},
 	    {{.vr_scale = 120}, "GT7-SteamVR-EyeScale-120.json"},
 	    {{.vr_scale = 125}, "GT7-SteamVR-EyeScale-125.json"},
+	    {{.native_pssr_1080_4k = true}, "GT7-PSSR-1080-to-4K.json"},
+	    {{.desktop_height = 0, .native_pssr_1080_4k = true}, "GT7-PSSR-1080-to-4K.json"},
 	}};
 	for (const auto& executable : executables) {
 		Require(ExecutableImageSha256(executable, digest, error),

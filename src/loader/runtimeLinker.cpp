@@ -13,11 +13,14 @@
 #include "common/platform/sysDbg.h"
 #include "common/profiler.h"
 #include "common/singleton.h"
+#include "common/sourceTrace.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/gpuPhases.h"
 #include "graphics/host_gpu/pageManager.h"
+#include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/bisect.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
@@ -824,6 +827,66 @@ static bool WriteGpuFaultingBytes(uint64_t pc, uint64_t fault_vaddr, uint64_t va
 	return Libs::LibKernel::Memory::TryWriteGpuFaultingBytes(pc, fault_vaddr, vaddr, data, size);
 }
 
+namespace {
+
+// The existing Perf fault duration ends before AddFault/RecordTrackedFault. Keep that boundary
+// and the statistics tail separately: their mutex, map updates and periodic sorting can delay
+// the same CPU lane. This opt-in trace only publishes bounded POD records; no fault-path I/O.
+class SourceFaultTrace {
+public:
+	enum class Route : uint32_t { CleanLoad = 1, CleanStore = 2, Coherence = 3 };
+
+	SourceFaultTrace(Common::HostException::AccessViolationType access, uint64_t address) noexcept {
+		if (!Common::SourceTrace::Enabled()) return;
+		m_begin_ns = Common::SourceTrace::NowNs();
+		m_context = Common::SourceTrace::t_context;
+		using Access = Common::HostException::AccessViolationType;
+		m_flags = access == Access::Read ? 1u : access == Access::Write ? 2u :
+		          access == Access::Execute ? 3u : 0u;
+		if (Libs::Graphics::GuestGpu::IsGpuThread()) m_flags |= 1u << 16u;
+		m_flags |= (static_cast<uint32_t>(m_context.type) & 0xffu) << 24u;
+		// Range topology only: do not query mappings, inspect memory, or retain raw addresses.
+		constexpr auto extended_base = Libs::LibKernel::Memory::kExtendedMemoryBase;
+		constexpr auto extended_size = Libs::LibKernel::Memory::kExtendedMemorySize;
+		m_address_class = address != 0 && address < Libs::Graphics::LOWER_ADDRESS_SIZE ? 1u :
+		                  address >= extended_base && address - extended_base < extended_size ? 2u : 0u;
+		m_phase = static_cast<uint32_t>(Libs::Graphics::GpuPhases::Detail::t_step);
+	}
+
+	[[nodiscard]] uint64_t WorkEnd() const noexcept {
+		return m_begin_ns != 0 ? Common::SourceTrace::NowNs() : 0;
+	}
+
+	void Finish(Route route, uint64_t work_end_ns) const noexcept {
+		if (m_begin_ns == 0) return;
+		const auto end_ns = Common::SourceTrace::NowNs();
+		constexpr uint64_t slow_ns = 10'000'000;
+		if (work_end_ns - m_begin_ns < slow_ns && end_ns - m_begin_ns < slow_ns) return;
+		Common::SourceTrace::Event event {};
+		event.kind = Common::SourceTrace::Kind::Fault;
+		// flags: access[0:7], route[8:15], GPU lane[16], source submission type[24:31].
+		event.flags = m_flags | (static_cast<uint32_t>(route) << 8u);
+		event.begin_ns = m_begin_ns;
+		event.end_ns = end_ns;
+		event.work_end_ns = work_end_ns;
+		event.submission_id = m_context.submission_id;
+		event.request_id = m_context.request_id;
+		event.arg0 = m_address_class;
+		// arg1: active GPU phase[0:31], source queue[32:63]. Other threads have no phase.
+		event.arg1 = (static_cast<uint64_t>(m_context.queue_id) << 32u) | m_phase;
+		Common::SourceTrace::Record(event);
+	}
+
+private:
+	decltype(Common::SourceTrace::t_context) m_context {};
+	uint64_t m_begin_ns = 0;
+	uint32_t m_flags = 0;
+	uint32_t m_address_class = 0;
+	uint32_t m_phase = 0;
+};
+
+} // namespace
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -833,6 +896,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	}
 
 	if (info->type == Common::HostException::ExceptionType::AccessViolation) {
+		const SourceFaultTrace source_trace(info->access_violation_type, info->access_violation_vaddr);
 		using CoreAccess = Common::HostException::AccessViolationType;
 		using GpuAccess  = Libs::Graphics::PageFaultAccess;
 		GpuAccess access;
@@ -864,9 +928,11 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		        info->native_context, info->access_violation_vaddr,
 		        &Libs::LibKernel::Memory::TryReadCleanFaultingBytes)) {
 			const auto ns = elapsed_ns();
+			const auto trace_work_end = source_trace.WorkEnd();
 			Common::PerfStats::AddFault(ns, true, true);
 			RecordTrackedFault(info->exception_address, info->access_violation_vaddr, true,
 			                   Libs::Graphics::GuestGpu::IsGpuThread(), ns / 1000u, true);
+			source_trace.Finish(SourceFaultTrace::Route::CleanLoad, trace_work_end);
 			return true;
 		}
 		// A game thread's store to a page protected because the GPU wrote to it (often to other
@@ -894,10 +960,12 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			if (Loader::X64InstructionEmulator::TryEmulateStore(
 			        info->native_context, info->access_violation_vaddr, &WriteGpuFaultingBytes)) {
 				const auto ns = elapsed_ns();
+				const auto trace_work_end = source_trace.WorkEnd();
 				Common::PerfStats::AddFault(ns, false, true);
 				Common::PerfStats::AddCleanStore(ns);
 				RecordTrackedFault(info->exception_address, info->access_violation_vaddr, false,
 				                   false, ns / 1000u, true);
+				source_trace.Finish(SourceFaultTrace::Route::CleanStore, trace_work_end);
 				return true;
 			}
 			// A declined write is counted where it was declined.
@@ -914,10 +982,12 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				    Libs::Graphics::Bisect::SlowReadMicroseconds());
 			}
 			const auto ns = elapsed_ns();
+			const auto trace_work_end = source_trace.WorkEnd();
 			Common::PerfStats::AddFault(ns, access == GpuAccess::Read, false);
 			RecordTrackedFault(info->exception_address, info->access_violation_vaddr,
 			                   access == GpuAccess::Read, Libs::Graphics::GuestGpu::IsGpuThread(),
 			                   ns / 1000u, false);
+			source_trace.Finish(SourceFaultTrace::Route::Coherence, trace_work_end);
 			return true;
 		}
 	}

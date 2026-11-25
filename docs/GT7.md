@@ -1,38 +1,49 @@
 # Gran Turismo 7 in Tohi-GT7
 
-## Tohi-GT7 1.0.0 desktop release
+## Tohi-GT7 1.0.3 desktop release
+
+> [!IMPORTANT]
+> **本版本仅支持 NVIDIA GeForce RTX 40／50 系列显卡。**
+> This release supports only NVIDIA GeForce RTX 40 / 50 series GPUs. The live test
+> used an **RTX 5080**; it does not establish testing of every supported model.
 
 For the Windows binary package, fully extract the archive and start **`launcher.exe`**.
 It is the package's user entry point: add your own compatible GT7 directory, select
 the game and launch. Developer capture scripts and standalone probes are source-tree
 tools and are not included in the binary package.
 
-The launcher's **DLSS** checkbox is enabled by default. It selects the fixed
-**1920×1080 → 2560×1440** desktop configuration with DLSS Super Resolution
-(Quality hint, transformer preset K), **Vulkan FSR 3.1.4 2× frame generation** and
-the local wheel/occlusion ghosting correction. The fixed 75% input scale differs
-from the standard recommended DLSS Quality input resolution. There are no adjustable
-DLSS quality settings. This combination needs a compatible NVIDIA RTX GPU; the
-live acceptance run used an RTX 3080 and GT7 **PPSA01317, version 01.710.000**.
+The launcher's **4K + NVIDIA 2X** checkbox is enabled by default and can be turned
+off. It selects **1920×1080 → 3840×2160** reconstruction through
+GT7's native PSSR interface and the **NVIDIA DLSS backend**, followed by **NVIDIA 2X
+frame generation**. The PC reconstruction does not use Sony's PSSR neural model.
+Fixed 2X requests one generated frame per original frame; 3X, 4X and dynamic
+multi-frame generation are not offered. The live test used GT7 **PPSA01317, version
+01.710.000**. Other game versions have not received equivalent validation.
 
-Turning **DLSS** off disables this complete combination and uses ordinary desktop
-rendering. Existing save/configuration locations remain compatible. Both checkbox
-states use silent API logging for normal GT7 play; automatic developer captures are
+The game's FPS counter continues to report original game frames, not generated
+presentations. The RTX 5080 driving test recorded real frame-generation activity,
+and the player reported substantially reduced or absent interruptions in the
+requested comparison. Missing or unverified camera, depth, motion or HUD-less
+inputs still pause generation. This does not promise continuous 2X in every menu,
+track or view, or a particular display FPS.
+
+Existing save/configuration locations remain compatible. The normal profile
+uses silent API logging; automatic developer captures are
 disabled. Ordinary play requires neither F9/F10 nor manually set environment variables.
 The launcher no longer exposes the earlier VR launch controls.
 
 Use the game's **performance (frame rate) mode**. Ray tracing (RT) is not recommended
-for this release. See the [1.0.0 release notes](RELEASE-1.0.0.zh-CN.md),
-[DLSS implementation notes](GT7-DLSS-EXPERIMENT.md) and
-[frame-generation validation and limits](GT7-FSR-FRAME-GENERATION.md).
+for this release. See the [1.0.3 release notes](RELEASE-1.0.3.zh-CN.md),
+[native PSSR/DLSS implementation notes](NATIVE-PSSR-DLSS.md) and
+[NVIDIA frame-generation validation and limits](GT7-NVIDIA-FRAME-GENERATION.md).
 
 ## Upstream development context
 
 The following settings, hardware measurements and dated change log record the
 upstream work before Tohi-GT7 1.0.0. They provide historical context for ordinary
-rendering with **DLSS off**; they are not the current default DLSS preset.
-In particular, the old 3840×2160 and `File` logging entries below must not be applied
-to the default 1080p-to-1440p desktop preset. Keep normal play logging silent.
+rendering with **DLSS off**; they are not instructions for the current native
+1080p-to-4K preset. In particular, historical debug and `File` logging settings
+below do not replace the release launcher's defaults. Keep normal play logging silent.
 
 The upstream branch (`gt7-eqaa`) carries work on getting Gran Turismo 7 playable. It builds on the
 `wolverine` branch of [Senaxx/KytyPS5](https://github.com/Senaxx/KytyPS5). Build it as described
@@ -90,7 +101,7 @@ races in it are untested. It needs **Bindless textures** on in the launcher.
 ### Historical DLSS input investigation (source-tree tools)
 
 This section records the early `feature/gt7-dlss-sr` input investigation, before DLSS
-was integrated. **Tohi-GT7 1.0.0 does enable DLSS through its default launcher checkbox**;
+was integrated. **Tohi-GT7 1.0.0 introduced DLSS through its default launcher checkbox**;
 the investigation scripts below are developer tools, not steps required to play, and
 are not shipped in the binary package. Use a source checkout to follow these examples.
 

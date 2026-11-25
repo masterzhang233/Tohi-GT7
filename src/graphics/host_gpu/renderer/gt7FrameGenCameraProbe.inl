@@ -97,13 +97,13 @@ void CollectCameraProbe(CameraProbeState& probe, RenderContext& context,
         if (Libs::LibKernel::Memory::TryClampRangeSize(source, bytes) != bytes) {
             failure = "camera matrix range not mapped"; return false;
         }
-        if (buffers.HasGpuDirtyBytes(source, bytes)) {
+        if (!buffers.IsCleanForConcurrentRead(source, bytes)) {
             failure = "camera matrix range GPU dirty"; return false;
         }
         if (!Libs::LibKernel::Memory::TryReadBacking(source, destination, bytes)) {
             failure = "camera backing read failed"; return false;
         }
-        if (buffers.HasGpuDirtyBytes(source, bytes)) {
+        if (!buffers.IsCleanForConcurrentRead(source, bytes)) {
             failure = "camera matrix range became GPU dirty"; return false;
         }
         failure = nullptr;

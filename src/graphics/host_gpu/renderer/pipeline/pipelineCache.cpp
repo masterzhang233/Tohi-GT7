@@ -21,6 +21,7 @@
 #include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/gt7DlssEffectCoverage.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderDiskCache.h"
 #include "graphics/host_gpu/renderer/pipeline/spirvCoverageMask.h"
 #include "graphics/host_gpu/renderer/pipeline/spirvMeshTest.h"
@@ -78,6 +79,33 @@ bool ShaderFailureNonFatal() {
 }
 
 namespace {
+
+bool PlaytestDiagnostics() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GT7_PERF_DIAGNOSTICS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+struct PipelineDiagnosticTime {
+	std::atomic<uint64_t> count {0}, total_us {0}, max_us {0}, over_50ms {0};
+	void Add(uint64_t us) {
+		count.fetch_add(1, std::memory_order_relaxed);
+		total_us.fetch_add(us, std::memory_order_relaxed);
+		over_50ms.fetch_add(us >= 50000 ? 1u : 0u, std::memory_order_relaxed);
+		auto old = max_us.load(std::memory_order_relaxed);
+		while (old < us && !max_us.compare_exchange_weak(old, us, std::memory_order_relaxed)) {}
+	}
+	std::string Take() {
+		return fmt::format("{}/{:.3f}/{:.3f}/{}", count.exchange(0),
+		                   double(total_us.exchange(0)) / 1000.0,
+		                   double(max_us.exchange(0)) / 1000.0, over_50ms.exchange(0));
+	}
+};
+
+PipelineDiagnosticTime g_playtest_sync_build, g_playtest_worker_build;
+PipelineDiagnosticTime g_playtest_bounded_wait, g_playtest_required_wait;
 
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -1820,11 +1848,16 @@ static vk::Result CreateThroughCacheFiles(const GraphicsPipelineBuild&       bui
 
 // Counts a finished pipeline build and puts it on the timeline (slow ones as a warning).
 static void ReportPipelineBuilt(Profiler::Counter counter, const char* kind, uint64_t first_hash,
-                                uint64_t second_hash, std::chrono::steady_clock::time_point begin) {
+                                uint64_t second_hash, std::chrono::steady_clock::time_point begin,
+                                bool background = false) {
 	const auto us = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
 	                                         std::chrono::steady_clock::now() - begin)
 	                                         .count());
 	Profiler::Add(counter);
+	if (PlaytestDiagnostics()) {
+		(!background && Profiler::t_gpu_thread ? g_playtest_sync_build : g_playtest_worker_build).Add(
+		    static_cast<uint64_t>(std::max<int64_t>(us, 0)));
+	}
 	Profiler::Add(Profiler::Counter::PipelineBuildTime, us);
 	Profiler::Message(us >= 100000 ? Profiler::MessageWarning : Profiler::MessageInfo,
 	                  "%s pipeline built in %.1f ms: 0x%016" PRIx64 " 0x%016" PRIx64, kind,
@@ -2424,6 +2457,7 @@ std::size_t PipelineCache::GraphicsPipelineKeyHash::operator()(const GraphicsPip
 	for (uint32_t i = 0; i < key.vertex_input.attribute_count; i++) {
 		PipelineKeyHash::Mix(hash, key.vertex_input.attributes[i].offset);
 		PipelineKeyHash::Mix(hash, key.vertex_input.attributes[i].binding);
+		PipelineKeyHash::Mix(hash, key.vertex_input.attributes[i].format);
 	}
 	PipelineKeyHash::Mix(hash, XXH3_64bits(&key.static_params, sizeof(key.static_params)));
 	return hash;
@@ -2610,7 +2644,8 @@ struct PipelineCache::ProgramCache {
 		                            .normalized_id     = normalized_module != nullptr ? ++next_shader_id : 0u},
 		});
 		const auto& permutation = source.permutations.back();
-		input_info.stage = {.program = &permutation.program, .resources = &source.resources};
+		input_info.stage = {.program = &permutation.program, .resources = &source.resources,
+		                    .resource_plan = &source.resource_plan};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
 		std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};
@@ -2948,7 +2983,8 @@ struct PipelineCache::ProgramCache {
 			}
 			if (permutation != nullptr) {
 				input_info.stage = {.program   = &permutation->program,
-				                    .resources = &source.resources};
+				                    .resources = &source.resources,
+				                    .resource_plan = &source.resource_plan};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
 			}
@@ -4428,6 +4464,9 @@ void PipelineCache::WaitForPipeline(const PendingGraphicsPipeline& job) {
 	}
 	const auto spent = std::chrono::duration_cast<std::chrono::microseconds>(
 	    std::chrono::steady_clock::now() - now);
+	if (PlaytestDiagnostics()) {
+		g_playtest_bounded_wait.Add(static_cast<uint64_t>(std::max<int64_t>(spent.count(), 0)));
+	}
 	m_wait_left -= std::min(spent, m_wait_left);
 }
 
@@ -5079,6 +5118,10 @@ bool PipelineCache::DescribeGraphicsStages(
 			if (!ShaderFailureNonFatal()) {
 				EXIT("unsupported tessellation programs\n");
 			}
+			return false;
+		}
+	} else if (scan) {
+		if (!PrepareVertexProgramForScan(vertex_regs, context, vertex_info[0], vertex_params[0])) {
 			return false;
 		}
 	} else {
@@ -5805,6 +5848,18 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		}
 		const auto& ctx = command.GetRegisters();
 		const auto& bc = ctx.GetBlendControl(0);
+		if (geometric_effect && !Gt7DlssEffectCoverage::CanReplay({
+		        .color_samples = color.desc.info.samples,
+		        .depth_attachment = static_cast<bool>(depth.image_id),
+		        .sample_shading = ps.ps_sample_shading,
+		        .alpha_to_coverage = ctx.GetShaderRegisters().AlphaToMask(),
+		        .depth_export = ps.ps_depth_export_enable,
+		        .sample_mask_export = ps.ps_sample_mask_export_enable,
+		        .pixel_discard = ps.ps_pixel_kill_enable,
+		        .sample_masks = {ctx.GetAaMask(0), ctx.GetAaMask(1)},
+		    })) {
+			return reject("geometric effect requires full single-sample coverage");
+		}
 		using Factor = Prospero::BlendFactor;
 		const auto add = static_cast<uint8_t>(Prospero::BlendOp::kAdd);
 		const bool known_source_over = bc.separate_alpha_blend &&
@@ -5827,11 +5882,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		    !(geometric_effect ? geometric_blend : known_source_over) ||
 		    render_target_mask_slot(ctx.GetRenderTargetMask(), 0) != 0xf ||
 		    ctx.GetShaderRegisters().AlphaToMask() ||
-		    (geometric_effect && (ctx.GetColorControl().mode != 1 || ctx.GetColorControl().op != 0xcc ||
-		                          ctx.GetAaConfig().msaa_num_samples != 0 ||
-		                          ctx.GetAaConfig().msaa_exposed_samples != 0 ||
-		                          (ctx.GetAaMask(0) & 0x00010001u) != 0x00010001u ||
-		                          (ctx.GetAaMask(1) & 0x00010001u) != 0x00010001u))) {
+		    (geometric_effect && (ctx.GetColorControl().mode != 1 || ctx.GetColorControl().op != 0xcc))) {
 			return reject("unverified blend, channel mask or coverage state");
 		}
 	}
@@ -6113,6 +6164,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 			    .offset = static_cast<uint32_t>(vs_input_info.resources[attribute].Base48() -
 			                                    vs_input_info.buffers[binding].addr),
 			    .binding = static_cast<uint8_t>(binding),
+			    .format  = vs_input_info.resources[attribute].RawFormat(),
 			};
 		}
 	}
@@ -6164,11 +6216,28 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 			// A draw that may not be skipped waits for the compile another draw of the same
 			// pipeline sent to the background (round 87: more of those are sent now).
 			const GpuPhases::Scope wait_phase(GpuPhases::Phase::PipelineWait);
+			const auto diagnostic_begin = PlaytestDiagnostics() ? std::chrono::steady_clock::now()
+			                                                   : std::chrono::steady_clock::time_point {};
 			bool                   stalled = false;
 			while (!FinishPending(found)) {
 				m_compiler->Ask(*found.pending, stalled);
 				(void)m_compiler->Wait(*found.pending, std::chrono::milliseconds(100));
 				stalled = true;
+			}
+			if (PlaytestDiagnostics()) {
+				const auto end = std::chrono::steady_clock::now();
+				const auto us = std::chrono::duration_cast<std::chrono::microseconds>(end - diagnostic_begin).count();
+				g_playtest_required_wait.Add(static_cast<uint64_t>(std::max<int64_t>(us, 0)));
+				static auto next_report = std::chrono::steady_clock::time_point {};
+				if (us >= 50000 && end >= next_report) {
+					next_report = end + std::chrono::seconds(2);
+					PipelineCacheLog("GT7 perf required pipeline wait: steady_ms={:.3f} guest_frame={} "
+					                 "duration_ms={:.3f} vs={:016x} ps={:016x} defer={}",
+					                 std::chrono::duration<double, std::milli>(end.time_since_epoch()).count(),
+					                 FrameGraph::GpuThreadFrames(), double(us) / 1000.0,
+					                 vertex_program.hash, ps_active ? pixel_program.hash : 0,
+					                 static_cast<unsigned>(defer));
+				}
 			}
 		}
 		return &found;
@@ -6395,7 +6464,7 @@ void PipelineCache::ReapBackgroundCompute() {
 		     job.ahead ? " (started while it waited)" : "",
 		     job.pipeline->disable_optimization ? " (without optimization)" : "");
 		ReportPipelineBuilt(Profiler::Counter::ComputePipelinesBuilt, "Compute", job.hash, 0,
-		                    job.begin);
+		                    job.begin, true);
 		if (job.hash != 0 && !job.expansion.empty() && !job.partition) {
 			// Newer than the shader's ready expansion: it runs from now on, until a newer one is
 			// ready (GetComputeProgram). A partition's is not one: it runs its target alone.
@@ -6664,6 +6733,30 @@ void PipelineCache::ReportBackgroundProgress() {
 	const size_t compiling = m_compute_background.size();
 	const size_t waiting   = m_compute_waiting.size();
 	const auto   now       = std::chrono::steady_clock::now();
+	if (PlaytestDiagnostics()) {
+		static auto next_report = std::chrono::steady_clock::time_point {};
+		if (now >= next_report) {
+			next_report = now + std::chrono::seconds(5);
+			const auto* disk = m_program_cache->disk.get();
+			if (disk != nullptr) {
+				const auto& c = disk->counters;
+				PipelineCacheLog("GT7 perf shader cache: steady_ms={:.3f} guest_frame={} "
+				                 "cumulative_source_hit_miss={}/{} permutation_hit_miss={}/{} "
+				                 "rejected={} written={} read_MB={:.3f} pending_compute={} waiting_compute={}",
+				                 std::chrono::duration<double, std::milli>(now.time_since_epoch()).count(),
+				                 FrameGraph::GpuThreadFrames(), c.source_hits.load(), c.source_misses.load(),
+				                 c.permutation_hits.load(), c.permutation_misses.load(), c.rejected.load(),
+				                 c.writes.load(), double(c.bytes_read.load()) / 1048576.0, compiling, waiting);
+			}
+			PipelineCacheLog("GT7 perf pipeline CPU: steady_ms={:.3f} guest_frame={} "
+			                 "since_report(count/total_ms/max_ms/over50ms) sync_build={} worker_build={} "
+			                 "bounded_wait={} required_wait={}",
+			                 std::chrono::duration<double, std::milli>(now.time_since_epoch()).count(),
+			                 FrameGraph::GpuThreadFrames(), g_playtest_sync_build.Take(),
+			                 g_playtest_worker_build.Take(), g_playtest_bounded_wait.Take(),
+			                 g_playtest_required_wait.Take());
+		}
+	}
 	// What waits and is not a partition starts at its next dispatch; with nothing compiling, no
 	// dispatch asks for it now.
 	if (compiling != 0 || !m_partition_waiting.empty()) {

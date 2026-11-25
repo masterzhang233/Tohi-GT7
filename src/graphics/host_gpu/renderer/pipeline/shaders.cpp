@@ -190,10 +190,9 @@ bool VertexAttributeFetched(const ShaderVertexInputInfo& info, int attribute) {
 	return info.stage.program->info.vertex_fetch_components[attribute] != 0;
 }
 
-static void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, uint32_t& size,
+static void GetInputFormat(uint8_t raw_format, vk::Format& format, uint32_t& size,
                            uint32_t used_components) {
-	const auto fmt        = res.Format();
-	const auto raw_format = res.RawFormat();
+	const auto fmt = static_cast<Prospero::BufferFormat>(raw_format);
 	if (raw_format == kTemporaryVertexAttribFormat113) {
 		static bool logged_113 = false;
 		if (!logged_113) {
@@ -223,8 +222,7 @@ static void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, 
 	format = VulkanFormat(fmt);
 	size   = ShaderRecompiler::Format::GetFormatInfo(fmt).component_count;
 	if (format == vk::Format::eUndefined || size == 0) {
-		EXIT("unknown vertex format: fmt = %u descriptor=%08x,%08x,%08x,%08x\n", raw_format,
-		     res.fields[0], res.fields[1], res.fields[2], res.fields[3]);
+		EXIT("unknown vertex format: fmt = %u\n", raw_format);
 	}
 
 	if (NarrowInputFormat(format, size, used_components)) {
@@ -499,7 +497,7 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 		    vs_input_info.stage.program->info.vertex_fetch_components[index];
 		const auto used_components =
 		    compiled_components > 0 ? static_cast<int>(compiled_components) : registers_num;
-		GetInputFormat(vs_input_info.resources[index], native_attribute.format, attr_size,
+		GetInputFormat(vertex_input.attributes[index].format, native_attribute.format, attr_size,
 		               static_cast<uint32_t>(used_components));
 
 		if (graphics_debug_dump_enabled()) {

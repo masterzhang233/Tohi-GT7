@@ -36,6 +36,10 @@
     {
       "file": "GT7-SteamVR-EyeScale-125.json",
       "sha256": "6ad6db4890004d8d22ff6c187ea11c3b397c01c352f5bd87df341791e88babd3"
+    },
+    {
+      "file": "GT7-PSSR-1080-to-4K.json",
+      "sha256": "282da91e431164d1c2437bf7071239e2b26ec1cd824bf0a86e938bb6fce32b30"
     }
   ],
   "executable_image_sha256": "f2fab719a2f5caab44ed389a87953cefca78905a0b9b081d023ad33bccbe3aaf"

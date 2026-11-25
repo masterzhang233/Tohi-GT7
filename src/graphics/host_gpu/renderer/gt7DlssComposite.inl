@@ -3,7 +3,7 @@ bool Gt7Dlss::Composite(CommandBuffer& buffer, const TextureBinding& low_final,
                         const RenderColorInfo& high_target, uint32_t effect_count) {
     auto& s = *m_impl;
     if (!Active()) return false;
-    const auto reject = [&](const char* reason) { CancelFrame(reason); return false; };
+    const auto reject = [&](const char* reason) { CancelLiveFrame(reason); return false; };
     const auto rgb_identity = [](const vk::ComponentMapping& mapping) {
         return (mapping.r == vk::ComponentSwizzle::eIdentity || mapping.r == vk::ComponentSwizzle::eR) &&
                (mapping.g == vk::ComponentSwizzle::eIdentity || mapping.g == vk::ComponentSwizzle::eG) &&

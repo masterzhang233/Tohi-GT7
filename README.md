@@ -9,27 +9,46 @@
 Tohi-GT7 is the GT7 desktop fork maintained by `masterzhang233`, based on
 [usa-ratt/KytyPS5-GT7](https://github.com/usa-ratt/KytyPS5-GT7) and
 [KytyPS5](https://github.com/KytyPS5/KytyPS5). It retains the upstream emulator and its
-contributors' work, with a Chinese launcher, GT7 render profiles, DLSS Super Resolution,
-and experimental Vulkan FSR 3.1 frame generation. The original emulator is based on
+contributors' work, with a Chinese launcher, GT7 render profiles, native PSSR request
+handling through DLSS Super Resolution, and NVIDIA Vulkan frame generation. The original emulator is based on
 [Kyty](https://github.com/InoriRus/Kyty).
 
 **[Downloads and update notes](https://github.com/masterzhang233/Tohi-GT7/releases)** ·
 **[Report a Tohi-GT7 issue](https://github.com/masterzhang233/Tohi-GT7/issues)**
 
-**[Current release: Tohi-GT7 1.0.2](https://github.com/masterzhang233/Tohi-GT7/releases/tag/v1.0.2).**
-The launcher provides one **DLSS** checkbox, enabled by
-default. For desktop GT7 it selects the tested **1920×1080 → 2560×1440** configuration
-(Quality hint, transformer preset K), together with **FSR 3.1.4 2× frame generation**
-and the wheel/occlusion ghosting correction. There is no adjustable DLSS quality menu.
-DLSS requires a compatible NVIDIA RTX GPU; the live acceptance run used an RTX 3080.
-This is a fixed 1080p input, not the standard DLSS Quality input resolution at 1440p.
+**[Current release: Tohi-GT7 1.0.3](https://github.com/masterzhang233/Tohi-GT7/releases/tag/v1.0.3).**
 
-Version 1.0.2 selectively ports timer-event deletion, HTile/depth-descriptor fixes,
+> [!IMPORTANT]
+> **This release supports only NVIDIA GeForce RTX 40 / 50 series GPUs.**
+> **本版本仅支持 NVIDIA GeForce RTX 40／50 系列显卡。** Other GPUs are outside this release's
+> support scope. Live testing used an **RTX 5080**, not every model in these series.
+
+The launcher's **4K + NVIDIA 2X** checkbox is enabled by default and can be turned
+off. It uses **1920×1080 → 3840×2160 DLSS reconstruction** through
+GT7's native PSSR interface, followed by **NVIDIA 2X frame generation**. Reconstruction
+on the PC uses the NVIDIA DLSS backend; it does not run Sony's PSSR neural model.
+Fixed 2X requests **one generated frame per original frame**. This release does not
+offer 3X, 4X or dynamic multi-frame generation. The game's FPS counter still counts
+original game frames, so it does not show the extra presentations.
+
+The RTX 5080 driving test confirmed native 1080p-to-4K SR and frame-generation activity;
+the player reported that interruptions were substantially reduced or absent during
+the requested comparison. Input and HUD validation can still suspend generation, so
+this is not a guarantee of continuous 2X output or a display-FPS benchmark.
+Version 1.0.3 also selectively ports eight graphics, memory, timing and shader-cache
+changes from the November 25 KytyPS5 mainline snapshot. The launcher retains its GT7
+background and dark/red styling, with clearer preset information, spacing and launch
+status. See the
+[1.0.3 release notes](docs/RELEASE-1.0.3.zh-CN.md),
+[native PSSR/DLSS notes](docs/NATIVE-PSSR-DLSS.md) and
+[NVIDIA frame-generation notes](docs/GT7-NVIDIA-FRAME-GENERATION.md).
+
+The earlier 1.0.2 release selectively ports timer-event deletion, HTile/depth-descriptor fixes,
 save-mount error handling, and font-writing advances/iteration from the November 6
 KytyPS5 release. It retains this fork's DLSS/FSR integration, wheel support and
 Unicode/TTC font fallback. The Windows release build and package integrity were
 checked; the new regression cases were not fully executed and no in-game acceptance
-was completed for this release. See the [1.0.2 notes](docs/RELEASE-1.0.2.zh-CN.md)
+was completed for that release. See the [1.0.2 notes](docs/RELEASE-1.0.2.zh-CN.md)
 for the exact upstream commits and validation limits.
 
 The earlier 1.0.1 update recognizes equivalent camera-position calculations in vertex shaders,
@@ -64,7 +83,7 @@ and configuration locations are kept compatible with previous builds.
 
 > [!NOTE]
 > Start the Windows package through `launcher.exe` or `Start-GT7-Desktop.cmd` and follow the
-> [Tohi-GT7 1.0.2 release notes](docs/RELEASE-1.0.2.zh-CN.md).
+> [Tohi-GT7 1.0.3 release notes](docs/RELEASE-1.0.3.zh-CN.md).
 > [GT7 documentation](docs/GT7.md) also retains the upstream settings and change log
 > as historical context; they do not replace the current default DLSS preset.
 > In the game, use performance (frame rate) mode. Ray tracing (RT) is not recommended.
@@ -194,6 +213,12 @@ the Vulkan/SPIR-V validation rules.
 ## Building
 
 ### System requirements
+
+The **Tohi-GT7 1.0.3 Windows release** requires an **NVIDIA GeForce RTX 40 / 50 series**
+GPU and a driver/runtime configuration accepted by NVIDIA DLSS frame generation.
+Its live validation used Windows and an RTX 5080. Other GPU families are unsupported
+for this release. The following are the underlying emulator's general source-build
+requirements, not a broader compatibility claim for the 1.0.3 package.
 
 - Windows 10 version 1803, a current Linux distribution, or macOS on Apple Silicon
 - A 64-bit x86 processor (on macOS, an Apple Silicon processor with Rosetta 2)

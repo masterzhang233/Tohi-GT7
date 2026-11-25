@@ -26,8 +26,11 @@
 #include "graphics/host_gpu/renderer/gpuProfiler.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/renderer/gt7Dlss.h"
+#include "graphics/presentation/window/gt7FrameGen.h"
 #include "graphics/host_gpu/renderer/gt7DlssDrawChecks.h"
 #include "graphics/host_gpu/renderer/gt7FrameGenCamera.h"
+#include "graphics/host_gpu/renderer/gt7NativeAttachmentPolicy.h"
+#include "graphics/host_gpu/renderer/gt7OpaqueOverlay.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/occlusionQueries.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
@@ -67,6 +70,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <vulkan/vulkan_format_traits.hpp>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
@@ -437,7 +441,8 @@ static bool EqualTestedNothing(uint64_t vs_hash) {
 
 static void SetGraphicsDynamicParams(const CommandBuffer& buffer, const CommandRecorder& vk_buffer,
                                      const ShaderVertexInputInfo& vs_input_info,
-                                     const RenderDepthInfo& depth, const RenderState& rendering) {
+                                     const RenderDepthInfo& depth, const RenderState& rendering,
+                                     const Gt7Dlss::OutputDrawDiagnostic* sr_writer = nullptr) {
 	KYTY_PROFILER_FUNCTION();
 
 	const auto& ctx = buffer.GetRegisters();
@@ -485,6 +490,29 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, const CommandR
 	}
 	vk_buffer.setViewportWithCount(viewport_count, viewports.data());
 	vk_buffer.setScissorWithCount(viewport_count, scissors.data());
+	if (sr_writer && sr_writer->report) {
+		// Log the exact arrays just submitted, without a second viewport/scissor derivation.
+		std::array<char, 4096> message {};
+		size_t used = 0;
+		const auto append = [&](const char* format, auto... args) {
+			if (used >= message.size() - 1) return;
+			const auto remaining = message.size() - used;
+			const int written = std::snprintf(message.data() + used, remaining, format, args...);
+			if (written > 0) used += std::min<size_t>(static_cast<size_t>(written), remaining - 1);
+		};
+		append("GT7 native FG first SR writer raster: frame=%llu scene=%llu slot=%u indexed_viewports=%u count=%u",
+		       static_cast<unsigned long long>(sr_writer->frame), static_cast<unsigned long long>(sr_writer->scene),
+		       sr_writer->target_slot, unsigned(indexed_viewports), viewport_count);
+		for (uint32_t i = 0; i < viewport_count; ++i) {
+			const auto& v = viewports[i];
+			const auto& s = scissors[i];
+			append(" v%u={xywh=%.9g,%.9g,%.9g,%.9g z=%.9g,%.9g scissor=%d,%d,%u,%u}",
+			       i, double(v.x), double(v.y), double(v.width), double(v.height), double(v.minDepth),
+			       double(v.maxDepth), s.offset.x, s.offset.y, s.extent.width, s.extent.height);
+		}
+		std::printf("%s\n", message.data());
+		std::fflush(stdout);
+	}
 
 	float line_width = ctx.GetLineWidth();
 	if (line_width != 1.0f) {
@@ -823,7 +851,7 @@ static vk::ResolveModeFlagBits ColorResolveMode(Prospero::BufferFormat format) {
 	}
 }
 
-RenderExecutor::~RenderExecutor() = default;
+RenderExecutor::~RenderExecutor() { ShutdownPssr(); }
 
 RenderExecutor::MsColorTarget&
 RenderExecutor::GetMsColorTarget(CommandBuffer& buffer, ImageId image_id, const Image& source,
@@ -2723,10 +2751,12 @@ static Gt7FrameGenCamera::RasterState Gt7FrameGenerationRasterState(const Comman
 
 static bool Gt7FrameGenerationCameraRaster(const CommandBuffer& buffer,
                                          const ShaderVertexInputInfo& vertex,
-                                         const RenderDepthInfo& depth) {
+                                         const RenderDepthInfo& depth, bool native_inputs) {
 	const auto raster = Gt7FrameGenerationRasterState(buffer, vertex, depth);
 	const bool full_viewport = Gt7DlssFullViewport(buffer, 1920, 1080);
-	const bool compatible = full_viewport && Gt7FrameGenCamera::CompatibleRaster(raster);
+	const bool compatible = full_viewport && (native_inputs
+	    ? Gt7FrameGenCamera::CompatibleNativeRaster(raster)
+	    : Gt7FrameGenCamera::CompatibleRaster(raster));
 	if (!compatible) {
 		static std::atomic<int64_t> next_report {0};
 		const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -2752,6 +2782,117 @@ static bool Gt7DlssTextureShape(const TextureBinding& texture, uint32_t width, u
 	       texture.desc.info.samples == 1 && view.format == format &&
 	       view.type == vk::ImageViewType::e2D && view.base_level == 0 && view.level_count == 1 &&
 	       view.base_layer == 0 && view.layer_count == 1;
+}
+
+static bool Gt7OpaqueOverlayUniform(const PreparedBindings& bindings, ShaderType type,
+                                    uint32_t byte_extent, Gt7OpaqueOverlay::ReadRange& range) {
+	if (!bindings.runtime || !*bindings.runtime) return false;
+	const auto& program = *bindings.runtime->program;
+	const auto& snapshot = *bindings.runtime->resources;
+	if (program.stage != type || program.has_address_writes || program.info.uses_dma ||
+	    program.info.uses_bvh || program.info.buffers.size() != 1 ||
+	    !program.info.images.empty() || !program.info.samplers.empty() ||
+	    !bindings.images.empty() || !bindings.samplers.empty() ||
+	    !bindings.bindless_heaps.empty() || !bindings.bindless_patches.empty() ||
+	    bindings.buffer_sources.size() != 1 || bindings.buffers.size() != 1 ||
+	    snapshot.buffers.size() != 1 || snapshot.buffers[0].dword_count != 4 ||
+	    !snapshot.images.empty() || !snapshot.samplers.empty() ||
+	    !snapshot.bindless_heaps.empty() || !snapshot.bindless_sampler_heaps.empty() ||
+	    !snapshot.gpu_fills.empty() ||
+	    snapshot.uniform_fill.kind != ShaderRecompiler::IR::UniformFillKind::None) return false;
+	const auto& resource = program.info.buffers[0];
+	if (!resource.read || !resource.scalar || resource.written || resource.atomic || resource.formatted ||
+	    resource.source != 0 || resource.max_byte_extent != byte_extent ||
+	    resource.image_alias != ShaderRecompiler::IR::BufferResource::NoImageAlias ||
+	    resource.indirect_root != ShaderRecompiler::IR::BufferResource::NoIndirectBuffer ||
+	    !resource.indirect_resources.empty()) return false;
+	const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[0]);
+	const auto& source = bindings.buffer_sources[0];
+	// Require the complete resolved descriptor, including the highest scalar read.
+	// Null/clamped descriptors cannot silently become a proof of independence.
+	if (descriptor.Type() != 0 || descriptor.SwizzleEnabled() || descriptor.AddTid() ||
+	    descriptor.PackedStride() != resource.packed_stride ||
+	    source.address != descriptor.Base48() || source.size != descriptor.GetSize() ||
+	    source.size < byte_extent || bindings.buffers[0].buffer == nullptr) return false;
+	range = {source.address, source.size};
+	return range.Valid();
+}
+
+static bool Gt7ProvenOpaqueOverlay(CommandBuffer& buffer, Gt7Dlss& dlss,
+                                   const DrawCallInfo& draw, const DrawRenderState& state,
+                                   const DrawEmitInfo& emit, const DrawIndexBufferSource& index,
+                                   const PreparedVertexBuffers& acquired_vertices,
+                                   const PreparedBindings& vertex, const PreparedBindings* pixel,
+                                   bool ordinary_vertex, bool storage_writes, bool address_writes) {
+	using Gt7OpaqueOverlay::ReadRange;
+	if (!ordinary_vertex || !state.ps_active || !pixel || !vertex.runtime || !*vertex.runtime ||
+	    !pixel->runtime || !*pixel->runtime ||
+	    !Gt7OpaqueOverlay::KnownPrograms(vertex.runtime->program->shader_hash, pixel->runtime->program->shader_hash) ||
+	    !dlss.WatchesFrameGenerationOutput() || state.color_count != 1 || storage_writes || address_writes ||
+	    state.depth_info.image_id || state.depth_info.depth_test_enable || state.depth_info.depth_write_enable)
+		return false;
+	const auto& ps = state.ps_input_info;
+	const auto& vs = state.vertex_info[0];
+	const auto& registers = buffer.GetRegisters();
+	const auto& target = state.color_info[0];
+	const auto& view = target.desc.view_info;
+	if (ps.ps_depth_export_enable || ps.ps_pixel_kill_enable || ps.ps_sample_mask_export_enable ||
+	    ps.ps_sample_shading || ps.dual_source_blending || registers.GetBlendControl(0).enable ||
+	    registers.GetColorControl().mode != 1 || registers.GetColorControl().op != 0xcc ||
+	    render_target_mask_slot(registers.GetRenderTargetMask() & registers.GetShaderRegisters().m_cbShaderMask, 0) != 0xf ||
+	    !target.image_id || !target.desc.info.data.Valid() || !dlss.MatchesFrameGenerationOutput(target) ||
+	    target.target_slot != 0 || !target.export_mapping.IsIdentity() || target.guest_mip_level || target.guest_array_layer ||
+	    target.desc.info.extent != vk::Extent3D {3840, 2160, 1} || target.desc.info.samples != 1 ||
+	    target.desc.info.pixel_format != vk::Format::eA2B10G10R10UnormPack32 ||
+	    view.format != vk::Format::eA2B10G10R10UnormPack32 || view.type != vk::ImageViewType::e2D ||
+	    view.base_level != 0 || view.level_count != 1 || view.base_layer != 0 || view.layer_count != 1 ||
+	    vs.prepare_failed || !vs.fetch_embedded || vs.fetch_external || vs.resources_num != 2 ||
+	    vs.buffers_num < 1 || vs.buffers_num > 2 || acquired_vertices.count != uint32_t(vs.buffers_num) ||
+	    vertex.runtime->program != vs.stage.program || vertex.runtime->resources != vs.stage.resources ||
+	    pixel->runtime->program != ps.stage.program || pixel->runtime->resources != ps.stage.resources)
+		return false;
+	std::array<ReadRange, 2> uniforms {}, attributes {}, vertex_buffers {};
+	if (!Gt7OpaqueOverlayUniform(vertex, ShaderType::Vertex, 64, uniforms[0]) ||
+	    !Gt7OpaqueOverlayUniform(*pixel, ShaderType::Pixel, 12, uniforms[1])) return false;
+	for (int i = 0; i < vs.buffers_num; ++i) {
+		// Use the range actually bound to Vulkan, after mapping clamps. Every attribute
+		// must fit this complete range; neither a null binding nor an omitted constant
+		// attribute may turn into an unchecked guest read.
+		vertex_buffers[i] = {vs.buffers[i].addr, acquired_vertices.sizes[i]};
+		if (acquired_vertices.buffers[i] == nullptr || !vertex_buffers[i].Valid() ||
+		    acquired_vertices.sizes[i] != VertexBufferDescriptorSize(i, vs)) return false;
+	}
+	for (int i = 0; i < vs.resources_num; ++i) {
+		const auto& attribute = vs.resources[i];
+		const auto& destination = vs.resources_dst[i];
+		if (destination.buffer_index < 0 || destination.buffer_index >= vs.buffers_num ||
+		    attribute.Type() != 0 || attribute.AddTid() || attribute.SwizzleEnabled() ||
+		    !VertexAttributeFetched(vs, i)) return false;
+		attributes[i] = Gt7OpaqueOverlay::AttributeRange(attribute.Base48(), attribute.Stride(),
+		    attribute.NumRecords(), ShaderRecompiler::Format::GetFormatInfo(attribute.Format()).byte_size,
+		    attribute.OutOfBounds());
+		if (!Gt7OpaqueOverlay::Contains(vertex_buffers[destination.buffer_index], attributes[i])) return false;
+	}
+	std::array<ReadRange, 3> controls {};
+	size_t controls_count = 0;
+	if (draw.IsIndexed()) controls[controls_count++] = {
+	    index.address ? index.address : reinterpret_cast<uint64_t>(index.host_data), index.size};
+	if (emit.gpu_args_address) controls[controls_count++] = {emit.gpu_args_address,
+	    draw.IsIndexed() ? sizeof(vk::DrawIndexedIndirectCommand) : sizeof(vk::DrawIndirectCommand)};
+	if (emit.gpu_instance_count_address) controls[controls_count++] = {emit.gpu_instance_count_address, sizeof(uint32_t)};
+	const auto overlaps = [&](ReadRange read) {
+		const GuestRange range {read.address, read.size};
+		return buffer.GetContext().GetTextureCache().WriteOverlapsImage(range, target.image_id, target.desc.info.data) ||
+		       dlss.MatchesWatchedWriteRange(range);
+	};
+	// Validate the existing snapshots in place: no allocation on an accepted overlay.
+	for (const auto* prepared : {&vertex, pixel})
+		for (const auto& [address, size] : prepared->runtime->resources->specialization_reads) {
+			const ReadRange read {address, size};
+			if (!read.Valid() || overlaps(read)) return false;
+		}
+	return Gt7OpaqueOverlay::IndependentReads(uniforms, attributes,
+	    std::span(vertex_buffers.data(), size_t(vs.buffers_num)), std::span(controls.data(), controls_count), {}, overlaps);
 }
 
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
@@ -3010,6 +3151,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	PipelineCache::Pipeline* dlss_effect_pipeline = nullptr;
 	bool dlss_composite = false;
 	bool fg_capture_hudless = false;
+	bool fg_verified_camera = false;
+	const ShaderStageRuntime* fg_depth_vertex = nullptr;
+	Gt7Dlss::OutputDrawDiagnostic fg_sr_writer;
+	// Diagnostic progress only: not requested, outer, raster, Observe, Finalize, verified.
+	uint32_t fg_camera_step = 0, fg_camera_outer_mask = 0;
 	if (dlss) {
 		const bool address_writes =
 		    (state.ps_active && state.ps_input_info.stage.program->has_address_writes) ||
@@ -3019,7 +3165,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		if (writes || address_writes) dlss->CancelFrame("graphics shader writes storage or unbounded addresses");
 		const auto ps = state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0;
 		const auto vs = vertex_stages.front().stage.program->shader_hash;
-		if (m_context.GetGraphics().gt7_fsr_present_queue != nullptr && state.depth_info.image_id && state.color_count >= 2) {
+		const bool capture_frame_inputs = Gt7FrameGen::InputsRequested(m_context.GetGraphics());
+		if (capture_frame_inputs && state.depth_info.image_id && state.color_count >= 2) {
 			for (const auto& color : std::span(state.color_info, state.color_count)) {
 				if (color.target_slot == 1 && color.desc.info.pixel_format == vk::Format::eR16G16Sfloat &&
 				    color.desc.info.extent.width == 1920 && color.desc.info.extent.height == 1080) {
@@ -3031,18 +3178,40 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				}
 			}
 		}
-		if (m_context.GetGraphics().gt7_fsr_present_queue != nullptr &&
-		    Gt7Dlss::IsFrameGenerationCameraShader(vertex_stages.front().stage) && !mesh_active && vertex_stages.size() == 1 &&
-		    vertex_stages.front().stage.program->stage == ShaderType::Vertex &&
-		    state.ps_active && !state.ps_input_info.ps_depth_export_enable &&
-		    !writes && !address_writes && Gt7FrameGenerationCameraRaster(buffer, vertex_stages.front(), state.depth_info)) {
-			dlss->ObserveFrameGenerationCamera(vertex_stages.front().stage, state.depth_info,
-			                                  {state.color_info, state.color_count});
+		if (capture_frame_inputs) {
+			// The same outer eligibility predicate, expressed as diagnostic bits.
+			fg_camera_outer_mask = (!Gt7Dlss::IsFrameGenerationCameraShader(vertex_stages.front().stage) ? 1u : 0u) |
+			    (mesh_active ? 2u : 0u) | (vertex_stages.size() != 1 ? 4u : 0u) |
+			    (vertex_stages.front().stage.program->stage != ShaderType::Vertex ? 8u : 0u) |
+			    (!state.ps_active ? 16u : 0u) | (state.ps_input_info.ps_depth_export_enable ? 32u : 0u) |
+			    (writes ? 64u : 0u) | (address_writes ? 128u : 0u);
+			fg_camera_step = 1;
+			// A proved static layout may explain a compensated depth affine, but
+			// only for the actual sole Vertex stage and the same strict raster gate.
+			// Keep it separate from Observe: no camera is created or rebased here.
+			if (dlss->NativeFrameGenerationInputs() && (fg_camera_outer_mask & ~1u) == 0 &&
+			    bindings.vertex[0].runtime &&
+			    bindings.vertex[0].runtime->program == vertex_stages.back().stage.program &&
+			    bindings.vertex[0].runtime->resources == vertex_stages.back().stage.resources &&
+			    Gt7FrameGenerationCameraRaster(buffer, vertex_stages.back(), state.depth_info, true)) {
+				fg_depth_vertex = bindings.vertex[0].runtime;
+			}
+			if (fg_camera_outer_mask == 0) {
+				fg_camera_step = 2;
+				if (Gt7FrameGenerationCameraRaster(buffer, vertex_stages.front(), state.depth_info,
+				                                  dlss->NativeFrameGenerationInputs())) {
+					fg_camera_step = 3;
+					fg_verified_camera = dlss->ObserveFrameGenerationCamera(vertex_stages.front().stage, state.depth_info,
+					    {state.color_info, state.color_count}, Gt7FrameGenerationRasterState(buffer, vertex_stages.front(), state.depth_info),
+					    fg_depth_vertex);
+					if (fg_verified_camera) fg_camera_step = 5;
+				}
+			}
 		}
 		const bool direct = !mesh_active && !draw.IsIndexed() && vertex_stages.size() == 1 &&
 		    emit.gpu_args_address == 0 && emit.gpu_instance_count_address == 0 && draw.instance_count == 1 &&
 		    emit.first_vertex == 0 && emit.first_instance == 0;
-		if (m_context.GetGraphics().gt7_fsr_present_queue != nullptr) {
+		if (capture_frame_inputs) {
 			const auto& blend = buffer.GetRegisters().GetBlendControl(0);
 			const bool ordinary_vertex = !mesh_active && vertex_stages.size() == 1 &&
 			    vertex_stages.front().stage.program->stage == ShaderType::Vertex;
@@ -3065,7 +3234,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			    (!ui_color_factors ? 1u << 8 : 0u) | (!blend.separate_alpha_blend ? 1u << 9 : 0u) |
 			    (blend.alpha_srcblend != 0 ? 1u << 10 : 0u) | (blend.alpha_comb_fcn != 0 ? 1u << 11 : 0u) |
 			    (blend.alpha_destblend != 1 ? 1u << 12 : 0u);
-			if (ui_reject_mask != 0 && dlss->WatchesFrameGenerationOutput() &&
+			const bool proven_opaque_overlay = Gt7ProvenOpaqueOverlay(buffer, *dlss, draw, state, emit,
+			    index_source, vertex_bindings, bindings.vertex[0], bindings.pixel ? &*bindings.pixel : nullptr,
+			    ordinary_vertex, writes, address_writes);
+			if (ui_reject_mask != 0 && !proven_opaque_overlay && dlss->WatchesFrameGenerationOutput() &&
 			    std::ranges::any_of(std::span(state.color_info, state.color_count),
 			        [&](const auto& target) { return dlss->MatchesFrameGenerationOutput(target); })) {
 				static uint64_t failures = 0;
@@ -3108,7 +3280,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				}
 			}
 			dlss->CheckFrameGenerationOutputDraw({state.color_info, state.color_count}, bindings.pixel ? &*bindings.pixel : nullptr,
-			    vs, ps, ui_reject_mask == 0);
+			    vs, ps, ui_reject_mask == 0, proven_opaque_overlay, &fg_sr_writer);
 			if (direct && ordinary_vertex && state.ps_active && !writes && !address_writes &&
 			    ps == 0xedb9cdad0985bf44ULL && vs == 0xf13bd2584bf580c0ULL &&
 			    bindings.pixel && state.color_count == 1 && !state.depth_info.image_id &&
@@ -3169,16 +3341,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				}
 			}
 		}
-		const bool taa = ps == 0xc3113b114fb02e5dULL && vs == 0xf13bd2584bf580c0ULL;
+		const bool taa = !Config::PssrDlssEnabled() && ps == 0xc3113b114fb02e5dULL && vs == 0xf13bd2584bf580c0ULL;
 		if (taa) {
 			m_gt7_dlss_effects = 0;
-			dlss->CancelFrame("new temporal pass");
+			dlss->CancelLiveFrame("new temporal pass");
 			if (!writes && !address_writes && direct && bindings.pixel && !state.depth_info.image_id && draw.index_count == 4 &&
 			    topology == vk::PrimitiveTopology::eTriangleFan &&
 			    Gt7DlssFullViewport(buffer, 1920, 1080)) {
 				(void)dlss->BeginTaa(buffer, *bindings.pixel, {state.color_info, state.color_count});
 			} else {
-				dlss->CancelFrame("unsupported temporal draw", true);
+				dlss->CancelLiveFrame("unsupported temporal draw", true);
 			}
 		} else if (dlss->Active()) {
 			bool writes_scene = false;
@@ -3313,7 +3485,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				// A second blur or additional overlay needs the same per-draw resource
 				// and pipeline checks, not a fixed count from the first capture.
 				if (expected && m_gt7_dlss_effects == std::numeric_limits<uint32_t>::max()) {
-					dlss->CancelFrame("scene effect counter overflow");
+					dlss->CancelLiveFrame("scene effect counter overflow");
 					expected = false;
 				}
 				if (expected) {
@@ -3509,6 +3681,169 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
 	                         feedback_aspects, stages);
 	rendering_phase.End();
+	if (fg_sr_writer.report) {
+		const auto& registers = buffer.GetRegisters();
+		for (uint32_t i = 0; i < state.color_count; ++i) {
+			const auto& target = state.color_info[i];
+			if (target.target_slot != fg_sr_writer.target_slot) continue;
+			const auto slot = target.target_slot;
+			const auto& color = rendering.color_attachments[slot];
+			const auto& depth = rendering.depth_stencil_attachment;
+			const auto& blend = registers.GetBlendControl(slot);
+			const auto& blend_constant = registers.GetBlendColor();
+			const auto logical_mask = render_target_mask_slot(registers.GetRenderTargetMask(), slot);
+			const auto mapped_mask = target.export_mapping.ApplyMask(logical_mask);
+			uint32_t format_channels = 0;
+			for (uint8_t c = 0; c < vk::componentCount(target.desc.view_info.format); ++c) {
+				switch (vk::componentName(target.desc.view_info.format, c)[0]) {
+					case 'R': format_channels |= 1u; break;
+					case 'G': format_channels |= 2u; break;
+					case 'B': format_channels |= 4u; break;
+					case 'A': format_channels |= 8u; break;
+					default: break;
+				}
+			}
+			// Blend fields are guest state, not a claim about pipeline fallback/remapping.
+			// load_clear describes this rendering attachment, not earlier cache materialization.
+			std::printf("GT7 native FG first SR writer attachments: frame=%llu scene=%llu slot=%u"
+			            " framebuffer=%ux%u layers=%u format=%u mapping=0x%x logical_mask=0x%x shader_mask=0x%x"
+			            " mapped_mask=0x%x format_channels=0x%x effective_channels=0x%x color_write_enable=%u"
+			            " blend_guest=%u bypass=%u color=%u/%u/%u alpha=%u/%u/%u separate=%u alpha_source=%u"
+			            " blend_constant=%.9g,%.9g,%.9g,%.9g color_mode=%u rop=0x%x"
+			            " load_clear=%u clear=0x%x/0x%x/0x%x/0x%x resolve=%u"
+			            " depth_present=%u depth_clear=%u depth_clear_value=%.9g stencil_present=%u stencil_clear=%u stencil_clear_value=%u\n",
+			            static_cast<unsigned long long>(fg_sr_writer.frame), static_cast<unsigned long long>(fg_sr_writer.scene),
+			            slot, rendering.width, rendering.height, rendering.num_layers, unsigned(target.desc.view_info.format),
+			            unsigned(target.export_mapping.packed), logical_mask,
+			            render_target_mask_slot(registers.GetShaderRegisters().m_cbShaderMask, slot),
+			            mapped_mask, format_channels, mapped_mask & format_channels, unsigned(bool(color.image_view)),
+			            unsigned(blend.enable), unsigned(registers.GetRenderTarget(slot).info.blend_bypass),
+			            unsigned(blend.color_srcblend), unsigned(blend.color_comb_fcn), unsigned(blend.color_destblend),
+			            unsigned(blend.alpha_srcblend), unsigned(blend.alpha_comb_fcn), unsigned(blend.alpha_destblend),
+			            unsigned(blend.separate_alpha_blend),
+			            unsigned(state.ps_active && slot == 0 ? state.ps_input_info.alpha_blend_source : ShaderAlphaBlendSource::None),
+			            double(blend_constant.red), double(blend_constant.green), double(blend_constant.blue), double(blend_constant.alpha),
+			            unsigned(registers.GetColorControl().mode), unsigned(registers.GetColorControl().op),
+			            unsigned(color.is_clear), color.clear_value[0], color.clear_value[1], color.clear_value[2], color.clear_value[3],
+			            unsigned(color.resolve_mode), unsigned(depth.has_depth), unsigned(depth.depth_clear),
+			            double(std::bit_cast<float>(depth.clear_value[0])), unsigned(depth.has_stencil),
+			            unsigned(depth.stencil_clear), depth.clear_value[1]);
+			break;
+		}
+	}
+	if (dlss) {
+		// Initial CPU-dirty attachment uploads must precede the first committed
+		// camera witness. Later witnesses only validate; they never hide a write.
+		if (fg_verified_camera && dlss->NativeFrameGenerationInputs()) {
+			fg_camera_step = 4;
+			fg_verified_camera = dlss->FinalizeFrameGenerationCamera(state.depth_info,
+			    {state.color_info, state.color_count});
+			if (fg_verified_camera) fg_camera_step = 5;
+		}
+		const auto& attachment = rendering.depth_stencil_attachment;
+		const auto& fg_screen = buffer.GetRegisters().GetScreenViewport();
+		// Match the viewport endpoints actually sent by SetGraphicsDynamicParams,
+		// including the final stage's indexed slots, VTE bits and clip conversion.
+		const auto& fg_outputs = vertex_stages.back().stage.program->info.outputs;
+		const bool fg_indexed_viewports = std::any_of(fg_outputs.begin(), fg_outputs.end(), [](const auto& output) {
+			return output.kind == ShaderRecompiler::IR::StageOutputKind::ViewportIndex;
+		});
+		std::array<Gt7NativeAttachmentPolicy::DepthRange, std::size(HW::ScreenViewport {}.viewports)> fg_depth_ranges {};
+		const auto fg_viewport_count = fg_indexed_viewports ? fg_depth_ranges.size() : 1;
+		for (size_t i = 0; i < fg_viewport_count; ++i) {
+			const auto& fg_viewport = fg_screen.viewports[i];
+			const auto fg_mapped = ViewportTransform::Resolve(fg_screen.transform_control,
+			    fg_viewport.xscale, fg_viewport.yscale, fg_viewport.zscale,
+			    fg_viewport.xoffset, fg_viewport.yoffset, fg_viewport.zoffset,
+			    buffer.GetRegisters().GetClipControl().dx_clip_space);
+			fg_depth_ranges[i] = {fg_mapped.min_depth, fg_mapped.max_depth};
+		}
+		const bool fg_depths_match = Gt7NativeAttachmentPolicy::EnabledViewportsMatch(fg_indexed_viewports, fg_depth_ranges);
+		const auto input_rejection = dlss->CheckNativeFrameGenerationInputDraw(state.depth_info, {state.color_info, state.color_count},
+		    fg_verified_camera, attachment.has_depth && attachment.depth_clear,
+		    std::bit_cast<float>(attachment.clear_value[0]), fg_depth_ranges[0].minimum,
+		    fg_depth_ranges[0].maximum, fg_depths_match, fg_depth_vertex);
+		if (input_rejection.reason_mask != 0) {
+			const auto vs = vertex_stages.front().stage.program->shader_hash;
+			const auto ps = state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0;
+			// Record first occurrences of at most 64 writer classes, then sample
+			// every five seconds. The recording lane owns these bounded counters.
+			using WriterKey = std::array<uint64_t, 4>;
+			static thread_local std::array<WriterKey, 64> seen {};
+			static thread_local size_t seen_count = 0;
+			static thread_local int64_t next_report = 0;
+			const WriterKey key {vs, ps, input_rejection.reason_mask,
+			    uint64_t(fg_camera_step) | (uint64_t(fg_camera_outer_mask) << 32)};
+			const bool known = std::find(seen.begin(), seen.begin() + seen_count, key) != seen.begin() + seen_count;
+			const bool first = !known && seen_count < seen.size();
+			if (first) seen[seen_count++] = key;
+			const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+			    std::chrono::steady_clock::now().time_since_epoch()).count();
+			if (first || now >= next_report) {
+				next_report = now + 5000;
+				constexpr const char* steps[] {"not_requested", "outer", "raster", "Observe", "Finalize", "verified"};
+				std::array<char, 6144> message {};
+				size_t used = 0;
+				const auto append = [&](const char* format, auto... args) {
+					if (used >= message.size() - 1) return;
+					const auto remaining = message.size() - used;
+					const int written = std::snprintf(message.data() + used, remaining, format, args...);
+					if (written > 0) used += std::min<size_t>(static_cast<size_t>(written), remaining - 1);
+				};
+				const auto& registers = buffer.GetRegisters();
+				const auto& viewport = registers.GetScreenViewport().viewports[0];
+				const auto scissor = calc_final_scissor(registers.GetScreenViewport(), registers.GetScanModeControl(), {1920, 1080}, 0);
+				append("GT7 native FG first input writer: frame=%llu scene=%llu first_class=%u vs=%016llx ps=%016llx"
+				       " reason_mask=0x%x verified=%u failed_step=%s outer_mask=0x%x"
+				       " watched_depth=%u:%u range=0x%llx+0x%llx watched_motion=%u:%u range=0x%llx+0x%llx"
+				       " depth=%u:%u range=0x%llx+0x%llx depth_touch=0x%x depth_test=%u depth_write=%u compare=%u"
+				       " clear=%u clear_value=%.9g clear_bits=0x%x stencil_clear=%u"
+				       " targets=%u color_touches=0x%x rt_mask=0x%x vertices=%u instances=%u indexed=%u topology=%u"
+				       " mesh=%u stages=%zu viewport=%g,%g,%g,%g scissor=%d,%d,%d,%d",
+				       static_cast<unsigned long long>(input_rejection.frame), static_cast<unsigned long long>(input_rejection.scene),
+				       unsigned(first), static_cast<unsigned long long>(vs), static_cast<unsigned long long>(ps),
+				       input_rejection.reason_mask, unsigned(fg_verified_camera), steps[fg_camera_step], fg_camera_outer_mask,
+				       uint32_t(input_rejection.depth_id), uint32_t(input_rejection.depth_id >> 32),
+				       static_cast<unsigned long long>(input_rejection.depth_address), static_cast<unsigned long long>(input_rejection.depth_size),
+				       uint32_t(input_rejection.motion_id), uint32_t(input_rejection.motion_id >> 32),
+				       static_cast<unsigned long long>(input_rejection.motion_address), static_cast<unsigned long long>(input_rejection.motion_size),
+				       state.depth_info.image_id.index, state.depth_info.image_id.generation,
+				       static_cast<unsigned long long>(state.depth_info.desc.info.data.address),
+				       static_cast<unsigned long long>(state.depth_info.desc.info.data.size), input_rejection.depth_touch_relation,
+				       unsigned(state.depth_info.depth_test_enable), unsigned(state.depth_info.depth_write_enable), unsigned(state.depth_info.depth_compare_op),
+				       unsigned(attachment.has_depth && attachment.depth_clear), double(std::bit_cast<float>(attachment.clear_value[0])),
+				       attachment.clear_value[0], unsigned(attachment.stencil_clear), state.color_count, input_rejection.color_touch_mask,
+				       registers.GetRenderTargetMask(), draw.index_count, draw.instance_count, unsigned(draw.IsIndexed()), unsigned(topology),
+				       unsigned(mesh_active), vertex_stages.size(), double(viewport.xscale), double(viewport.xoffset),
+				       double(viewport.yscale), double(viewport.yoffset), scissor.left, scissor.top, scissor.right, scissor.bottom);
+				// Report the endpoints already used by the input gate, without a
+				// second transform or a change to the bounded reporting cadence.
+				append(" depth_mapping={actual=%.9g,%.9g saved=%.9g,%.9g raw_z=%.9g,%.9g vte=0x%x dx=%u indexed_viewports=%u count=%zu all_match=%u projection=%s}",
+				       double(fg_depth_ranges[0].minimum), double(fg_depth_ranges[0].maximum),
+				       double(input_rejection.saved_viewport_min_depth), double(input_rejection.saved_viewport_max_depth),
+				       double(viewport.zscale), double(viewport.zoffset), unsigned(fg_screen.transform_control),
+				       unsigned(registers.GetClipControl().dx_clip_space), unsigned(fg_indexed_viewports),
+				       fg_viewport_count, unsigned(fg_depths_match), input_rejection.depth_projection_status);
+				for (size_t i = 0; i < fg_viewport_count; ++i) {
+					append(" depth_v%zu={actual=%.9g,%.9g raw_z=%.9g,%.9g}", i,
+					       double(fg_depth_ranges[i].minimum), double(fg_depth_ranges[i].maximum),
+					       double(fg_screen.viewports[i].zscale), double(fg_screen.viewports[i].zoffset));
+				}
+				for (size_t i = 0; i < state.color_count; ++i) {
+					const auto& color = state.color_info[i];
+					append(" target%zu={slot=%u mask=0x%x id=%u:%u range=0x%llx+0x%llx touch=0x%x extent=%ux%u format=%u base=%u+%u/%u+%u}",
+					       i, color.target_slot, render_target_mask_slot(registers.GetRenderTargetMask(), color.target_slot),
+					       color.image_id.index, color.image_id.generation, static_cast<unsigned long long>(color.desc.info.data.address),
+					       static_cast<unsigned long long>(color.desc.info.data.size), input_rejection.color_touch_relation[i],
+					       color.desc.info.extent.width, color.desc.info.extent.height, unsigned(color.desc.view_info.format),
+					       color.desc.view_info.base_level, color.desc.view_info.level_count,
+					       color.desc.view_info.base_layer, color.desc.view_info.layer_count);
+				}
+				std::printf("%s\n", message.data());
+				std::fflush(stdout);
+			}
+		}
+	}
 	if (FrameGraph::Logging() && state.depth_info.image_id) {
 		// What the depth attachment's rendering starts with (an HTile clear among them).
 		const auto& ds = rendering.depth_stencil_attachment;
@@ -3613,7 +3948,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
 
-	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering);
+	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering, &fg_sr_writer);
 	if (m_context.GetTextureCache().TraceEnabled()) {
 		TraceTargetDraws(m_context.GetTextureCache(), buffer, state.depth_info, state.color_info,
 		                 state.color_count, rendering);
@@ -3914,7 +4249,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				     state.ps_input_info.stage.program->shader_hash, draw.index_count);
 			}
 		} else {
-			dlss->CancelFrame("effect attachment unavailable or depth clear");
+			dlss->CancelLiveFrame("effect attachment unavailable or depth clear");
 		}
 	}
 	if (dlss_composite && dlss->Active() &&
@@ -3970,6 +4305,8 @@ const char* RenderExecutor::ConsumeDrawAsOperation(CommandBuffer& buffer,
 		return "a depth-to-color copy";
 	}
 	if (DepthStencilCopy(buffer)) {
+		if (auto* dlss = m_context.GetGt7Dlss(); dlss && dlss->WatchesFrameGenerationInputs())
+			dlss->CancelFrame("depth/stencil copy after native camera observation");
 		return "a depth/stencil copy";
 	}
 	if (ResolveColorTargets(buffer, render_target_slice_offset)) {
@@ -4368,6 +4705,8 @@ bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer, uint32_t render_
 	}
 
 	auto& cache = m_context.GetTextureCache();
+	if (auto* dlss = m_context.GetGt7Dlss(); dlss && dlss->MatchesFrameGenerationInput(dst))
+		dlss->CancelFrameForWrite(dst, "image resolve writes native camera inputs");
 	cache.MarkGpuWritten(dst.image_id);
 	auto& source      = cache.GetImage(src.image_id);
 	auto& destination = cache.GetImage(dst.image_id);

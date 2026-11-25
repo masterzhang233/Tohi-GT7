@@ -3,6 +3,7 @@
 #include "wheelMappingDialog.h"
 
 #include <QCoreApplication>
+#include <QFile>
 #include <QJsonObject>
 #include <QSettings>
 #include <QTemporaryDir>
@@ -35,11 +36,13 @@ int main(int argc, char** argv) {
 	Check(WheelMappingDialog::tr("Racing wheel") == QStringLiteral("WheelMappingDialog"),
 	      "wheel dialog uses its own translation context instead of QDialog");
 	app.removeTranslator(&probe);
+	const QStringList native_arguments {"--gt7-desktop-height", "native", "--ps5-pro",
+	                                    "--pssr-dlss", "--gt7-pssr-1080-4k"};
 	Configuration original;
 	original.title_id = "PPSA01317";
 	Check(!original.controller.wheel_enabled, "racing wheel is disabled for new configurations");
 	Check(original.console_language == 11, "new configurations default to Simplified Chinese");
-	Check(original.gt7_dlss_enabled && Gt7ProfileArguments(original) == QStringList {"--gt7-desktop-height", "1080"}, "fresh launcher defaults to fixed DLSS desktop profile");
+	Check(original.gt7_dlss_enabled && Gt7ProfileArguments(original) == native_arguments, "fresh launcher requests native PSSR 1080p to 4K without the legacy desktop patch");
 	original.gt7_dlss_enabled = false;
 	original.gt7_desktop_height = 1440;
 	original.gt7_vr_scale = 120;
@@ -136,9 +139,14 @@ int main(int argc, char** argv) {
 	preset.reflections_half_rate = true;
 	preset.skip_shader_hashes = "1234";
 	ApplyGt7DesktopPreset(preset);
-	Check(preset.screen_resolution == Configuration::Resolution::R2560X1440 &&
-	          preset.gt7_desktop_height == 1080 && !preset.gt7_vr_enabled,
-	      "preset overrides legacy resolution and VR without tunable alternatives");
+	Check(preset.screen_resolution == Configuration::Resolution::R3840X2160 &&
+	          preset.gt7_desktop_height == 0 && !preset.gt7_vr_enabled,
+	      "preset selects 4K and native input without legacy desktop or VR arguments");
+	Check(Gt7ProfileArguments(preset) == native_arguments &&
+	          preset.present_mode == Configuration::PresentMode::Mailbox &&
+	          !preset.readback_linear_images && preset.tessellation_enabled && preset.bindless_images_enabled &&
+	          preset.shader_optimization_type == Configuration::ShaderOptimizationType::Performance,
+	      "native preset retains the tested presentation and rendering settings");
 	Check(preset.user_id == 1000 && preset.printf_direction == Configuration::LogDirection::Silent,
 	      "preset preserves save identity and avoids expensive API trace logs");
 	Check(!preset.reflections_half_rate && preset.skip_shader_hashes.isEmpty(),
@@ -150,21 +158,36 @@ int main(int argc, char** argv) {
 	inherited.insert("KYTY_FG_FRAMES", "100");
 	inherited.insert("KYTY_GT7_DLSS_TRACE", "1");
 	inherited.insert("GT7_OLD_OVERRIDE", "1");
+	inherited.insert("KYTY_PSSR_DLSS", "1");
+	inherited.insert("KYTY_PSSR_DIAGNOSTICS", "1");
+	inherited.insert("KYTY_GT7_NATIVE_ASYNC_PRESENT", "1");
+	inherited.insert("KYTY_GT7_DLSS_FG_RUNTIME", "old-split-runtime");
+	inherited.insert("KYTY_GT7_DLSS_PRESET", "K");
+	inherited.insert("kyty_old_override", "1");
+	inherited.insert("DISABLE_RTSS_LAYER", "0");
 	const auto enabled_env = Gt7LaunchEnvironment(preset, temporary.path(), inherited);
-	Check(enabled_env.value("KYTY_GT7_DLSS") == "1" &&
-	          enabled_env.value("KYTY_GT7_FSR_FG") == "1" &&
-	          enabled_env.value("KYTY_GT7_FSR_FG_OCCLUSION_GUARD") == "1",
-	      "one enabled switch requests DLSS, frame generation and occlusion guard together");
+	Check(enabled_env.value("KYTY_GT7_DLSS") == "0" &&
+	          enabled_env.value("KYTY_GT7_FSR_FG") == "0" &&
+	          enabled_env.value("KYTY_GT7_FSR_FG_OCCLUSION_GUARD") == "0" &&
+	          enabled_env.value("KYTY_GT7_DLSS_FG") == "1",
+	      "native profile enables NVIDIA FG while disabling the old TAA hook and FSR FG");
+	Check(enabled_env.value("KYTY_GT7_DLSS_PRESET") == "M" &&
+	          enabled_env.value("KYTY_PSSR_DIAGNOSTICS") == "0" &&
+	          enabled_env.value("KYTY_GT7_NATIVE_ASYNC_PRESENT") == "0" &&
+	          enabled_env.value("KYTY_SAMPLE") == "0" && enabled_env.value("DISABLE_RTSS_LAYER") == "1",
+	      "ordinary native play uses tested preset M, synchronous presentation and local RTSS opt-out");
 	Check(enabled_env.value("KYTY_FG_MANUAL_ONLY") == "1" &&
 	          !enabled_env.contains("KYTY_GT7_FSR_FG_DEBUG") &&
 	          !enabled_env.contains("KYTY_GT7_FSR_FG_CAPTURE_OUTPUTS") &&
 	          !enabled_env.contains("KYTY_FG_FRAMES") &&
 	          !enabled_env.contains("KYTY_GT7_DLSS_TRACE") &&
-	          !enabled_env.contains("GT7_OLD_OVERRIDE") && enabled_env.value("PATH") == "keep",
+	          !enabled_env.contains("GT7_OLD_OVERRIDE") && !enabled_env.contains("kyty_old_override") &&
+	          !enabled_env.contains("KYTY_PSSR_DLSS") && enabled_env.value("PATH") == "keep",
 	      "ordinary play removes inherited debug flags and suppresses automatic captures");
 	Check(enabled_env.value("KYTY_GT7_DLSS_BACKEND") == temporary.filePath("kyty_dlss_backend.dll") &&
-	          enabled_env.value("KYTY_GT7_DLSS_RUNTIME") == temporary.path(),
-	      "portable runtime paths resolve relative to the selected emulator");
+	          enabled_env.value("KYTY_GT7_DLSS_RUNTIME") == temporary.path() &&
+	          enabled_env.value("KYTY_GT7_DLSS_FG_RUNTIME") == temporary.path(),
+	      "SR and FG use the identical portable runtime directory beside the selected emulator");
 	preset.gt7_dlss_enabled = false;
 	preset.screen_resolution = Configuration::Resolution::R1920X1080;
 	preset.printf_direction = Configuration::LogDirection::File;
@@ -173,14 +196,48 @@ int main(int argc, char** argv) {
 	Check(disabled_env.value("KYTY_GT7_DLSS") == "0" &&
 	          disabled_env.value("KYTY_GT7_FSR_FG") == "0" &&
 	          disabled_env.value("KYTY_GT7_FSR_FG_OCCLUSION_GUARD") == "0" &&
-	          !disabled_env.contains("KYTY_GT7_DLSS_BACKEND"),
+	          disabled_env.value("KYTY_GT7_DLSS_FG") == "0" &&
+	          !disabled_env.contains("KYTY_GT7_DLSS_BACKEND") &&
+	          !disabled_env.contains("KYTY_GT7_DLSS_RUNTIME") &&
+	          !disabled_env.contains("KYTY_GT7_DLSS_FG_RUNTIME") &&
+	          !disabled_env.contains("KYTY_GT7_DLSS_PRESET") && Gt7ProfileArguments(preset).isEmpty(),
 	      "turning off the switch really disables the entire preset despite inherited settings");
 	Check(preset.screen_resolution == Configuration::Resolution::R1920X1080 &&
 	          preset.printf_direction == Configuration::LogDirection::Silent,
 	      "unchecked preset preserves desktop output but still disables high-volume API logs");
+	const QStringList expected_runtime {"kyty_dlss_backend.dll", "nvngx_dlss.dll", "sl.interposer.dll",
+	    "sl.common.dll", "sl.dlss_g.dll", "sl.reflex.dll", "sl.pcl.dll", "nvngx_dlssg.dll", "NvLowLatencyVk.dll"};
+	Check(Gt7GraphicsRuntimeFiles() == expected_runtime,
+	      "required runtime includes SR, interposer, common, FG, Reflex, PCL and low-latency dependencies");
+	QTemporaryDir runtime;
+	Check(runtime.isValid() && MissingGt7GraphicsRuntimeFiles(runtime.path()) == expected_runtime,
+	      "an empty release reports every required graphics runtime");
+	const auto make_file = [&](const QString& name) {
+		QFile file(runtime.filePath(name));
+		return file.open(QIODevice::WriteOnly) && file.write("fixture", 7) == 7;
+	};
+	for (const auto& name: expected_runtime) Check(make_file(name), "create local runtime existence fixture");
+	Check(MissingGt7GraphicsRuntimeFiles(runtime.path()).isEmpty(), "complete runtime set passes preflight");
+	for (const auto& name: expected_runtime) {
+		Check(QFile::remove(runtime.filePath(name)), "remove one runtime fixture");
+		Check(MissingGt7GraphicsRuntimeFiles(runtime.path()) == QStringList {name},
+		      "every missing runtime is rejected individually");
+		Check(QDir().mkdir(runtime.filePath(name)), "create directory with runtime filename");
+		Check(MissingGt7GraphicsRuntimeFiles(runtime.path()) == QStringList {name},
+		      "a directory cannot satisfy runtime file validation");
+		Check(QDir().rmdir(runtime.filePath(name)) && make_file(name), "restore runtime fixture");
+	}
 	copied.title_id = "PPSA99999";
 	Check(!HasGt7Profile(copied) && Gt7ProfileArguments(copied).isEmpty(),
 	      "other titles do not receive GT7 flags inherited from settings");
+	const auto other_arguments = Gt7ProfileArguments(copied);
+	const auto other_resolution = copied.screen_resolution;
+	const bool other_vr = copied.gt7_vr_enabled;
+	ApplyGt7DesktopPreset(copied);
+	Check(copied.screen_resolution == other_resolution && copied.gt7_vr_enabled == other_vr &&
+	          Gt7ProfileArguments(copied) == other_arguments &&
+	          Gt7LaunchEnvironment(copied, runtime.path(), inherited) == inherited,
+	      "other titles keep their own resolution, VR preferences and environment untouched");
 	std::printf("GT7 launcher settings tests: %s\n", failures == 0 ? "PASS" : "FAIL");
 	return failures == 0 ? 0 : 1;
 }

@@ -1,0 +1,311 @@
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cinttypes>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <shared_mutex>
+#include <span>
+#include <string>
+#include <thread>
+#include <vector>
+
+#define LOGF(...) ((void)0)
+#define EXIT(...) std::abort()
+constexpr uint64_t TRACKER_PAGE_SIZE = 4096;
+constexpr uint64_t Base = 0x100000;
+constexpr uint64_t Address = Base + 96;
+constexpr uint32_t OldValue = 0x00111100;
+constexpr uint32_t NewValue = 0x00222200;
+unsigned waits_holding_dirty_lock = 0;
+namespace Common {
+template <class A, class B> auto AlignDown(A a, B b) { return a & ~(static_cast<A>(b) - 1); }
+}
+namespace Libs::Graphics {
+@RANGES@
+struct ReadbackQueue {
+    struct Ticket { bool valid = false; bool Valid() const { return valid; } };
+    RangeSet pending;
+    bool AnyPending() const { return !pending.Empty(); }
+    Ticket PendingIn(uint64_t begin, uint64_t end) const { return {pending.Intersects(begin, end - begin)}; }
+};
+struct Scheduler {
+    uint64_t current = 20;
+    std::vector<uint64_t> submitted, publication_waits;
+    std::vector<std::string> order;
+    bool dirty_after_wait = false;
+    uint64_t CurrentTick() const { return current; }
+    void Wait(uint64_t tick) {
+        order.push_back("submit"); submitted.push_back(tick); if (tick == current) ++current;
+    }
+    void WaitPriorityOperations(uint64_t tick);
+};
+struct BufferCache {
+    // Exact intervals use the production RangeSet; the page bitmap acceleration
+    // of m_gpu_modified_ranges is not needed to exercise the read decision.
+    RangeSet m_gpu_modified_ranges, m_downloading_ranges, m_fast_pending_ranges;
+    mutable std::shared_mutex m_dirty_ranges_mutex;
+    ReadbackQueue queue;
+    ReadbackQueue* m_readback_queue = &queue;
+    unsigned read_memory_calls = 0;
+    bool address_writes = false;
+    bool page_protected = true;
+    struct DownloadBatch { uint64_t id, tick, begin, end; };
+    std::vector<DownloadBatch> m_download_batches;
+    Scheduler m_scheduler;
+    bool HasGpuDirtyBytes(uint64_t, uint64_t);
+    bool HasGpuDirtyBytesShared(uint64_t, uint64_t);
+    bool IsCleanForConcurrentRead(uint64_t, uint64_t) const;
+    bool FinishPendingBacking(uint64_t, uint64_t);
+    bool AddressWritesInFlight() const { return address_writes; }
+    void FinishFastReadbacks(uint64_t, uint64_t);
+    void ReadMemory(uint64_t, uint64_t);
+};
+@QUERIES@
+struct GuestGpu { static bool IsGpuThread() { return true; } };
+}
+struct Backing {
+    std::array<uint8_t, TRACKER_PAGE_SIZE> cpu {}, gpu {};
+    const uint8_t* FindBacking(uint64_t address, uint64_t size) const {
+        return address >= Base && size <= cpu.size() && address - Base <= cpu.size() - size
+                   ? cpu.data() + address - Base : nullptr;
+    }
+} backing;
+Libs::Graphics::BufferCache buffers;
+struct Resources { auto& GetBufferCache() { return buffers; } } resources;
+namespace Libs::LibKernel::Memory {
+auto* g_gpu_resources = &resources;
+auto* g_guest_address_space = &backing;
+bool t_gpu_read_delegate = false;
+auto& GetGpuResources() { return resources; }
+bool IsGpuAddressRange(uint64_t, uint64_t) { return true; }
+bool TryReadBacking(uint64_t address, void* data, uint64_t size) {
+    const auto* bytes = backing.FindBacking(address, size);
+    if (!bytes) return false;
+    std::memcpy(data, bytes, size);
+    return true;
+}
+@READERS@
+}
+namespace M = Libs::LibKernel::Memory;
+
+// Publication adapter: copying completed staging bytes precedes removing their
+// pending ranges, as in DownloadBufferCopies/CompleteFastReadback. Production
+// ReadMemory's Vulkan scheduling/wait itself is outside this CPU regression.
+void Publish() {
+    buffers.m_downloading_ranges.ForEach([](uint64_t begin, uint64_t end) {
+        std::memcpy(backing.cpu.data() + begin - Base, backing.gpu.data() + begin - Base, end - begin);
+    });
+    buffers.m_downloading_ranges.Clear();
+    buffers.m_fast_pending_ranges.Clear();
+    buffers.queue.pending.Clear();
+    buffers.m_download_batches.clear();
+}
+void Libs::Graphics::Scheduler::WaitPriorityOperations(uint64_t tick) {
+    // Test from another thread: attempting exclusive ownership from the thread
+    // already holding a shared mutex would not be a valid ownership test.
+    std::thread lock_probe([] {
+        if (buffers.m_dirty_ranges_mutex.try_lock()) buffers.m_dirty_ranges_mutex.unlock();
+        else ++waits_holding_dirty_lock;
+    });
+    lock_probe.join();
+    order.push_back("publication");
+    publication_waits.push_back(tick);
+    auto& batches = buffers.m_download_batches;
+    for (const auto& batch: batches) {
+        if (batch.tick <= tick) {
+            std::memcpy(backing.cpu.data() + batch.begin - Base,
+                        backing.gpu.data() + batch.begin - Base, batch.end - batch.begin);
+        }
+    }
+    std::erase_if(batches, [&](const auto& batch) { return batch.tick <= tick; });
+    buffers.m_downloading_ranges.Clear();
+    for (const auto& batch: batches) buffers.m_downloading_ranges.Add(batch.begin, batch.end - batch.begin);
+    if (dirty_after_wait) {
+        buffers.m_gpu_modified_ranges.Add(Address, 16);
+    }
+}
+void Libs::Graphics::BufferCache::FinishFastReadbacks(uint64_t address, uint64_t size) {
+    if (!queue.PendingIn(address, address + size).Valid()) return;
+    m_fast_pending_ranges.ForEach([](uint64_t begin, uint64_t end) {
+        std::memcpy(backing.cpu.data() + begin - Base, backing.gpu.data() + begin - Base, end - begin);
+        buffers.m_downloading_ranges.Subtract(begin, end - begin);
+    });
+    m_fast_pending_ranges.Clear(); queue.pending.Clear();
+    for (const auto& batch: m_download_batches) m_downloading_ranges.Add(batch.begin, batch.end - batch.begin);
+}
+void Libs::Graphics::BufferCache::ReadMemory(uint64_t address, uint64_t size) {
+    ++read_memory_calls;
+    page_protected = false;
+    m_gpu_modified_ranges.ForEachInRange(address, size, [](uint64_t begin, uint64_t end) {
+        std::memcpy(backing.cpu.data() + begin - Base, backing.gpu.data() + begin - Base, end - begin);
+    });
+    m_gpu_modified_ranges.Subtract(address, size);
+    Publish();
+}
+@PAGE_CACHE@
+namespace vk { struct DispatchIndirectCommand { uint32_t x = 0, y = 0, z = 0; }; }
+struct Context { auto& GetBufferCache() { return buffers; } } m_context;
+bool CanSkipEmptyDispatch(uint64_t args_addr) {
+    vk::DispatchIndirectCommand skip_args {};
+    return @EMPTY_DISPATCH@;
+}
+bool CanMirrorSampler(uint64_t address) {
+    std::vector<std::array<uint32_t, 4>> records(1);
+    const uint64_t bytes = records.size() * sizeof(records[0]);
+    return @SAMPLER_MIRROR@;
+}
+int failures = 0;
+void Check(bool ok, const char* name) {
+    if (!ok) { ++failures; std::fprintf(stderr, "FAIL: %s\n", name); }
+}
+void SetWord(std::array<uint8_t, TRACKER_PAGE_SIZE>& data, uint64_t address, uint32_t value) {
+    std::memcpy(data.data() + address - Base, &value, 4);
+}
+void Reset(bool fast = false) {
+    backing.cpu.fill(0); backing.gpu.fill(0);
+    SetWord(backing.cpu, Address, OldValue); SetWord(backing.gpu, Address, NewValue);
+    buffers.m_gpu_modified_ranges.Clear(); buffers.m_downloading_ranges.Clear();
+    buffers.m_fast_pending_ranges.Clear(); buffers.queue.pending.Clear();
+    buffers.read_memory_calls = 0; buffers.address_writes = false;
+    buffers.page_protected = true;
+    buffers.m_download_batches.clear();
+    buffers.m_scheduler = {};
+    M::t_gpu_read_delegate = false;
+    // State reached by DownloadBufferWindow: dirty -> pending publication.
+    buffers.m_gpu_modified_ranges.Add(Address, 16);
+    buffers.m_downloading_ranges.Add(Address, 16);
+    buffers.m_gpu_modified_ranges.Subtract(Address, 16);
+    if (fast) {
+        buffers.m_fast_pending_ranges.Add(Address, 16);
+        buffers.queue.pending.Add(Address, 16);
+    } else {
+        buffers.m_download_batches.push_back({1, 10, Address, Address + 16});
+    }
+}
+void TestOrdinaryPublication() {
+    Reset();
+    Check(!buffers.HasGpuDirtyBytes(Address, 4), "ordinary publication retains GPU-dirty query semantics");
+    Check(!buffers.IsCleanForConcurrentRead(Address, 4), "production host-readable query sees pending publication");
+    Check(M::FindGpuCleanBacking(Base, TRACKER_PAGE_SIZE) == nullptr, "pending SRT page cannot be cached as clean");
+    uint32_t value = 0xabcdef00;
+    Check(!M::TryReadGpuCleanBacking(Address, &value, 4) && value == 0xabcdef00,
+          "nonblocking clean read refuses unpublished bytes without changing output");
+    GuestPageReadCache page_cache;
+    Check(page_cache.Map(Base) == nullptr, "actual SRT page cache rejects unpublished page");
+    Check(!page_cache.Read(Address, std::span(&value, 1)), "actual SRT cached read takes exact fallback");
+    Check(M::TryReadBufferBacking(Address, &value, 4) && value == NewValue && buffers.read_memory_calls == 0,
+          "exact SRT read publishes ordinary readback before copying descriptor");
+    Check(M::FindGpuCleanBacking(Base, TRACKER_PAGE_SIZE) != nullptr,
+          "published page becomes cacheable");
+    Check(M::TryReadGpuCleanBacking(Address, &value, 4) && value == NewValue,
+          "published clean read returns new descriptor");
+}
+void TestDelegateAndIndependentBytes() {
+    Reset(); M::t_gpu_read_delegate = true;
+    Check(M::FindGpuCleanBacking(Address, 4) == nullptr, "delegate refuses unpublished descriptor");
+    uint32_t value = 1;
+    Check(!M::TryReadGpuCleanBacking(Address, &value, 4) && value == 1,
+          "delegate does not read unpublished bytes");
+    Check(M::TryReadGpuCleanBacking(Base, &value, 4) && value == 0,
+          "unrelated bytes on same page remain readable");
+    Check(buffers.read_memory_calls == 0, "delegate and unrelated reads do not force publication");
+    Publish();
+    Check(M::TryReadGpuCleanBacking(Address, &value, 4) && value == NewValue,
+          "delegate reads new descriptor after publication");
+}
+void TestExistingGpuAndFastPaths() {
+    Reset(true);
+    uint32_t value = 0;
+    Check(M::TryReadBufferBacking(Address, &value, 4) && value == NewValue,
+          "fast readback completes before backing read");
+    Check(buffers.read_memory_calls == 0, "fast readback keeps its dedicated completion path");
+    Reset(); buffers.m_downloading_ranges.Clear(); buffers.m_gpu_modified_ranges.Add(Address, 16);
+    Check(M::TryReadBufferBacking(Address, &value, 4) && value == NewValue && buffers.read_memory_calls == 1,
+          "GPU-resident dirty bytes still take readback");
+    Check(M::TryReadBufferBacking(Address, &value, 4) && buffers.read_memory_calls == 1,
+          "published bytes avoid redundant readback");
+}
+void TestDispatchAndSampler() {
+    Reset();
+    SetWord(backing.cpu, Address, 0);
+    for (uint64_t offset: {0u, 4u, 8u}) SetWord(backing.gpu, Address + offset, 1);
+    Check(!CanSkipEmptyDispatch(Address), "unpublished nonempty indirect dispatch cannot use stale zero arguments");
+    Check(!CanMirrorSampler(Address), "sampler mirror cannot cache an unpublished descriptor");
+    Publish();
+    Check(!CanSkipEmptyDispatch(Address), "published nonempty dispatch is retained");
+    Check(CanMirrorSampler(Address), "published sampler descriptor may be mirrored");
+    SetWord(backing.cpu, Address, 0);
+    Check(CanSkipEmptyDispatch(Address), "published empty dispatch keeps fast skip");
+    buffers.address_writes = true;
+    Check(!CanSkipEmptyDispatch(Address), "in-flight address writes keep skip disabled");
+}
+void TestExactPublicationAvoidsWindowDownload() {
+    Reset();
+    constexpr uint64_t neighbor = Address + 64;
+    buffers.m_gpu_modified_ranges.Add(neighbor, 16);
+    uint32_t value = 0;
+    Check(M::TryReadBufferBacking(Address, &value, 4) && value == NewValue,
+          "pending descriptor returns published value beside newer GPU writes");
+    std::printf("same-page-neighbor: full_readback_calls=%u submitted_current=%zu publication_waits=%zu "
+                "neighbor_dirty=%d page_protected=%d\n", buffers.read_memory_calls,
+                buffers.m_scheduler.submitted.size(), buffers.m_scheduler.publication_waits.size(),
+                buffers.m_gpu_modified_ranges.Contains(neighbor, 16), buffers.page_protected);
+    Check(buffers.read_memory_calls == 0 && buffers.m_scheduler.submitted.empty(),
+          "pending exact range does not start window download or submit current tick");
+    Check(buffers.m_scheduler.publication_waits == std::vector<uint64_t>{10},
+          "pending exact range waits its existing publication tick");
+    Check(buffers.m_gpu_modified_ranges.Contains(neighbor, 16) && buffers.page_protected,
+          "unrelated same-page dirty bytes and page protection are preserved");
+    Reset();
+    Check(M::TryReadBufferBacking(Address + 16, &value, 4) && buffers.read_memory_calls == 0 &&
+              buffers.m_scheduler.publication_waits.empty() && buffers.page_protected,
+          "adjacent non-overlapping bytes neither wait nor lift protection");
+}
+void TestPublicationBatchesAndFallbacks() {
+    uint32_t value = 0;
+    Reset();
+    buffers.m_download_batches = {{1, 5, Address, Address + 16}, {2, 12, Address, Address + 8}};
+    Check(M::TryReadBufferBacking(Address + 4, &value, 4) && buffers.read_memory_calls == 0 &&
+              buffers.m_scheduler.publication_waits == std::vector<uint64_t>{12},
+          "partially overlapping publications wait the greatest overlapping tick");
+    Reset(); buffers.m_scheduler.current = 10;
+    Check(M::TryReadBufferBacking(Address, &value, 4) && value == NewValue &&
+              buffers.m_scheduler.submitted == std::vector<uint64_t>{10} &&
+              buffers.m_scheduler.publication_waits == std::vector<uint64_t>{10} &&
+              buffers.m_scheduler.order == std::vector<std::string>{"submit", "publication"} &&
+              buffers.read_memory_calls == 0,
+          "unsubmitted publication submits its tick before waiting without new download");
+    Reset(); buffers.m_download_batches.clear();
+    Check(M::TryReadBufferBacking(Address, &value, 4) && value == NewValue && buffers.read_memory_calls == 1,
+          "missing publication batch conservatively uses full readback");
+    Reset(); buffers.m_download_batches.front().tick = 21;
+    Check(M::TryReadBufferBacking(Address, &value, 4) && value == NewValue &&
+              buffers.read_memory_calls == 1 && buffers.m_scheduler.submitted.empty(),
+          "future publication tick conservatively uses full readback");
+    Reset(); buffers.m_gpu_modified_ranges.Add(Address + 2, 4);
+    Check(M::TryReadBufferBacking(Address, &value, 4) && value == NewValue &&
+              buffers.read_memory_calls == 1 && buffers.m_scheduler.publication_waits.empty(),
+          "requested GPU-dirty overlap still takes full readback");
+    Reset(); buffers.m_scheduler.dirty_after_wait = true;
+    Check(M::TryReadBufferBacking(Address, &value, 4) && value == NewValue && buffers.read_memory_calls == 1,
+          "final clean recheck falls back if bytes are dirty after publication");
+    Reset(true);
+    buffers.m_download_batches.push_back({1, 10, Address, Address + 16});
+    Check(M::TryReadBufferBacking(Address, &value, 4) && value == NewValue &&
+              buffers.read_memory_calls == 0 && buffers.queue.pending.Empty() &&
+              buffers.m_scheduler.publication_waits == std::vector<uint64_t>{10},
+          "fast completion precedes overlapping ordinary publication wait");
+}
+int main() {
+    TestOrdinaryPublication(); TestDelegateAndIndependentBytes();
+    TestExistingGpuAndFastPaths(); TestDispatchAndSampler();
+    TestExactPublicationAvoidsWindowDownload(); TestPublicationBatchesAndFallbacks();
+    Check(waits_holding_dirty_lock == 0, "publication waits release the dirty-range lock");
+    if (failures) return 1;
+    std::puts("PASS: backing-read publication (6 groups; extracted production readers, cache, queries and fast paths)");
+}

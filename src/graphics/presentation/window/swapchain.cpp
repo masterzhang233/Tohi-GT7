@@ -23,6 +23,7 @@
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/gt7FrameGen.h"
+#include "graphics/presentation/window/gt7DlssFrameGen.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/vr/openvrBridge.h"
 #include "graphics/vr/vrEyeImage.h"
@@ -49,6 +50,67 @@
 // IWYU pragma: no_include <intrin.h>
 
 namespace Libs::Graphics {
+
+namespace {
+bool PerformanceDiagnostics() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_GT7_PERF_DIAGNOSTICS");
+		return value && value[0] == '1' && value[1] == '\0';
+	}();
+	return enabled;
+}
+
+// Opt-in, bounded CPU timing. This is deliberately separate from the per-API
+// trace, so a short stutter investigation can keep printf-direction Silent.
+struct PresentTimingHistory {
+	uint64_t previous_end_ns = 0;
+	uint64_t reports = 0;
+	uint64_t next_report_ns = 0;
+};
+
+class PresentTiming {
+public:
+	enum Stage : size_t {
+		OverlayAndResize, Acquire, Reflex, RendererLock, RecordAndSubmit, Capture,
+		Present, RetireLock, RetireSubmit, Title, Count
+	};
+	PresentTiming(PresentTimingHistory& history, uint64_t frame, uint64_t guest)
+	    : m_history(history), m_frame(frame), m_guest(guest) {
+		if (PerformanceDiagnostics()) m_started = m_mark = StallWatch::NowNs();
+	}
+	void EndStage(Stage stage) {
+		if (!m_started) return;
+		const auto now = StallWatch::NowNs();
+		m_ns[stage] += now - m_mark;
+		m_mark = now;
+	}
+	~PresentTiming() {
+		if (!m_started) return;
+		const auto end = StallWatch::NowNs();
+		const auto total = end - m_started;
+		const auto gap = m_history.previous_end_ns ? m_started - m_history.previous_end_ns : 0;
+		m_history.previous_end_ns = end;
+		if (total < 50'000'000u && gap < 100'000'000u) return;
+		// Keep early incidents individually; bound long menu/loading sessions.
+		if (m_history.reports >= 128 && end < m_history.next_report_ns) return;
+		++m_history.reports;
+		m_history.next_report_ns = end + 5'000'000'000u;
+		const auto ms = [&](Stage stage) { return double(m_ns[stage]) / 1.0e6; };
+		std::printf("GT7 present timing: steady_ms=%.3f frame=%llu guest=%llu gap_before_ms=%.3f "
+		            "total_ms=%.3f overlay_resize=%.3f acquire=%.3f reflex=%.3f render_lock=%.3f "
+		            "record_submit=%.3f capture=%.3f present=%.3f retire_lock=%.3f retire_submit=%.3f title=%.3f\n",
+		    double(end) / 1.0e6, static_cast<unsigned long long>(m_frame),
+		    static_cast<unsigned long long>(m_guest), double(gap) / 1.0e6, double(total) / 1.0e6,
+		    ms(OverlayAndResize), ms(Acquire), ms(Reflex), ms(RendererLock), ms(RecordAndSubmit),
+		    ms(Capture), ms(Present), ms(RetireLock), ms(RetireSubmit), ms(Title));
+	}
+private:
+	PresentTimingHistory& m_history;
+	uint64_t m_frame, m_guest;
+	uint64_t m_started = 0, m_mark = 0;
+	std::array<uint64_t, Count> m_ns {};
+};
+} // namespace
 
 struct Presenter::Frame {
 	VulkanImage   image;
@@ -84,6 +146,7 @@ public:
 	~FramePool() {
 		m_scheduler.Wait(m_scheduler.CurrentTick() - 1);
 		Gt7FrameGen::WaitForPresents(m_window.graphic_ctx);
+		Gt7DlssFrameGen::WaitForPresents(m_window.graphic_ctx);
 		if (m_vr_master) {
 			m_vr_master->Wait(m_vr_master->CurrentTick() - 1);
 		}
@@ -651,6 +714,9 @@ public:
 	void                 Recreate(bool surface_lost = false);
 	[[nodiscard]] bool   NeedsResize() const;
 	[[nodiscard]] Status AcquireNextImage();
+	void BeginFrame() {
+		if (m_dlss_frame_generation) Gt7DlssFrameGen::BeginFrame();
+	}
 	[[nodiscard]] bool   PrepareSystemOverlay();
 	void     RecordPresentCommands(CommandBuffer& command, Presenter::Frame* source,
 	                               const Presenter::Layer& overlay, bool draw_system_overlay);
@@ -660,7 +726,7 @@ public:
 	[[nodiscard]] uint32_t ImageCount() const noexcept {
 		return static_cast<uint32_t>(m_images.size());
 	}
-	[[nodiscard]] bool UsesFrameGeneration() const noexcept { return m_frame_generation; }
+	[[nodiscard]] bool UsesFrameGeneration() const noexcept { return m_frame_generation || m_dlss_frame_generation; }
 	[[nodiscard]] vk::Format Format() const noexcept { return m_format; }
 
 private:
@@ -670,6 +736,7 @@ private:
 	WindowContext&   m_window;
 	vk::SwapchainKHR m_handle = nullptr;
 	bool             m_frame_generation = false;
+	bool             m_dlss_frame_generation = false;
 	vk::Format       m_format = vk::Format::eUndefined;
 	vk::Extent2D     m_extent {};
 	// Drawable pixel size observed when this swapchain was created.
@@ -741,6 +808,7 @@ struct Presenter::Impl {
 	Common::Mutex         present_mutex;
 	std::array<Layer, 2>  layers {};
 	std::atomic<uint64_t> presented_overlay_revision {0};
+	PresentTimingHistory present_timing;
 	// Declared last: destroyed first, while the device is still alive. bisect_pictures holds
 	// KYTY_BISECT's pictures (bisect.h).
 	std::unique_ptr<FrameDump> frame_dump;
@@ -834,6 +902,7 @@ void Swapchain::Create() {
 		create_info.presentMode = vk::PresentModeKHR::eFifo;
 	}
 	create_info.clipped = VK_TRUE;
+	m_dlss_frame_generation = Gt7DlssFrameGen::DeviceReady();
 	if (Gt7FrameGen::Requested()) {
 		const auto result = Gt7FrameGen::CreateSwapchain(graphics, create_info, &m_handle);
 		m_frame_generation = result == vk::Result::eSuccess;
@@ -847,6 +916,9 @@ void Swapchain::Create() {
 		                     "vkCreateSwapchainKHR");
 	}
 	EXIT_IF(m_handle == nullptr);
+	// Vulkan Reflex sleep mode needs the swapchain registered by the interposer.
+	// Device initialization alone runs too early for the NV low-latency2 path.
+	if (m_dlss_frame_generation) Gt7DlssFrameGen::OnSwapchainCreated();
 
 	m_images = EnumerateVulkan<vk::Image>(
 	    "vkGetSwapchainImagesKHR", [&](uint32_t* count, vk::Image* images) {
@@ -920,6 +992,10 @@ void Swapchain::Destroy() {
 	if (m_frame_generation && m_handle != nullptr) {
 		Gt7FrameGen::WaitForPresents(graphics);
 	}
+	if (m_dlss_frame_generation) {
+		Gt7DlssFrameGen::WaitForPresents(graphics);
+		Gt7DlssFrameGen::OnSwapchainDestroyed();
+	}
 	if (m_system_overlay != nullptr) {
 		m_system_overlay->ReleaseVulkan();
 	}
@@ -957,6 +1033,7 @@ void Swapchain::Destroy() {
 	}
 
 	m_frame_generation = false;
+	m_dlss_frame_generation = false;
 	m_handle        = nullptr;
 	m_format        = vk::Format::eUndefined;
 	m_extent        = {};
@@ -1012,7 +1089,7 @@ static bool AcquireWithFence() {
 Swapchain::Status Swapchain::AcquireNextImage() {
 	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size());
 	m_image_index     = static_cast<uint32_t>(-1);
-	const bool fence  = !m_frame_generation && AcquireWithFence() && m_acquire_fence != nullptr;
+	const bool fence  = !UsesFrameGeneration() && AcquireWithFence() && m_acquire_fence != nullptr;
 	const auto begin  = StallWatch::NowNs();
 	const auto result = m_frame_generation ? Gt7FrameGen::AcquireNextImage(
 	    m_window.graphic_ctx.device, m_handle, std::numeric_limits<uint64_t>::max(),
@@ -1198,7 +1275,8 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		// frame, a missing input or an active overlay is presented without FG.
 		const auto* inputs = source != nullptr && overlay.frame == nullptr && !draw_system_overlay
 		                         ? &source->frame_generation : nullptr;
-		const auto* hudless = inputs != nullptr
+		// Keep invalid inputs for their rejection diagnostic, but never convert or tag them.
+		const auto* hudless = inputs != nullptr && inputs->valid
 		    ? source->PrepareHudless(m_window.graphic_ctx, vk_command, m_extent, m_format) : nullptr;
 		Gt7FrameGen::RecordPrepare(m_window.graphic_ctx, vk_command, inputs,
 		                           vk::Rect2D {{0, 0}, m_extent}, hudless);
@@ -1311,6 +1389,20 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1,
 		                           &to_present);
 	}
+	if (m_dlss_frame_generation) {
+		const auto* inputs = source != nullptr && overlay.frame == nullptr && !draw_system_overlay
+		                         ? &source->frame_generation : nullptr;
+		// Preserve rejection diagnostics without converting invalid inputs.
+		const auto* hudless = inputs != nullptr && inputs->valid
+		    ? source->PrepareHudless(m_window.graphic_ctx, vk_command, m_extent, m_format) : nullptr;
+		// Streamline consumes the real backbuffer through its Vulkan present hook.
+		// All conversions above are recorded first; tags describe PRESENT_SRC and
+		// frame-owned shader-read inputs with the same presentation dimensions.
+		Gt7DlssFrameGen::RecordPrepare(m_window.graphic_ctx, vk_command, inputs,
+		    m_images[m_image_index], m_image_views[m_image_index], m_extent, m_format,
+		    vk::Rect2D {{0, 0}, m_extent}, hudless);
+		command.GetScheduler().StateShadow().InvalidateAll();
+	}
 }
 
 uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
@@ -1336,12 +1428,16 @@ Swapchain::Status Swapchain::Present() {
 
 	vk::Result result;
 	const auto begin = StallWatch::NowNs();
+	// Native bookkeeping owns its own mutex. Do not invert its drain path's
+	// native-state -> queue lock ordering around the externally synchronized queue.
+	if (m_dlss_frame_generation) Gt7DlssFrameGen::BeforePresent();
 	{
 		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
 		result = m_frame_generation
 		             ? Gt7FrameGen::QueuePresent(m_window.graphic_ctx.queue, present)
 		             : m_window.graphic_ctx.queue.presentKHR(&present);
 	}
+	if (m_dlss_frame_generation) Gt7DlssFrameGen::AfterPresent(result);
 	const auto end = StallWatch::NowNs();
 	StallWatch::NoteSection(StallWatch::Section::Present, begin, end, m_image_index);
 	Common::PerfStats::AddHost(Common::PerfStats::Host::Present, end - begin);
@@ -1378,8 +1474,9 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	auto* frame = m_impl->frames.Acquire({info.extent.width, info.extent.height}, frame_format);
 	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
 	auto& image = m_impl->ResolveSurface(info);
-	// End an incomplete private sequence on the GPU recording thread. The separate
-	// presentation thread's frame counter is not a boundary for recorded commands.
+	// Resolve inputs from this exact output on the GPU recording thread. A CPU
+	// flip may arrive after recording of the next scene has already begun, so
+	// retiring this output must not reset that newer scene's capture state.
 	if (auto* dlss = m_impl->renderer.GetGt7Dlss()) {
 		dlss->CopyFrameGenerationInputs(buffer, frame->frame_generation, image);
 		dlss->FrameBoundary();
@@ -1504,7 +1601,7 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	clear.float32[3] = opaque ? 1.0f : 0.0f;
 	if (producer != nullptr) {
 		EXIT_IF(producer->IsInvalid());
-		if (auto* dlss = m_impl->renderer.GetGt7Dlss()) dlss->FrameBoundary();
+		if (auto* dlss = m_impl->renderer.GetGt7Dlss()) dlss->FrameBoundary(true);
 		frame->Clear(*producer, clear);
 	} else {
 		auto& command = m_impl->present_scheduler.BeginCommand();
@@ -1543,7 +1640,10 @@ void Presenter::Present(Frame& frame) {
 }
 
 void Presenter::Present(std::span<const Layer> layers) {
+	const auto timing_now = [] { return PerformanceDiagnostics() ? StallWatch::NowNs() : 0; };
+	const auto entry_ns = timing_now();
 	Common::LockGuard lock(m_impl->present_mutex);
+	const auto locked_ns = timing_now();
 	bool desktop_changed = false;
 	for (const auto& layer: layers) {
 		if (layer.bus == 0x20) {
@@ -1567,12 +1667,24 @@ void Presenter::Present(std::span<const Layer> layers) {
 		desktop_changed = true;
 	}
 	if (!desktop_changed) { return; }
+	const auto layers_ns = timing_now();
 	const auto presented =
 	    m_impl->window.graphic_ctx.presented_frames.fetch_add(1, std::memory_order_relaxed) + 1;
 	Timeline::Present(presented);
 	GpuTiming::Present(presented);
+	const auto timeline_ns = timing_now();
 	Common::PerfStats::AddPresent();
+	const auto perf_ns = timing_now();
 	StallWatch::UpdateMemoryText(m_impl->window.graphic_ctx);
+	const auto memory_ns = timing_now();
+	if (entry_ns && memory_ns - entry_ns >= 50'000'000u) {
+		std::printf("GT7 present prelude: steady_ms=%.3f frame=%llu total_ms=%.3f lock=%.3f "
+		            "layers=%.3f timeline=%.3f perf=%.3f memory=%.3f\n",
+		    double(memory_ns) / 1.0e6, static_cast<unsigned long long>(presented),
+		    double(memory_ns-entry_ns) / 1.0e6, double(locked_ns-entry_ns) / 1.0e6,
+		    double(layers_ns-locked_ns) / 1.0e6, double(timeline_ns-layers_ns) / 1.0e6,
+		    double(perf_ns-timeline_ns) / 1.0e6, double(memory_ns-perf_ns) / 1.0e6);
+	}
 	m_impl->Present();
 }
 
@@ -1659,23 +1771,34 @@ void Presenter::ClearLayer(int bus) {
 
 void Presenter::Impl::Present() {
 	KYTY_PROFILER_FUNCTION();
+	PresentTiming timing(present_timing,
+	    window.graphic_ctx.presented_frames.load(std::memory_order_relaxed),
+	    layers[0].frame ? layers[0].frame->frame_generation.guest_frame : 0);
 
 	const auto overlay_visual = GetSystemOverlayVisualState();
 	// Some window systems keep presenting an old swapchain after a resize.
 	if (swapchain.NeedsResize()) {
 		RecoverSwapchain(Swapchain::Status::Recreate);
 	}
+	timing.EndStage(PresentTiming::OverlayAndResize);
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
 		auto status = swapchain.AcquireNextImage();
+		timing.EndStage(PresentTiming::Acquire);
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
+			timing.EndStage(PresentTiming::OverlayAndResize);
 			continue;
 		}
+		// Reflex may sleep on the CPU. Pace after successful acquire, before
+		// taking the renderer mutex used by the guest's command producers.
+		swapchain.BeginFrame();
+		timing.EndStage(PresentTiming::Reflex);
 		bool     dumped    = false;
 		bool     pictured  = false;
 		uint64_t dump_tick = 0;
 		{
 			Common::LockGuard       render_lock(renderer.GetMutex());
+			timing.EndStage(PresentTiming::RendererLock);
 			const RendererHoldTimer hold;
 			auto&                   command = present_scheduler.BeginCommand();
 			const bool        draw_system_overlay =
@@ -1707,6 +1830,7 @@ void Presenter::Impl::Present() {
 			}
 			dump_tick = tick;
 		}
+		timing.EndStage(PresentTiming::RecordAndSubmit);
 		if (dumped || pictured) {
 			present_scheduler.Wait(dump_tick);
 			const auto presented =
@@ -1718,33 +1842,43 @@ void Presenter::Impl::Present() {
 				bisect_pictures->Write(presented);
 			}
 		}
+		timing.EndStage(PresentTiming::Capture);
 		status = swapchain.Present();
+		timing.EndStage(PresentTiming::Present);
 		if (swapchain.UsesFrameGeneration()) {
 			// HUD-less color is read by the generation commands submitted inside
 			// QueuePresent, after our earlier prepare/blit submission. Retire those
 			// reads on the same graphics queue before this frame can be reused.
 			Common::LockGuard render_lock(renderer.GetMutex());
+			timing.EndStage(PresentTiming::RetireLock);
 			present_scheduler.BeginCommand();
 			const auto tick = present_scheduler.Submit();
 			for (const auto& layer: layers) {
 				if (layer.frame != nullptr) layer.frame->present_tick = tick;
 			}
 		}
+		timing.EndStage(PresentTiming::RetireSubmit);
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
+			timing.EndStage(PresentTiming::OverlayAndResize);
 			continue;
 		}
 
 		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
 		window.UpdateTitle();
+		timing.EndStage(PresentTiming::Title);
 		return;
 	}
 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");
 	Gt7FrameGen::NoteDroppedFrame();
+	Gt7DlssFrameGen::NoteDroppedFrame();
 }
 
 void Presenter::Discard(Frame& frame) {
-	if (frame.frame_generation.valid) Gt7FrameGen::NoteDroppedFrame();
+	if (frame.frame_generation.valid) {
+		Gt7FrameGen::NoteDroppedFrame();
+		Gt7DlssFrameGen::NoteDroppedFrame();
+	}
 	m_impl->frames.Release(&frame);
 }
 

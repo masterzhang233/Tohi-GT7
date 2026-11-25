@@ -6,6 +6,7 @@
 #include "common/logging/log.h"
 #include "common/perfStats.h"
 #include "common/profiler.h"
+#include "common/sourceTrace.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
@@ -53,6 +54,49 @@ static thread_local CommandProcessor* g_current_processor = nullptr;
 static thread_local Pm4Execution*     g_current_execution = nullptr;
 static thread_local bool              g_gpu_thread        = false;
 static thread_local GuestGpu*         g_gpu_state         = nullptr;
+
+// Source tracing only carries scalar identities. An inline GPU command retains the
+// submission it interrupted; an outer command runs with the restored, empty context.
+class SourceTraceContextScope {
+public:
+	SourceTraceContextScope(bool enabled, uint64_t submission_id, uint64_t request_id,
+	                        uint32_t queue_id, uint32_t type): m_enabled(enabled) {
+		if (m_enabled) {
+			m_previous = Common::SourceTrace::t_context;
+			Common::SourceTrace::t_context = {submission_id, request_id, queue_id, type};
+		}
+	}
+	~SourceTraceContextScope() {
+		if (m_enabled) Common::SourceTrace::t_context = m_previous;
+	}
+	KYTY_CLASS_NO_COPY(SourceTraceContextScope);
+
+private:
+	bool m_enabled;
+	Common::SourceTrace::Context m_previous {};
+};
+
+static void RunSourceTracedCommand(Common::UniqueFunction<void>& command, bool inline_command) {
+	if (!Common::SourceTrace::Enabled()) {
+		command();
+		return;
+	}
+	const auto begin = Common::SourceTrace::NowNs();
+	command();
+	const auto end = Common::SourceTrace::NowNs();
+	if (end >= begin && end - begin >= 10'000'000ull) {
+		Common::SourceTrace::Event event {};
+		event.kind = Common::SourceTrace::Kind::Command;
+		event.flags = inline_command ? 1u : 0u;
+		event.begin_ns = begin;
+		event.end_ns = event.work_end_ns = end;
+		event.submission_id = Common::SourceTrace::t_context.submission_id;
+		event.request_id = Common::SourceTrace::t_context.request_id;
+		event.arg0 = Common::SourceTrace::t_context.queue_id;
+		event.arg1 = Common::SourceTrace::t_context.type;
+		Common::SourceTrace::Record(event);
+	}
+}
 
 struct DrawIndirectArgs {
 	uint32_t vertex_count_per_instance;
@@ -322,7 +366,7 @@ void GuestGpu::ProcessCommands() {
 			m_commands.pop_front();
 			EXIT_IF(m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 		}
-		command();
+		RunSourceTracedCommand(command, true);
 	}
 }
 
@@ -396,8 +440,8 @@ void GuestGpu::SubmitFlipPreparation(uint64_t request_id) {
 void GuestGpu::SuspendPoint() {
 	EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
 	// Do not hold a queue lock while waiting: asynchronous work may be needed to
-	// finish the preceding graphics frame. The first point returns immediately.
-	m_suspend_point_ready->acquire();
+	// process the preceding graphics frame. The first point returns immediately.
+	m_suspend_point_ready.acquire();
 	Submission submission;
 	submission.type = SubmissionType::SuspendPoint;
 	Enqueue(std::move(submission));
@@ -772,6 +816,7 @@ void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(submission.queue_id >= QueueCount);
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
+	if (Common::SourceTrace::Enabled()) submission.diagnostic_id = ++m_diagnostic_id;
 	if (m_draw_prep != nullptr) {
 		// In queue order, as the GPU thread will run them.
 		auto& scanner =
@@ -923,7 +968,7 @@ void GuestGpu::ThreadRun(void* data) {
 			const auto busy_from = perf_time();
 			{
 				const GpuPhases::Scope phase(GpuPhases::Phase::Command);
-				command();
+				RunSourceTracedCommand(command, false);
 			}
 			Common::PerfStats::AddGpuThread(PerfPhase::Busy, perf_time() - busy_from);
 
@@ -992,6 +1037,10 @@ static bool FlushBeforeGc() {
 }
 
 bool GuestGpu::Process(Submission& submission) {
+	const bool source_trace = Common::SourceTrace::Enabled();
+	const auto trace_begin = source_trace ? Common::SourceTrace::NowNs() : 0;
+	const SourceTraceContextScope trace_context(source_trace, submission.diagnostic_id,
+	    submission.flip_request_id, submission.queue_id, static_cast<uint32_t>(submission.type));
 	const bool first_slice = !submission.started;
 	auto&      cp          = GetProcessor(submission.queue_id);
 	Timeline::Mark("proc-begin", submission.queue_id, static_cast<uint64_t>(submission.type));
@@ -1113,13 +1162,31 @@ bool GuestGpu::Process(Submission& submission) {
 			if (Pm4SyncBarriers()) {
 				cp.EmitGlobalBarrier();
 			}
-			m_renderer.GetCommandScheduler().DeferPriorityOperation(
-			    [ready = m_suspend_point_ready] { ready->release(); });
 			cp.BufferFlush();
 			cp.Reset();
+			// This is a command-processor boundary, not a host GPU completion fence.
+			// All earlier packets have been submitted; their native completion remains
+			// protected by the scheduler's timeline and resource lifetime tracking.
+			m_suspend_point_ready.release();
 			break;
 	}
 
+	if (source_trace) {
+		const auto end = Common::SourceTrace::NowNs();
+		if (end >= trace_begin && end - trace_begin >= 10'000'000ull) {
+			Common::SourceTrace::Event event {};
+			event.kind = Common::SourceTrace::Kind::Process;
+			event.flags = static_cast<uint32_t>(submission.type) | (complete ? 1u << 8u : 0u) |
+			    (submission.yielded ? 1u << 9u : 0u) | (submission.progressed ? 1u << 10u : 0u);
+			event.begin_ns = trace_begin;
+			event.end_ns = event.work_end_ns = end;
+			event.submission_id = submission.diagnostic_id;
+			event.request_id = submission.flip_request_id;
+			event.arg0 = submission.queue_id;
+			event.arg1 = first_slice ? 1u : 0u;
+			Common::SourceTrace::Record(event);
+		}
+	}
 	return complete;
 }
 
@@ -1640,6 +1707,11 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 		                                              thread_group_y, thread_group_z, mode);
 	}
 	CompleteDispatch();
+}
+
+void CommandProcessor::ProcessPssr(const Pssr::Request& request) {
+	EXIT_NOT_IMPLEMENTED(IsAsyncComputeQueue());
+	m_renderer.GetRenderExecutor().ProcessPssr(CurrentBuffer(), request);
 }
 
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {

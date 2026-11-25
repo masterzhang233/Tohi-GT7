@@ -1,5 +1,9 @@
 # Tohi-GT7 desktop DLSS integration
 
+An independent, opt-in [native PSSR input path](NATIVE-PSSR-DLSS.md) is also
+available for development. It does not replace the launcher preset described
+below and currently provides SR only.
+
 This is an experimental integration for the verified GT7 1.71 desktop render path.
 The Tohi-GT7 launcher exposes one **DLSS** checkbox, enabled by default for desktop
 GT7. It selects the fixed configuration below together with the separate

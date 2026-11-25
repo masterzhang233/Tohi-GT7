@@ -22,6 +22,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/gt7FrameGen.h"
+#include "graphics/presentation/window/gt7DlssFrameGen.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/vr/openvrBridge.h"
 #include "graphics/vr/openvrRuntimePath.h"
@@ -30,6 +31,7 @@
 #include "kernel/memory.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
+#include "../../../../tools/dlss_backend/vulkan_device_report.h"
 
 #include <algorithm>
 #include <array>
@@ -813,6 +815,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	                                           : static_cast<void*>(&fragment_barycentric);
 #endif
 	features13.robustImageAccess   = supported_features13.robustImageAccess;
+	// Streamline's Vulkan resource tracking creates a private data slot.
+	if (Gt7DlssFrameGen::Requested()) {
+		features13.privateData = supported_features13.privateData;
+	}
 	features13.subgroupSizeControl = graphics.subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
 	// Optional (round 87): new pipelines are first looked up in the driver's caches alone.
 	features13.pipelineCreationCacheControl = supported_features13.pipelineCreationCacheControl;
@@ -941,6 +947,16 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 			graphics.device_fault_enabled = true;
 		}
 	}
+	vk::PhysicalDevicePresentIdFeaturesKHR present_id {};
+	if (HasExtension(device_extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME)) {
+		vk::PhysicalDeviceFeatures2 present_id_query {};
+		present_id_query.pNext = &present_id;
+		physical_device.getFeatures2(&present_id_query);
+		if (present_id.presentId) {
+			present_id.pNext = const_cast<void*>(create_info.pNext);
+			create_info.pNext = &present_id;
+		}
+	}
 	create_info.pQueueCreateInfos       = queue_create_infos.data();
 	create_info.queueCreateInfoCount    = queue_create_count;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
@@ -960,6 +976,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 
 	vk::Device device = nullptr;
 
+	kyty_device_diagnostic::WriteDeviceCreateReport(static_cast<const VkDeviceCreateInfo&>(create_info));
 	auto result = physical_device.createDevice(&create_info, nullptr, &device);
 	if (result != vk::Result::eSuccess) {
 		LOGF("vkCreateDevice failed: %s\n", vk::to_string(result).c_str());
@@ -967,6 +984,14 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 
 	return device;
+}
+
+static bool ValidationFeatureOverridesRequested() {
+#ifdef KYTY_ENABLE_BEST_PRACTICES
+	return true;
+#else
+	return Config::GpuAssistedValidationEnabled() || Config::SpirvDebugPrintfEnabled();
+#endif
 }
 
 static void VulkanGetExtensions(VulkanExtensions& r) {
@@ -1036,6 +1061,12 @@ static void VulkanGetExtensions(VulkanExtensions& r) {
 			     ext.extensionName.data(), ext.specVersion);
 		}
 
+		// Ordinary validation requires only the layer. Request this layer-only
+		// extension when its feature overrides are actually used; Streamline's
+		// instance proxy validates extension names against the global list.
+		if (!ValidationFeatureOverridesRequested()) {
+			return;
+		}
 		if (HasExtension(available_extensions, VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME)) {
 			r.required_extensions.push_back(VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME);
 		} else {
@@ -1210,6 +1241,9 @@ void WindowContext::CreateVulkan() {
 	if (get_instance_proc_addr == nullptr) {
 		EXIT("Could not load Vulkan: %s\n", SDL_GetError());
 	}
+	if (!Config::VrEnabled()) {
+		get_instance_proc_addr = Gt7DlssFrameGen::Initialize(get_instance_proc_addr);
+	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
 
 	VulkanExtensions r;
@@ -1279,7 +1313,7 @@ void WindowContext::CreateVulkan() {
 	validation_features.pEnabledValidationFeatures     = enabled_features;
 
 	vk::DebugUtilsMessengerCreateInfoEXT dbg_create_info {};
-	dbg_create_info.pNext           = &validation_features;
+	dbg_create_info.pNext           = enabled_features_count ? &validation_features : nullptr;
 	dbg_create_info.messageSeverity = vk::DebugUtilsMessageSeverityFlagBitsEXT::eVerbose |
 	                                  vk::DebugUtilsMessageSeverityFlagBitsEXT::eInfo |
 	                                  vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning |
@@ -1344,12 +1378,9 @@ void WindowContext::CreateVulkan() {
 		LOGF("Vulkan address binding report: messenger created\n");
 	}
 
-	vk::SurfaceKHR::CType native_surface = VK_NULL_HANDLE;
-	if (!SDL_Vulkan_CreateSurface(window, static_cast<vk::Instance::CType>(graphic_ctx.instance),
-	                              nullptr, &native_surface)) {
-		EXIT("Could not create a Vulkan surface");
+	if (!Gt7DlssFrameGen::CreateSurface(window, graphic_ctx.instance, &surface)) {
+		EXIT("Could not create a Vulkan surface: %s\n", SDL_GetError());
 	}
-	surface = native_surface;
 
 	std::vector<const char*> device_extensions = {
 	    VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
@@ -1570,6 +1601,7 @@ void WindowContext::CreateVulkan() {
 	}
 
 	Gt7DlssHost::AddDeviceExtensions(graphic_ctx, device_extensions);
+	Gt7DlssFrameGen::AppendDeviceExtensions(device_extensions);
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions);
 	if (graphic_ctx.device == nullptr) {
 		EXIT("Could not create device");
@@ -1584,6 +1616,7 @@ void WindowContext::CreateVulkan() {
 	}
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	(void)Gt7DlssFrameGen::OnDevice(graphic_ctx, 0);
 	if (g_vr_queue_index != UINT32_MAX) {
 		graphic_ctx.device.getQueue(graphic_ctx.queue_family, g_vr_queue_index,
 		                            &graphic_ctx.vr_queue);
@@ -1661,12 +1694,9 @@ void WindowContext::RecreateSurface() {
 		graphic_ctx.instance.destroySurfaceKHR(surface, nullptr);
 		surface = nullptr;
 	}
-	vk::SurfaceKHR::CType native_surface = VK_NULL_HANDLE;
-	if (!SDL_Vulkan_CreateSurface(window, static_cast<vk::Instance::CType>(graphic_ctx.instance),
-	                              nullptr, &native_surface)) {
+	if (!Gt7DlssFrameGen::CreateSurface(window, graphic_ctx.instance, &surface)) {
 		EXIT("Could not recreate the Vulkan surface: %s\n", SDL_GetError());
 	}
-	surface = native_surface;
 }
 
 WindowContext::~WindowContext() {
@@ -1685,6 +1715,7 @@ WindowContext::~WindowContext() {
 
 	if (graphic_ctx.device != nullptr) {
 		RequireVulkanSuccess(graphic_ctx.device.waitIdle(), "wait for Vulkan device shutdown");
+		Gt7DlssFrameGen::Shutdown();
 		graphic_ctx.DestroyAllocator();
 		graphic_ctx.device.destroy(nullptr);
 		graphic_ctx.device = nullptr;

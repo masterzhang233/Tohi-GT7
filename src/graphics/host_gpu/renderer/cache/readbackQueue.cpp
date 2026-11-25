@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
+#include "graphics/presentation/window/gt7FrameGen.h"
 
 #include <algorithm>
 #include <chrono>
@@ -79,8 +80,8 @@ ReadbackQueue::~ReadbackQueue() {
 	if (m_queue != nullptr) {
 		// The device may be shutting down after a loss: wait for the queue rather than destroy
 		// what it may use.
-		if (m_graphics.gt7_fsr_present_queue != nullptr) {
-			// FFX may drain the whole device while changing interpolation state.
+		if (Gt7FrameGen::InputsRequested(m_graphics)) {
+			// Either frame-generation backend may drain the whole device.
 			Common::LockGuard lock(m_graphics.queue_mutex);
 			(void)m_queue.waitIdle();
 		} else {
@@ -253,8 +254,8 @@ ReadbackQueue::Ticket ReadbackQueue::Submit(Job&& job, uint64_t after_tick) {
 	submit.pCommandBuffers    = &slot.command;
 	RequireVulkanSuccess(m_graphics.device.resetFences(1, &slot.fence), "reset a readback fence");
 	vk::Result result;
-	if (m_graphics.gt7_fsr_present_queue != nullptr) {
-		// FFX's configuration/drain operations call vkDeviceWaitIdle. Only host
+	if (Gt7FrameGen::InputsRequested(m_graphics)) {
+		// Frame-generation drain operations call vkDeviceWaitIdle. Only host
 		// access to this queue shares their lock; GPU fence waits stay independent.
 		Common::LockGuard lock(m_graphics.queue_mutex);
 		result = m_queue.submit(1, &submit, slot.fence);

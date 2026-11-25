@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
@@ -360,12 +361,13 @@ static void cs_check(const HW::CsStageRegisters& cs, const HW::ShaderRegisters& 
 }
 #endif
 
-// `mismatch`, when given, is set (and the description left unfinished) where a buffer would end
-// the emulator: the draw-prep scanner's descriptions, from vertex tables that may be stale.
-static void ShaderDetectBuffers(ShaderVertexInputInfo& info, bool* mismatch = nullptr) {
+static bool TryDescribeVertexBuffers(ShaderVertexInputInfo& info) {
 	KYTY_PROFILER_FUNCTION();
 
 	info.buffers_num = 0;
+	if (info.resources_num < 0 || info.resources_num > ShaderVertexInputInfo::RES_MAX) {
+		return false;
+	}
 
 	for (int ri = 0; ri < info.resources_num; ri++) {
 		const auto& r = info.resources[ri];
@@ -385,11 +387,9 @@ static void ShaderDetectBuffers(ShaderVertexInputInfo& info, bool* mismatch = nu
 				uint64_t offset2 = b.addr - base;
 
 				if (offset1 < stride && offset2 < stride) {
-					if (mismatch != nullptr && b.num_records != r.NumRecords()) {
-						*mismatch = true;
-						return;
+					if (b.num_records != r.NumRecords()) {
+						return false;
 					}
-					EXIT_NOT_IMPLEMENTED(b.num_records != r.NumRecords());
 					b.addr = base;
 					break;
 				}
@@ -397,7 +397,9 @@ static void ShaderDetectBuffers(ShaderVertexInputInfo& info, bool* mismatch = nu
 		}
 
 		if (bi == info.buffers_num) {
-			EXIT_NOT_IMPLEMENTED(info.buffers_num >= ShaderVertexInputInfo::RES_MAX);
+			if (info.buffers_num >= ShaderVertexInputInfo::RES_MAX) {
+				return false;
+			}
 			info.buffers[bi] = {.addr = r.Base48(),
 			                    .stride = r.Stride(),
 			                    .num_records = r.NumRecords(),
@@ -406,16 +408,18 @@ static void ShaderDetectBuffers(ShaderVertexInputInfo& info, bool* mismatch = nu
 		}
 		destination.buffer_index = bi;
 	}
+	return true;
 }
 
 static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
                                        std::span<const ShaderSemantic> input_semantics,
-                                       const uint32_t* attrib, const uint32_t* buffer) {
+                                       const uint32_t* attrib, const uint32_t* buffer,
+                                       bool log_diagnostics = true) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(attrib == nullptr || buffer == nullptr);
 
-	const bool debug_dump = Config::GraphicsDebugDumpEnabled();
+	const bool debug_dump = log_diagnostics && Config::GraphicsDebugDumpEnabled();
 
 	for (uint32_t i = 0; i < input_semantics.size(); i++) {
 		const auto& in = input_semantics[i];
@@ -452,7 +456,7 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		r.fields[1]       = sharp[1];
 		r.fields[2]       = sharp[2];
 		r.fields[3]       = sharp[3];
-		if (r.SwizzleEnabled() || r.AddTid()) {
+		if (log_diagnostics && (r.SwizzleEnabled() || r.AddTid())) {
 			// A swizzled vertex buffer (groups of 8 << index stride vertices, each dword of a
 			// vertex 4 * that many bytes from the next), or one that adds the lane to the index
 			// (ADD_TID), has no Vulkan vertex input. Until the vertex fetch does it in the
@@ -685,10 +689,8 @@ static bool ShaderGetStaticVertexInputInfoForScan(uint64_t                   sha
 	                                               (max_index + 1u) * 4u * sizeof(uint32_t))) {
 		return false;
 	}
-	ShaderApplyAttribSemantics(info, semantics, attrib.data(), buffer.data());
-	bool mismatch = false;
-	ShaderDetectBuffers(info, &mismatch);
-	return !mismatch;
+	ShaderApplyAttribSemantics(info, semantics, attrib.data(), buffer.data(), false);
+	return TryDescribeVertexBuffers(info);
 }
 
 static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserSgprInfo& user_sgpr,
@@ -775,7 +777,7 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 			}
 		}
 		ShaderApplyAttribSemantics(info, metadata.input_semantics, attrib, buffer);
-		ShaderDetectBuffers(info);
+		EXIT_NOT_IMPLEMENTED(!TryDescribeVertexBuffers(info));
 	}
 	return true;
 }
@@ -875,6 +877,28 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
 	info.workgroup_register = regs.cs_regs.user_sgpr;
 }
 
+// A vertex module depends on the selected channels and their shader scalar type, not the
+// host input format. Keep formats unsupported by the local vertex emitter distinct: its
+// packed integer handling differs from generic formatted-buffer loads (and 113/121 have
+// compatibility mappings in shaders.cpp).
+constexpr auto kVertexFetchFormats = [] {
+	std::array<uint16_t, 128> formats {};
+	for (uint32_t raw = 0; raw < formats.size(); raw++) {
+		const auto format = static_cast<Prospero::BufferFormat>(raw);
+		const auto info   = ShaderRecompiler::Format::GetFormatInfo(format);
+		using Type = ShaderRecompiler::Format::ComponentType;
+		const bool integer = info.type == Type::Uint || info.type == Type::Sint;
+		if (info.component_count == 0 || (integer && info.packed_bitfield)) {
+			formats[raw] = static_cast<uint16_t>(0x100u + raw);
+			continue;
+		}
+		const auto type = integer ? info.type : Type::Float;
+		formats[raw] = static_cast<uint16_t>(info.component_count |
+		                                    (static_cast<uint32_t>(type) << 3u));
+	}
+	return formats;
+}();
+
 void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t>& key) {
 	EXIT_IF(info.resources_num < 0 || info.resources_num > ShaderVertexInputInfo::RES_MAX);
 	key.clear();
@@ -908,13 +932,23 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		                       mesh.max_vertices, mesh.max_primitives, mesh.provoking_vertex,
 		                       static_cast<uint32_t>(mesh.fast_launch), mesh.passes});
 	}
-	key.push_back(info.tess.input_control_points);
-	if (info.tess.input_control_points != 0) {
-		const auto& tess = info.tess;
-		key.insert(key.end(),
-		           {tess.output_control_points, tess.ls_stride, tess.hs_stride, tess.domain,
-		            tess.partitioning, tess.output_topology, tess.patch_base, tess.patch_size,
-		            tess.min_level_bits, tess.max_level_bits});
+	// Only the layout consumed by this stage participates in its module key. The local
+	// HS emitter also bakes in the guest tessellation-factor clamp; keep those limits.
+	const auto& tess = info.tess;
+	switch (info.logical_stage) {
+		case ShaderType::Local: key.push_back(tess.ls_stride); break;
+		case ShaderType::TessellationControl:
+			key.insert(key.end(), {tess.input_control_points, tess.output_control_points,
+			                       tess.ls_stride, tess.hs_stride, tess.patch_base,
+			                       tess.patch_size, tess.domain, tess.min_level_bits,
+			                       tess.max_level_bits});
+			break;
+		case ShaderType::TessellationEvaluation:
+			key.insert(key.end(), {tess.output_control_points, tess.hs_stride, tess.patch_base,
+			                       tess.patch_size, tess.domain, tess.partitioning,
+			                       tess.output_topology});
+			break;
+		default: break;
 	}
 
 	for (int i = 0; i < info.resources_num; i++) {
@@ -922,7 +956,10 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		const auto& destination = info.resources_dst[i];
 		key.push_back(destination.registers_num);
 		key.push_back(static_cast<uint32_t>(destination.attr_id));
-		key.push_back(resource.fields[3] & 0x7ffffu); // Channels and format used by embedded fetch.
+		// Exact format remains in the pipeline key; formatted fetches still specialize on
+		// channel count, integer/float type and destination selectors.
+		key.push_back(resource.DstSelXYZW() |
+		              static_cast<uint32_t>(kVertexFetchFormats[resource.RawFormat()]) << 12u);
 	}
 }
 
@@ -980,6 +1017,39 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 		key.push_back(static_cast<uint32_t>(info.group_id[i]));
 	}
 	key.push_back(static_cast<uint32_t>(info.tg_size_en));
+}
+
+bool PrepareVertexProgramForScan(const HW::VertexShaderInfo& regs, const HW::Context& context,
+                                 ShaderVertexInputInfo& info, ShaderParams& params) {
+	// The scanner's register state and vertex tables can be stale. Mesh preparation still has
+	// draw-time checks and guest-memory reads, so leave it to the GPU thread rather than running
+	// those checks speculatively. Ordinary vertex inputs use the same bounded clean-backing
+	// reader as the tessellation scanner; rejecting preparation never skips the actual draw.
+	if ((context.GetShaderStages() & 0x20u) != 0 || regs.es_regs.data_addr == 0 ||
+	    regs.gs_regs.rsrc2.user_sgpr > HW::UserSgprInfo::SGPRS_MAX) {
+		return false;
+	}
+	const auto generation = g_shader_map_generation.load(std::memory_order_acquire);
+	ShaderMapEntry entry;
+	if (!FindShaderMapEntry(regs.es_regs.data_addr, entry)) {
+		return false;
+	}
+	ShaderVertexInputInfo candidate {};
+	if (!ShaderGetStaticVertexInputInfoForScan(regs.es_regs.data_addr, regs.gs_user_sgpr,
+	                                          context.GetShaderRegisters(), entry.data, candidate)) {
+		return false;
+	}
+	// The shader entry and table-register cache are separate lookups. A registration between
+	// them invalidates this speculative description, even if each lookup succeeded on its own.
+	if (g_shader_map_generation.load(std::memory_order_acquire) != generation) {
+		return false;
+	}
+	candidate.wave_size = (context.GetShaderStages() & 0x00400000u) != 0 ? 32u : 64u;
+	params = GetShaderParams(
+	    regs.es_regs.data_addr, entry.hash,
+	    std::span<const uint32_t>(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr), entry.data);
+	info = std::move(candidate);
+	return true;
 }
 
 ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,

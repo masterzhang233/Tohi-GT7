@@ -10,8 +10,11 @@ not by the project's GPL license. The independently built
 `kyty_dlss_backend.dll` links the NGX SDK and exposes a C ABI to the emulator.
 
 DLSS requires a supported NVIDIA RTX GPU and compatible NVIDIA drivers.
-The fixed Tohi-GT7 1.0.0 preset was tested on an RTX 3080. FSR frame generation
-in this preset does not make DLSS super resolution available on other GPU vendors.
+Tohi-GT7 1.0.3 uses native PSSR temporal inputs for fixed 1920x1080 to
+3840x2160 DLSS reconstruction. The NVIDIA frame-generation option requests
+fixed 2X and has additional hardware/driver and scene-input requirements.
+See NVIDIA-STREAMLINE-NOTICE.md for its separately licensed components.
+Neither path makes DLSS available on other GPU vendors.
 
 The runtime is shipped as provided by NVIDIA; no runtime patch or replacement
 DLL is included. The DLSS SDK is available at https://github.com/NVIDIA/DLSS.

@@ -1,0 +1,17 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D sourceDepth;
+layout(binding = 1) uniform sampler2D sourceMotion;
+layout(binding = 2, r32f) uniform writeonly image2D resultDepth;
+layout(binding = 3, rg32f) uniform writeonly image2D resultMotion;
+layout(push_constant) uniform Parameters { uvec2 extent; vec2 motionScale; } p;
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(uvec2(pixel), p.extent))) return;
+    float depth = texelFetch(sourceDepth, pixel, 0).r;
+    // Native PSSR supplies unjittered current-to-previous displacements.
+    // Apply its pixel scale once; projection jitter is separate FG metadata.
+    vec2 motion = texelFetch(sourceMotion, pixel, 0).rg * p.motionScale;
+    imageStore(resultDepth, pixel, vec4(depth));
+    imageStore(resultMotion, pixel, vec4(motion, 0.0, 0.0));
+}

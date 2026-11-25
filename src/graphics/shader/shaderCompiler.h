@@ -32,6 +32,13 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& input_info, std::vector<u
 
 ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,
                             const HW::UserConfig& user_config, ShaderVertexInputInfo& input_info);
+// Ordinary vertex shaders only, using registered metadata and clean-backing table copies.
+// Missing/stale inputs and merged mesh stages return false for normal GPU-thread preparation;
+// input_info and params are unchanged on rejection.
+[[nodiscard]] bool PrepareVertexProgramForScan(const HW::VertexShaderInfo& regs,
+                                               const HW::Context& context,
+                                               ShaderVertexInputInfo& input_info,
+                                               ShaderParams& params);
 // Returns false when the tessellation interface cannot be reflected from the programs.
 [[nodiscard]] bool PrepareTessellationPrograms(const HW::VertexShaderInfo& regs,
                                                const HW::Context&          context,

@@ -48,6 +48,27 @@ constexpr bool CompatibleRaster(const RasterState& raster) {
            (!raster.layer_output || raster.layer_limit == 1);
 }
 
+struct DepthRange {
+    float minimum = 0.0f, maximum = 0.0f;
+    constexpr bool operator==(const DepthRange&) const = default;
+};
+
+// The caller proves PA_CL_VTE_CNTL == 0x43f and DX zero-to-one clipping.
+// Match Resolve's float addition before deriving the Vulkan viewport slope.
+constexpr DepthRange ViewportDepthRange(const RasterState& raster) {
+    return {raster.z_offset, raster.z_scale + raster.z_offset};
+}
+
+inline bool CompatibleNativeRaster(const RasterState& raster) {
+    auto identity_depth = raster;
+    identity_depth.z_scale = 1.0f;
+    identity_depth.z_offset = 0.0f;
+    const auto range = ViewportDepthRange(raster);
+    return CompatibleRaster(identity_depth) && std::isfinite(raster.z_scale) &&
+        std::isfinite(raster.z_offset) && std::isfinite(range.maximum) &&
+        range.minimum >= 0.0f && range.maximum <= 1.0f && range.maximum > range.minimum;
+}
+
 // Observed in the ordinary GT7 motion producer (VS 48a3c58d37f8582f):
 // s[10:11]+80 is its current view-projection; +144 is view; +208 is projection.
 // Only the VP load is established by the shader contract. The adjacent view
@@ -127,6 +148,37 @@ inline bool Decode(const Matrix& view_projection, const Matrix& view,
         output.forward[i] = -view[i * 4 + 2];
         if (!std::isfinite(output.position[i])) { output = {}; return reject("nonfinite camera position"); }
     }
+    return true;
+}
+
+// Keep the original shader's VP proof intact, then describe the raw depth
+// actually stored by Vulkan. For distance d, z/w = -a + b/d and window depth
+// is s*(z/w)+o, hence a' = s*a-o and b' = s*b. Zero remains the effective far
+// plane; no depth-image rewrite or special treatment of cleared pixels occurs.
+inline bool DecodeNative(const Matrix& view_projection, const Matrix& view,
+                         const Matrix& projection, const RasterState& raster,
+                         uint32_t width, uint32_t height, Parameters& output,
+                         const char** failure = nullptr) {
+    if (!Decode(view_projection, view, projection, width, height, output, failure)) return false;
+    const auto reject = [&](const char* reason) {
+        output = {};
+        if (failure) *failure = reason;
+        return false;
+    };
+    if (!CompatibleNativeRaster(raster)) return reject("unsupported native viewport depth range");
+    const auto range = ViewportDepthRange(raster);
+    if (range.minimum == 0.0f && range.maximum == 1.0f) return true;
+    const double scale = double(range.maximum) - double(range.minimum);
+    const double a = scale * double(projection[10]) - double(range.minimum);
+    const double b = scale * double(projection[14]);
+    if (!std::isfinite(a) || !std::isfinite(b) || a <= 0.0 || b <= 0.0)
+        return reject("native viewport is not finite reverse-Z");
+    const float near_plane = float(b / (1.0 + a));
+    const float far_plane = float(b / a);
+    if (!std::isfinite(near_plane) || !std::isfinite(far_plane) || near_plane <= 0.0f ||
+        far_plane <= near_plane) return reject("native viewport near/far range");
+    output.near_plane = near_plane;
+    output.far_plane = far_plane;
     return true;
 }
 

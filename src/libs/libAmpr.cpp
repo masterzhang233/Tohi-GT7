@@ -2,6 +2,7 @@
 #include "common/dateTime.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfStats.h"
 #include "common/stringUtils.h"
 #include "common/timer.h"
 #include "common/threads.h"
@@ -26,15 +27,18 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <fmt/format.h>
 #include <xxhash.h>
 
 #ifdef min
@@ -1641,9 +1645,187 @@ struct AprReadHashes {
 	bool     made  = false;
 };
 
+namespace {
+bool AprDiagnosticsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GT7_PERF_DIAGNOSTICS");
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
+	}();
+	return enabled;
+}
+
+uint64_t AprDiagnosticNowNs() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// The existing short-read diagnostic inspects GetLastError after File::Read.
+	const auto saved_error = GetLastError();
+#endif
+	const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	    std::chrono::steady_clock::now().time_since_epoch()).count());
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	SetLastError(saved_error);
+#endif
+	return now;
+}
+
+enum AprReadStage : size_t { AprSetup, AprInvalidate, AprHostRead, AprGuestCopy, AprReadStages };
+constexpr std::array<const char*, AprReadStages> kAprReadStageNames {
+	"setup", "invalidate", "host_read", "guest_copy"};
+struct AprDiagnosticMetric {
+	uint64_t total = 0, maximum = 0;
+	void Add(uint64_t ns) { total += ns; maximum = std::max(maximum, ns); }
+	void Merge(const AprDiagnosticMetric& other) {
+		total += other.total;
+		maximum = std::max(maximum, other.maximum);
+	}
+};
+struct AprReadRecord {
+	uint64_t begin = 0, end = 0, offset = 0, destination = 0, requested = 0, bytes = 0;
+	uint32_t file_id = 0;
+	int result = OK;
+	std::array<uint64_t, AprReadStages> stages {};
+};
+struct AprTaskRecord {
+	uint64_t begin = 0, end = 0, submit_wait = 0, initial_exec_wait = 0;
+	uint64_t reads = 0, bytes = 0, failures = 0;
+	uint32_t id = 0;
+	std::array<AprDiagnosticMetric, AprReadStages> stages {};
+	AprReadRecord longest_read {};
+};
+thread_local AprTaskRecord* t_apr_task_diagnostic = nullptr;
+
+// This scope lives in SubmissionEngine::Execute, outside its queue lock. Its destructor
+// runs after ExecuteCommandBufferState released the execution lock and after completion
+// notifications released their locks. Reads only collect fixed-size data while locked.
+// full includes completion notification and explicit guest waits; the four read stages
+// exclude optional hashes and loop bookkeeping, so they do not sum to full read/task time.
+class AprTaskDiagnostic {
+public:
+	AprTaskDiagnostic(bool amm_engine, uint32_t id, uint64_t submitted) {
+		if (amm_engine || !AprDiagnosticsEnabled()) return;
+		m_record.emplace();
+		m_record->begin = AprDiagnosticNowNs();
+		m_record->id = id;
+		if (submitted != 0) m_record->submit_wait = m_record->begin - submitted;
+		m_previous = t_apr_task_diagnostic;
+		t_apr_task_diagnostic = &*m_record;
+	}
+	~AprTaskDiagnostic() {
+		if (!m_record) return;
+		auto& r = *m_record;
+		r.end = AprDiagnosticNowNs();
+		t_apr_task_diagnostic = m_previous;
+		struct Summary {
+			uint64_t begin = 0, tasks = 0, reads = 0, bytes = 0, failures = 0;
+			AprDiagnosticMetric full {}, submit_wait {}, initial_exec_wait {};
+			std::array<AprDiagnosticMetric, AprReadStages> stages {};
+		};
+		static thread_local Summary summary;
+		if (summary.begin == 0) summary.begin = r.begin;
+		++summary.tasks;
+		summary.reads += r.reads;
+		summary.bytes += r.bytes;
+		summary.failures += r.failures;
+		summary.full.Add(r.end - r.begin);
+		summary.submit_wait.Add(r.submit_wait);
+		summary.initial_exec_wait.Add(r.initial_exec_wait);
+		for (size_t i = 0; i < AprReadStages; ++i) summary.stages[i].Merge(r.stages[i]);
+		const auto ms = [](uint64_t ns) { return double(ns) / 1e6; };
+		const auto stages_text = [&ms](const auto& stages) {
+			std::string text;
+			for (size_t i = 0; i < AprReadStages; ++i) {
+				text += fmt::format(" {}={:.3f}/{:.3f}", kAprReadStageNames[i],
+				                    ms(stages[i].total), ms(stages[i].maximum));
+			}
+			return text;
+		};
+		// At most one slow task per second globally, and 64 over the process lifetime.
+		// The exact longest read interval is retained; no per-read/per-chunk logging occurs.
+		static std::atomic<uint64_t> next_slow {0};
+		static std::atomic<uint32_t> slow_reports {0};
+		if (std::max(r.end - r.begin, r.submit_wait) >= 20'000'000u &&
+		    slow_reports.load(std::memory_order_relaxed) < 64) {
+			auto next = next_slow.load(std::memory_order_relaxed);
+			if (r.end >= next && next_slow.compare_exchange_strong(
+			        next, r.end + 1'000'000'000u, std::memory_order_relaxed) &&
+			    slow_reports.fetch_add(1, std::memory_order_relaxed) < 64) {
+				const auto& read = r.longest_read;
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "GT7 perf APR slow: steady_ms={:.3f} tid={} submission={} begin_ms={:.3f} "
+				    "full_ms={:.3f} submit_wait_ms={:.3f} initial_exec_wait_ms={:.3f} "
+				    "reads={} bytes={} failures={} stages_ms(total/max_read){} "
+				    "longest_read(begin/end/file_id/offset/destination/requested/bytes/result)="
+				    "{:.3f}/{:.3f}/{}/0x{:x}/0x{:x}/{}/{}/{} "
+				    "read_ms(setup/invalidate/host_read/guest_copy)={:.3f}/{:.3f}/{:.3f}/{:.3f}\n",
+				    ms(r.end), Common::PerfStats::CurrentOsThreadId(), r.id, ms(r.begin),
+				    ms(r.end - r.begin), ms(r.submit_wait), ms(r.initial_exec_wait),
+				    r.reads, r.bytes, r.failures, stages_text(r.stages), ms(read.begin), ms(read.end),
+				    read.file_id, read.offset, read.destination, read.requested, read.bytes, read.result,
+				    ms(read.stages[0]), ms(read.stages[1]), ms(read.stages[2]), ms(read.stages[3])));
+			}
+		}
+		if (r.end - summary.begin >= 5'000'000'000u) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "GT7 perf APR summary: steady_ms={:.3f} tid={} begin_ms={:.3f} tasks={} reads={} "
+			    "bytes={} failures={} full_ms(total/max)={:.3f}/{:.3f} "
+			    "submit_wait_ms(total/max)={:.3f}/{:.3f} initial_exec_wait_ms(total/max)={:.3f}/{:.3f} "
+			    "stages_ms(total/max_read){}\n", ms(r.end), Common::PerfStats::CurrentOsThreadId(),
+			    ms(summary.begin), summary.tasks, summary.reads, summary.bytes, summary.failures,
+			    ms(summary.full.total), ms(summary.full.maximum), ms(summary.submit_wait.total),
+			    ms(summary.submit_wait.maximum), ms(summary.initial_exec_wait.total),
+			    ms(summary.initial_exec_wait.maximum), stages_text(summary.stages)));
+			summary = {};
+		}
+	}
+private:
+	std::optional<AprTaskRecord> m_record;
+	AprTaskRecord* m_previous = nullptr;
+};
+
+class AprReadDiagnostic {
+public:
+	AprReadDiagnostic(uint32_t file_id, uint64_t offset, uint64_t destination, uint64_t size,
+	                  const uint64_t* bytes_read): m_task(t_apr_task_diagnostic), m_bytes_read(bytes_read) {
+		if (!m_task) return;
+		m_record.emplace();
+		m_record->begin = AprDiagnosticNowNs();
+		m_record->file_id = file_id;
+		m_record->offset = offset;
+		m_record->destination = destination;
+		m_record->requested = size;
+	}
+	~AprReadDiagnostic() {
+		if (!m_record) return;
+		auto& r = *m_record;
+		r.end = AprDiagnosticNowNs();
+		if (!m_setup_finished) r.stages[AprSetup] += r.end - r.begin;
+		r.bytes = m_bytes_read != nullptr ? *m_bytes_read : 0;
+		++m_task->reads;
+		m_task->bytes += r.bytes;
+		m_task->failures += r.result != OK;
+		for (size_t i = 0; i < AprReadStages; ++i) m_task->stages[i].Add(r.stages[i]);
+		if (r.end - r.begin > m_task->longest_read.end - m_task->longest_read.begin) m_task->longest_read = r;
+	}
+	void SetupComplete() {
+		if (!m_record) return;
+		m_record->stages[AprSetup] += AprDiagnosticNowNs() - m_record->begin;
+		m_setup_finished = true;
+	}
+	uint64_t Begin() const { return m_record ? AprDiagnosticNowNs() : 0; }
+	void End(AprReadStage stage, uint64_t begin) {
+		if (m_record) m_record->stages[stage] += AprDiagnosticNowNs() - begin;
+	}
+	int Result(int value) { if (m_record) m_record->result = value; return value; }
+private:
+	AprTaskRecord* m_task;
+	const uint64_t* m_bytes_read;
+	std::optional<AprReadRecord> m_record;
+	bool m_setup_finished = false;
+};
+} // namespace
+
 static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offset,
                                uint64_t destination, uint64_t size, uint64_t* bytes_read,
-                               AprReadHashes* hashes);
+                               AprReadHashes* hashes, uint32_t diagnostic_file_id);
 
 static int ExecuteCommandBufferState(const CommandBufferState& state, bool amm_engine,
                                      int32_t* execution_result, uint32_t* error_offset);
@@ -1654,6 +1836,7 @@ struct PendingSubmission {
 	CommandBufferState state;
 	uint32_t           id     = 0;
 	uint64_t           result = 0;
+	uint64_t           diagnostic_submitted_ns = 0;
 };
 
 // One in-order engine each for the asset reader and the memory mapper, as on the hardware:
@@ -1711,6 +1894,7 @@ private:
 	}
 
 	void Execute(const PendingSubmission& submission, const char* where) {
+		AprTaskDiagnostic diagnostic(m_amm_engine, submission.id, submission.diagnostic_submitted_ns);
 		int32_t  execution_result = OK;
 		uint32_t error_offset     = 0;
 		LOGF("AMPRTRACE begin %s id=%u (%s)\n", m_name, submission.id, where);
@@ -1770,6 +1954,8 @@ static int EnqueueCommandBuffer(uint64_t command_buffer, bool amm_engine, uint32
 	}
 	submission.id     = submission_id;
 	submission.result = result_address;
+	// This interval includes engine lookup and queue residence, not just mutex wait.
+	if (!amm_engine && AprDiagnosticsEnabled()) submission.diagnostic_submitted_ns = AprDiagnosticNowNs();
 	LOGF("AMPRTRACE queue %s p%u id=%u cb=0x%016" PRIx64 " maps=%zu counters=%zu events=%zu "
 	     "waits=%zu writes=%zu reads=%zu\n",
 	     amm_engine ? "amm" : "apr", priority, submission_id, command_buffer,
@@ -1868,7 +2054,11 @@ static int ExecuteCommandBufferState(const CommandBufferState& state, bool amm_e
 	// into the range before the map ran.
 	static std::mutex g_apr_execution_mutex;
 	static std::mutex g_amm_execution_mutex;
+	const auto diagnostic_lock_begin = t_apr_task_diagnostic != nullptr ? AprDiagnosticNowNs() : 0;
 	std::unique_lock  execution_lock(amm_engine ? g_amm_execution_mutex : g_apr_execution_mutex);
+	if (t_apr_task_diagnostic != nullptr) {
+		t_apr_task_diagnostic->initial_exec_wait += AprDiagnosticNowNs() - diagnostic_lock_begin;
+	}
 
 	for (const auto& entry: ordered) {
 		switch (entry.kind) {
@@ -1896,7 +2086,7 @@ static int ExecuteCommandBufferState(const CommandBufferState& state, bool amm_e
 				AprReadHashes hashes;
 				auto          result = ReadHostFileToGuest(host_path, command.file_offset,
 				                                           command.destination, command.size, &bytes_read,
-                                                  AprReadCheck() ? &hashes : nullptr);
+                                                  AprReadCheck() ? &hashes : nullptr, command.file_id);
 				if (trace_reads) {
 					LOGF("APRREAD path=%s offset=0x%" PRIx64 " size=0x%" PRIx64 " read=0x%" PRIx64
 					     " hash=%016" PRIx64 "\n",
@@ -2134,18 +2324,19 @@ static bool AdvanceCommandBuffer(uint64_t command_buffer, uint64_t record_size) 
 
 static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offset,
                                uint64_t destination, uint64_t size, uint64_t* bytes_read,
-                               AprReadHashes* hashes) {
+                               AprReadHashes* hashes, uint32_t diagnostic_file_id) {
+	AprReadDiagnostic diagnostic(diagnostic_file_id, file_offset, destination, size, bytes_read);
 	if (bytes_read == nullptr) {
-		return LibKernel::KERNEL_ERROR_EINVAL;
+		return diagnostic.Result(LibKernel::KERNEL_ERROR_EINVAL);
 	}
 
 	*bytes_read = 0;
 	if (size == 0) {
-		return OK;
+		return diagnostic.Result(OK);
 	}
 	if (!AprShared::IsValidGuestRange(destination, size, true) ||
 	    !AprShared::IsGuestRangeCommitted(destination, size)) {
-		return LibKernel::KERNEL_ERROR_EFAULT;
+		return diagnostic.Result(LibKernel::KERNEL_ERROR_EFAULT);
 	}
 
 	struct CachedFile {
@@ -2170,7 +2361,7 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		auto opened  = std::make_unique<CachedFile>();
 		opened->path = host_path;
 		if (!opened->file.Open(host_path, Common::File::Mode::Read)) {
-			return LibKernel::KERNEL_ERROR_ENOENT;
+			return diagnostic.Result(LibKernel::KERNEL_ERROR_ENOENT);
 		}
 		opened->size = opened->file.Size();
 		cache.push_back(std::move(opened));
@@ -2180,15 +2371,15 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 	auto&      file      = entry->file;
 	const auto file_size = entry->size;
 	if (file_offset >= file_size) {
-		return OK;
+		return diagnostic.Result(OK);
 	}
 	if (!file.Seek(file_offset)) {
-		return LibKernel::KERNEL_ERROR_EINVAL;
+		return diagnostic.Result(LibKernel::KERNEL_ERROR_EINVAL);
 	}
 
 	const auto readable = std::min<uint64_t>(size, file_size - file_offset);
 	if (readable == 0) {
-		return OK;
+		return diagnostic.Result(OK);
 	}
 
 	// The destination may be cached as a GPU buffer and write-protected by the memory tracker.
@@ -2196,11 +2387,19 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 	// lands as zeros (seen as PAGE_READONLY + ERROR_NOACCESS). Reading into a host chunk and
 	// copying takes the tracked-page fault like any CPU write, so the tracker unprotects the
 	// page and marks it dirty, and the bytes land.
+	// setup includes validation/cache/open/seek and host chunk allocation; invalidate can
+	// wait for GPU-owned data. host_read includes the file backend, guest_copy includes any
+	// tracking/page-in faults. These are wall times, not isolated disk or CPU execution times.
+	diagnostic.SetupComplete();
+	const auto invalidate_begin = diagnostic.Begin();
 	LibKernel::Memory::InvalidateMemory(destination, readable);
+	diagnostic.End(AprInvalidate, invalidate_begin);
+	const auto allocation_begin = diagnostic.Begin();
 	thread_local std::vector<uint8_t> chunk;
 	if (chunk.size() < APR_HOST_READ_CHUNK_SIZE) {
 		chunk.resize(APR_HOST_READ_CHUNK_SIZE);
 	}
+	diagnostic.End(AprSetup, allocation_begin);
 
 	XXH3_state_t* file_hash = nullptr;
 	if (hashes != nullptr) {
@@ -2213,14 +2412,18 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		const auto request = static_cast<uint32_t>(
 		    std::min<uint64_t>(APR_HOST_READ_CHUNK_SIZE, readable - *bytes_read));
 		uint32_t read = 0;
+		const auto read_begin = diagnostic.Begin();
 		file.Read(chunk.data(), request, &read);
+		diagnostic.End(AprHostRead, read_begin);
 		if (read == 0) {
 			break;
 		}
 		if (file_hash != nullptr) {
 			XXH3_64bits_update(file_hash, chunk.data(), read);
 		}
+		const auto copy_begin = diagnostic.Begin();
 		std::memcpy(reinterpret_cast<void*>(destination + *bytes_read), chunk.data(), read);
+		diagnostic.End(AprGuestCopy, copy_begin);
 		*bytes_read += read;
 	}
 	if (file_hash != nullptr) {
@@ -2260,7 +2463,7 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		     destination, readable, *bytes_read, state, protect, last_error, host_path.c_str());
 	}
 
-	return OK;
+	return diagnostic.Result(OK);
 }
 
 static int KYTY_SYSV_ABI CommandBufferConstructor(void* command_buffer) {

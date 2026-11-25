@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderDiskCache.h"
 
 #include "common/logging/log.h"
+#include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "shaderCacheVersion.h"
 
@@ -24,7 +25,7 @@ namespace {
 
 // Bump when the encoding below changes in a way the source version cannot see (it hashes this
 // file too, so this is belt and braces).
-constexpr uint32_t FormatVersion = 5;           // Proved GT7 camera-position metadata.
+constexpr uint32_t FormatVersion = 6;           // Stage-specific tessellation and vertex-format keys.
 constexpr uint32_t FileMagic     = 0x4344534bu; // "KSDC"
 constexpr uint64_t MaxFileSize   = uint64_t {256} << 20u;
 
@@ -217,6 +218,9 @@ void Visit(Io& io, T& v) {
 	io(v.param_export_mask);
 	io(v.has_address_writes);
 	io(v.gt7_camera_position);
+	io(v.position_matrix.kind);
+	io(v.position_matrix.user_sgpr);
+	io(v.position_matrix.byte_offset);
 	io(v.info);
 	io(v.bindings);
 }
@@ -388,7 +392,7 @@ static_assert(sizeof(IR::StageOutput) == 48);
 static_assert(sizeof(IR::ShaderInfo) == 192);
 static_assert(sizeof(IR::DescriptorBinding) == 32);
 static_assert(sizeof(IR::BindingLayout) == 72);
-static_assert(sizeof(IR::CompiledShaderInfo) == 304);
+static_assert(sizeof(IR::CompiledShaderInfo) == 320);
 static_assert(sizeof(IR::DescriptorSource::IndirectDescriptor) == 120);
 static_assert(sizeof(IR::DescriptorSource::BindlessSampler) == 4);
 static_assert(sizeof(IR::DescriptorSource) == 272);
@@ -729,48 +733,15 @@ std::vector<uint8_t> SessionKey(const SessionInfo& session) {
 void AppendInputKey(ByteWriter& key, const ShaderVertexInputInfo& info) {
 	key.Put<uint8_t>('V');
 	key.Put(static_cast<uint32_t>(info.logical_stage));
-	key.Put<int32_t>(info.resources_num);
-	key.Put<int32_t>(info.fetch_attrib_reg);
-	key.Put<int32_t>(info.fetch_buffer_reg);
-	key.Put(info.wave_size);
-	key.Put(info.scratch_size_dwords);
-	key.Put(info.pa_cl_vs_out_cntl);
-	key.Put(info.clip_space.position_format);
-	key.Put(info.clip_space.enabled);
-	if (info.clip_space.enabled) {
-		for (int i = 0; i < 2; i++) {
-			key.Put(info.clip_space.scale[i]);
-			key.Put(info.clip_space.offset[i]);
-			key.Put(info.clip_space.half_extent[i]);
-		}
-	}
-	const auto& mesh = info.mesh;
-	for (const auto value: mesh.threads_num) {
-		key.Put(value);
-	}
-	for (const auto value: {mesh.lds_size_dwords, mesh.scratch_size_dwords, mesh.host_subgroup_size,
-	                        mesh.wave_size, mesh.input_primitive, mesh.primitives_per_group,
-	                        mesh.vertices_per_group, mesh.max_vertices, mesh.max_primitives,
-	                        mesh.provoking_vertex, mesh.passes}) {
-		key.Put(value);
-	}
-	key.Put(mesh.fast_launch);
-	const auto& tess = info.tess;
-	for (const auto value:
-	     {tess.input_control_points, tess.output_control_points, tess.ls_stride, tess.hs_stride,
-	      tess.domain, tess.partitioning, tess.output_topology, tess.patch_base, tess.patch_size,
-	      tess.min_level_bits, tess.max_level_bits}) {
-		key.Put(value);
-	}
+	// Use the same specialization identity in memory and on disk. In particular, do not
+	// reintroduce the complete tessellation layout or raw vertex format into the disk key.
+	std::vector<uint32_t> static_key;
+	BuildStageStaticKey(info, static_key);
+	key.PutWords(static_key);
 	key.Put(info.fetch_external);
-	key.Put(info.fetch_embedded);
-	const int resources = std::clamp(info.resources_num, 0, ShaderVertexInputInfo::RES_MAX);
-	for (int i = 0; i < resources; i++) {
-		// The embedded fetch reads the V#'s format and destination selects (BuildStageStaticKey).
-		key.Put(info.resources[i].fields[3] & 0x7ffffu);
-		key.Put<int32_t>(info.resources_dst[i].registers_num);
-		key.Put<int32_t>(info.resources_dst[i].attr_id);
-	}
+	// BuildStageStaticKey keys the mesh's X dimension; retain the other disk-key inputs.
+	key.Put(info.mesh.threads_num[1]);
+	key.Put(info.mesh.threads_num[2]);
 }
 
 void AppendInputKey(ByteWriter& key, const ShaderPixelInputInfo& info) {

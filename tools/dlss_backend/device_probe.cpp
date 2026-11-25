@@ -1,6 +1,8 @@
 // Device-creation-only diagnostic. No game, GPU submissions, or NGX feature.
-#include "kyty_dlss_backend.h"
 #include <windows.h>
+#define VK_USE_PLATFORM_WIN32_KHR
+#include "kyty_dlss_backend.h"
+#include "vulkan_device_report.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <cstring>
@@ -28,7 +30,7 @@ struct Reservations {
     std::vector<void*> held;
     uint64_t bytes=0;
     ~Reservations(){for(auto p:held)VirtualFree(p,0,MEM_RELEASE);}
-    void Reserve(uint64_t first,uint64_t end,uint64_t minimum) {
+    void Reserve(uint64_t first,uint64_t end,uint64_t minimum,bool placeholders=false) {
         for(uint64_t next=first;next<end;) {
             MEMORY_BASIC_INFORMATION m {};
             if(!VirtualQuery(reinterpret_cast<void*>(next),&m,sizeof(m)))throw std::runtime_error("VirtualQuery failed");
@@ -38,7 +40,10 @@ struct Reservations {
             const auto start=(std::max(base,next)+0xffffull)&~0xffffull;
             const auto aligned_end=stop&~0xffffull;
             if(m.State==MEM_FREE&&aligned_end>start&&aligned_end-start>minimum) {
-                void* p=VirtualAlloc(reinterpret_cast<void*>(start),aligned_end-start,MEM_RESERVE,PAGE_NOACCESS);
+                void* p=placeholders
+                    ? VirtualAlloc2(GetCurrentProcess(),reinterpret_cast<void*>(start),aligned_end-start,
+                                    MEM_RESERVE|MEM_RESERVE_PLACEHOLDER,PAGE_NOACCESS,nullptr,0)
+                    : VirtualAlloc(reinterpret_cast<void*>(start),aligned_end-start,MEM_RESERVE,PAGE_NOACCESS);
                 if(!p)throw std::runtime_error("VirtualAlloc reserve failed "+std::to_string(GetLastError()));
                 held.push_back(p);bytes+=aligned_end-start;
             }
@@ -46,10 +51,23 @@ struct Reservations {
         }
     }
 };
+struct Backing {
+    HANDLE section {};void* address {};
+    ~Backing(){if(address)UnmapViewOfFile(address);if(section)CloseHandle(section);}
+    void Create(uint64_t bytes) {
+        section=CreateFileMappingW(INVALID_HANDLE_VALUE,nullptr,PAGE_EXECUTE_READWRITE|SEC_RESERVE,
+                                   DWORD(bytes>>32),DWORD(bytes),nullptr);
+        if(!section)throw std::runtime_error("Backing section failed "+std::to_string(GetLastError()));
+        address=MapViewOfFile(section,FILE_MAP_READ|FILE_MAP_WRITE,0,0,bytes);
+        if(!address)throw std::runtime_error("Backing mapping failed "+std::to_string(GetLastError()));
+    }
+};
 struct Context {
     HMODULE backend {},loader {};VkInstance instance {};VkDevice device {};
+    HWND window {};VkSurfaceKHR surface {};PFN_vkDestroySurfaceKHR destroy_surface {};
     PFN_vkGetInstanceProcAddr gipa {};PFN_vkDestroyInstance destroy_instance {};PFN_vkDestroyDevice destroy_device {};
-    ~Context(){if(device&&destroy_device)destroy_device(device,nullptr);if(instance&&destroy_instance)destroy_instance(instance,nullptr);
+    ~Context(){if(device&&destroy_device)destroy_device(device,nullptr);if(surface&&destroy_surface)destroy_surface(instance,surface,nullptr);
+        if(instance&&destroy_instance)destroy_instance(instance,nullptr);if(window)DestroyWindow(window);
         if(backend)FreeLibrary(backend);if(loader)FreeLibrary(loader);}
     template<class T>T Get(const char* name){auto p=reinterpret_cast<T>(gipa(instance,name));if(!p)throw std::runtime_error(std::string("Missing ")+name);return p;}
 };
@@ -69,13 +87,18 @@ void Run(const std::filesystem::path& dll,const std::filesystem::path& runtime,c
         report["early_cuda_result"]=init(0); // module intentionally retained for process lifetime
     }
     Reservations guest;
+    const bool placeholders=config.value("guest_placeholders",false);
     if(mode!="none") {
         // Same address intervals and >16MiB free-region threshold as ReserveGuestRegions.
-        // MEM_RESERVE rather than placeholders: this test concerns address availability only.
-        guest.Reserve(0x40000,0x1000000000ull,0x1000000);
-        guest.Reserve(0x1000000000ull,0xfc00000000ull,0x1000000);
-        guest.Reserve(0x080000000000ull,0x088000000000ull,0x1000000);
+        // Optional placeholders reproduce the emulator's reservation mechanism.
+        guest.Reserve(0x40000,0x1000000000ull,0x1000000,placeholders);
+        guest.Reserve(0x1000000000ull,0xfc00000000ull,0x1000000,placeholders);
+        guest.Reserve(0x080000000000ull,0x088000000000ull,0x1000000,placeholders);
     }
+    Backing backing;const auto backing_mib=config.value("backing_mib",uint64_t(0));
+    if(backing_mib>65536)throw std::runtime_error("backing_mib exceeds diagnostic limit");
+    if(backing_mib)backing.Create(backing_mib<<20);
+    report["backing_address"]=reinterpret_cast<uint64_t>(backing.address);
     report["guest_reserved_bytes"]=guest.bytes;report["guest_reservation_count"]=guest.held.size();
     report["modules_before_backend"]=Modules();
     Context c;c.backend=LoadLibraryExW(dll.c_str(),nullptr,LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -90,7 +113,7 @@ void Run(const std::filesystem::path& dll,const std::filesystem::path& runtime,c
     report["modules_after_query_instance"]=Modules();
     std::vector<const char*> instance_extensions;
     for(uint32_t n=0;n<ie.count;++n)instance_extensions.push_back(ie.names[n]);
-    if(config.value("emulator_extensions",false)) {
+    if(config.value("emulator_extensions",false)||config.value("win32_surface",false)) {
         instance_extensions.push_back("VK_KHR_surface");instance_extensions.push_back("VK_KHR_win32_surface");
         instance_extensions.push_back("VK_EXT_debug_utils");
     }
@@ -104,6 +127,16 @@ void Run(const std::filesystem::path& dll,const std::filesystem::path& runtime,c
     ici.enabledExtensionCount=static_cast<uint32_t>(instance_extensions.size());ici.ppEnabledExtensionNames=instance_extensions.data();
     VkCheck(c.Get<PFN_vkCreateInstance>("vkCreateInstance")(&ici,nullptr,&c.instance),"vkCreateInstance");
     c.destroy_instance=c.Get<PFN_vkDestroyInstance>("vkDestroyInstance");
+    if(config.value("win32_surface",false)) {
+        c.window=CreateWindowExW(0,L"STATIC",L"Kyty device probe (hidden)",WS_OVERLAPPEDWINDOW,
+                                 0,0,64,64,nullptr,nullptr,GetModuleHandleW(nullptr),nullptr);
+        if(!c.window)throw std::runtime_error("Hidden Win32 window failed "+std::to_string(GetLastError()));
+        VkWin32SurfaceCreateInfoKHR surface_info {};surface_info.sType=VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
+        surface_info.hinstance=GetModuleHandleW(nullptr);surface_info.hwnd=c.window;
+        VkCheck(c.Get<PFN_vkCreateWin32SurfaceKHR>("vkCreateWin32SurfaceKHR")(c.instance,&surface_info,nullptr,&c.surface),"CreateWin32Surface");
+        c.destroy_surface=c.Get<PFN_vkDestroySurfaceKHR>("vkDestroySurfaceKHR");
+        report["win32_surface_created"]=true;
+    }
     auto enumerate=c.Get<PFN_vkEnumeratePhysicalDevices>("vkEnumeratePhysicalDevices");uint32_t count=0;
     VkCheck(enumerate(c.instance,&count,nullptr),"enumerate");std::vector<VkPhysicalDevice> devices(count);
     VkCheck(enumerate(c.instance,&count,devices.data()),"enumerate");VkPhysicalDevice physical {};
@@ -221,6 +254,7 @@ void Run(const std::filesystem::path& dll,const std::filesystem::path& runtime,c
     }
     // Persist the exact inputs even if a third-party layer crashes inside create.
     {std::ofstream f(output);f<<report.dump(2)<<'\n';}
+    kyty_device_diagnostic::WriteDeviceCreateReport(ci);
     const auto result=c.Get<PFN_vkCreateDevice>("vkCreateDevice")(physical,&ci,nullptr,&c.device);
     report["vk_create_device_result"]=static_cast<int>(result);
     report["modules_after_create_device"]=Modules();

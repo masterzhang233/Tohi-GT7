@@ -12,8 +12,10 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/guest_gpu/pssr.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/hostMemory.h"
+#include "graphics/host_gpu/gt7DlssDevice.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
@@ -27,6 +29,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderDiskCache.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -392,6 +395,22 @@ struct TextureCacheTestAccess {
 };
 
 struct RenderExecutorTestAccess {
+  static std::array<uint64_t, 3> PssrCounts(const RenderExecutor &executor) {
+    return {executor.m_pssr_requests, executor.m_pssr_dlss_evaluations,
+            executor.m_pssr_linear_fallbacks};
+  }
+  static Dlss::Feature *PssrFeature(const RenderExecutor &executor) {
+    return executor.m_dlss_contexts.size() == 1 ? executor.m_dlss_contexts[0].feature : nullptr;
+  }
+  static Dlss::Creation PssrCreation(const RenderExecutor &executor) {
+    EXIT_IF(executor.m_dlss_contexts.size() != 1);
+    return executor.m_dlss_contexts[0].creation;
+  }
+  static Dlss::Resource PssrResource(RenderExecutor &executor,
+                                    const TextureBinding &binding, bool write) {
+    return executor.PssrResource(binding, write);
+  }
+
   static void DrawAuto(RenderExecutor &executor, CommandBuffer &command,
                        const DrawAutoArgs &args) {
     executor.DrawAuto(0, command, args);
@@ -957,6 +976,47 @@ std::string Hex(u32 value) {
 void Require(const char *shader_name, const char *stage, bool value,
              const std::string &message);
 
+bool g_native_pssr_integration = false;
+
+// Only the explicit native integration test needs NVIDIA initialized before the
+// guest VA reservation. Keep the same temporary 1 TiB low-address exclusion as
+// production InitCudaEarly; ordinary GPU tests do not load CUDA or NGX.
+void InitializeNativePssrDriverForTest() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  const auto cuda = LoadLibraryExW(L"nvcuda.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+  Require("PssrNative", "CUDA driver", cuda != nullptr, "NVIDIA driver is required");
+  using CuInit = int(__stdcall *)(unsigned int);
+  const auto initialize = reinterpret_cast<CuInit>(GetProcAddress(cuda, "cuInit"));
+  Require("PssrNative", "CUDA entry", initialize != nullptr, "cuInit is unavailable");
+  uint64_t floor_gb = 1024;
+  if (const auto *value = std::getenv("KYTY_CUDA_VA_FLOOR_GB"); value && std::atoi(value) > 0)
+    floor_gb = std::clamp<uint64_t>(std::strtoull(value, nullptr, 10), 1024, 65536);
+  const auto floor = floor_gb << 30u;
+  std::vector<void *> held;
+  for (uint64_t next = 0x10000; next < floor;) {
+    MEMORY_BASIC_INFORMATION info{};
+    if (!VirtualQuery(reinterpret_cast<void *>(next), &info, sizeof(info))) break;
+    const auto base = reinterpret_cast<uint64_t>(info.BaseAddress);
+    const auto end = std::min<uint64_t>(floor, base + info.RegionSize);
+    if (end <= next) break;
+    const auto start = (std::max(base, next) + 0xffffu) & ~uint64_t{0xffff};
+    if (info.State == MEM_FREE && end > start) {
+      if (auto *reservation = VirtualAlloc(reinterpret_cast<void *>(start), end - start,
+                                            MEM_RESERVE, PAGE_NOACCESS))
+        held.push_back(reservation);
+    }
+    next = end;
+  }
+  const int result = initialize(0);
+  for (auto *reservation : held) VirtualFree(reservation, 0, MEM_RELEASE);
+  std::printf("[native]  early CUDA initialization attempted above %llu GiB: %d\n",
+              static_cast<unsigned long long>(floor_gb), result);
+  // As production: the CUDA result does not replace actual Vulkan/NGX checks.
+#else
+  Fail("PssrNative", "platform", "the native backend integration requires Windows");
+#endif
+}
+
 void EnsureConfigInitialized() {
   static bool config_initialized = false;
   if (!config_initialized) {
@@ -965,6 +1025,8 @@ void EnsureConfigInitialized() {
     subsystems.Initialize<Config::Lifecycle>();
     Config::ConfigOptions options;
     options.printf_direction = Config::LogDirection::Silent;
+    options.pro_enabled = g_native_pssr_integration;
+    options.pssr_dlss_enabled = g_native_pssr_integration;
     Config::Load(options);
     subsystems.Initialize<Log::Lifecycle>();
     subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
@@ -3529,40 +3591,19 @@ public:
     Require(name, "marker insertion", parser_nonblocking,
             "inserting a suspend point blocked the GPU command thread");
 
-    std::binary_semaphore second_entered{0};
+    // A parsed point releases its credit even while native GPU work is gated.
     std::binary_semaphore second_returned{0};
     std::jthread second([&] {
-      second_entered.release();
       gpu.SuspendPoint();
       second_returned.release();
     });
-    second_entered.acquire();
-    const bool second_overtook_completion =
-        second_returned.try_acquire_for(std::chrono::milliseconds(100));
-
-    uint32_t compute_value = 0;
-    std::array<uint32_t, 5> compute_commands{};
-    write(compute_commands.data(), &compute_value, 33);
-    bool host_lane_responded = false;
-    std::binary_semaphore compute_progress{0};
-    std::jthread compute([&] {
-      gpu.SubmitCompute(0x20, compute_commands);
-      gpu.SendCommandSync([&] { host_lane_responded = true; });
-      gpu.WaitForIdle();
-      compute_progress.release();
-    });
-    const bool compute_did_not_wait =
-        compute_progress.try_acquire_for(std::chrono::seconds(2));
+    const bool second_nonblocking =
+        second_returned.try_acquire_for(std::chrono::seconds(2));
     signal(1);
     second.join();
-    compute.join();
     finish();
-    Require(name, "one outstanding point", !second_overtook_completion,
-            "a second suspend point returned before the first native completion");
-    Require(name, "independent queue progress",
-            compute_did_not_wait && host_lane_responded && compute_value == 33,
-            "waiting for a previous suspend point blocked compute submissions "
-            "or the host command lane");
+    Require(name, "executed point", second_nonblocking,
+            "a second suspend point waited for native GPU completion");
     Require(name, "frame count", gpu.GetFrameNum() == 2,
             "suspend-point insertion did not advance the frame counter once");
 
@@ -3616,29 +3657,53 @@ public:
     queued.join();
     gpu.Submit(after, {});
     release_lane.release();
+    // A point behind a stalled guest stream must still retain its credit, while
+    // asynchronous compute and the host command lane remain able to release it.
+    std::binary_semaphore next_returned{0};
+    std::jthread next([&] {
+      gpu.SuspendPoint();
+      next_returned.release();
+    });
+    const bool next_overtook_point =
+        next_returned.try_acquire_for(std::chrono::milliseconds(100));
+    uint32_t compute_value = 0;
+    std::array<uint32_t, 5> compute_commands{};
+    write(compute_commands.data(), &compute_value, 33);
+    gpu.SubmitCompute(0x20, compute_commands);
     bool prefix_reached = false;
     bool graphics_ordered = false;
+    bool compute_progressed = false;
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::seconds(2);
     do {
       gpu.SendCommandSync([&] {
         prefix_reached = prefix == 22;
         graphics_ordered = skipped == 0 && after_reset == 0;
+        compute_progressed = compute_value == 33;
       });
       std::this_thread::yield();
-    } while (!prefix_reached && std::chrono::steady_clock::now() < deadline);
+    } while (!(prefix_reached && compute_progressed) &&
+             std::chrono::steady_clock::now() < deadline);
     std::array<uint32_t, 5> release_graphics{};
     write(release_graphics.data(), &label, 1);
     gpu.SubmitCompute(0x20, release_graphics);
+    next.join();
     finish();
+    Require(name, "one outstanding point", !next_overtook_point,
+            "a suspend point returned before the CP executed the previous one");
+    Require(name, "independent queue progress", compute_progressed,
+            "waiting for a previous suspend point blocked compute submissions "
+            "or the host command lane");
+    Require(name, "frame count", gpu.GetFrameNum() == 4,
+            "a parsed point did not advance the frame counter exactly once");
     Require(name, "graphics FIFO",
             prefix_reached && graphics_ordered && skipped == 0,
             "suspend point or later graphics overtook a stalled graphics stream");
     Require(name, "graphics reset", after_reset == 44,
             "suspend point preserved the previous frame's predicate");
 
-    // Delay the completion callback beyond the owner's shutdown when possible.
-    // Its credit must remain alive independently of the GuestGpu object.
+    // Releasing a parsed point must not weaken shutdown's native completion and
+    // deferred resource lifetime guarantees.
     std::binary_semaphore priority_entered{0};
     std::binary_semaphore release_priority{0};
     gpu.SendCommandSync([&] {
@@ -3673,8 +3738,77 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  void CheckImageExternalWriteVersion() {
+    constexpr const char *name = "ImageExternalWriteVersion";
+    // A metadata-only Image exercises invalidation state without allocating a
+    // native image or reading guest bytes. Retained candidates use these same
+    // methods before/after the texture cache resolves an upload.
+    ImageInfo info{};
+    info.pixel_format = vk::Format::eUndefined;
+    info.data = {0x100080, 64};
+    info.extent = {8, 8, 1};
+    info.resources = {1, 1};
+    info.samples = 1;
+    Libs::Graphics::Image image(m_runtime_context,
+                                Renderer().GetCommandScheduler(), info);
+    image.RefreshComplete();
+    auto captured = image.ExternalWriteVersion();
+    image.MarkGpuModified();
+    image.ClearGpuModified();
+    image.ClearBufferModified();
+    image.InvalidateCpuWrite(info.data.address + 0x10000, 4);
+    Require(name, "GPU writes and unrelated bytes", captured == image.ExternalWriteVersion(),
+            "ordinary GPU use or unrelated bytes invalidated a scene snapshot");
+
+    image.InvalidateCpuWrite(info.data.address + 4, 4);
+    // Capture can observe the fault's new version while the native image still
+    // holds the old pixels. ResolveSurface must invalidate that version again
+    // when it uploads the external bytes, even though it also clears dirty.
+    const auto captured_after_cpu_write = image.ExternalWriteVersion();
+    image.RefreshComplete();
+    Require(name, "CPU refresh retains invalidation",
+            captured_after_cpu_write > captured &&
+                image.ExternalWriteVersion() > captured_after_cpu_write &&
+                !image.IsCpuDirty(),
+            "a completed CPU upload hid the invalidation from a retained snapshot");
+    captured = image.ExternalWriteVersion();
+    image.MarkCpuDirty();
+    image.MarkCpuDirty();
+    Require(name, "repeated dirty writes", image.ExternalWriteVersion() > captured + 1,
+            "a second external write while already dirty did not advance the version");
+    image.RefreshComplete();
+
+    captured = image.ExternalWriteVersion();
+    image.InvalidateCpuWrite(info.data.address - 4, 4);
+    image.SetMaybeCpuHash(0x1234);
+    const auto neighbor_write = image.ExternalWriteVersion();
+    Require(name, "neighbor uncertainty",
+            neighbor_write > captured && !image.ResolveMaybeCpuHash(0x1234) &&
+                image.ExternalWriteVersion() == neighbor_write,
+            "clearing a possible CPU write revived an older scene snapshot");
+    image.MarkMaybeCpuDirty();
+    image.SetMaybeCpuHash(0x1234);
+    captured = image.ExternalWriteVersion();
+    Require(name, "changed content hash",
+            image.ResolveMaybeCpuHash(0x5678) && image.ExternalWriteVersion() > captured,
+            "confirmed changed guest content did not invalidate the snapshot");
+    image.RefreshComplete();
+
+    captured = image.ExternalWriteVersion();
+    image.MarkBufferModified();
+    const auto captured_after_buffer_write = image.ExternalWriteVersion();
+    image.ClearBufferModified();
+    Require(name, "buffer refresh retains invalidation",
+            captured_after_buffer_write > captured &&
+                image.ExternalWriteVersion() > captured_after_buffer_write &&
+                !image.IsBufferModified(),
+            "clearing a buffer upload hid the invalidation from a retained snapshot");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckGpuCommandLane() {
     EnsureRuntimeContext();
+    CheckImageExternalWriteVersion();
     auto &context = Renderer();
     context.InitializeGpu(nullptr);
     auto &gpu = context.GetGpu();
@@ -4251,6 +4385,28 @@ public:
             "an unrelated unmap waited for a blocked PM4 submission");
 
     auto &scheduler = context.GetCommandScheduler();
+    gpu.SendCommandSync([&] {
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      Require("GpuCommandLane", "unused unmap setup",
+              !scheduler.HasPendingOperations() &&
+                  !resources.GetBufferCache().IsRegionRegistered(
+                      empty_unmap_base, empty_unmap_size) &&
+                  !resources.GetBufferCache().HasGpuDirtyBytesShared(
+                      empty_unmap_base, empty_unmap_size) &&
+                  !resources.GetTextureCache().IsRegionRegistered(
+                      empty_unmap_base, empty_unmap_size),
+              "unused mapped range unexpectedly owns native work");
+      const auto unused_tick = scheduler.CurrentTick();
+      resources.MapMemory(empty_unmap_base, empty_unmap_size);
+      resources.UnmapMemory(empty_unmap_base, empty_unmap_size / 2);
+      resources.UnmapMemory(empty_unmap_base + empty_unmap_size / 2,
+                            empty_unmap_size / 2);
+      Require("GpuCommandLane", "unused mapped unmap does not submit",
+              scheduler.CurrentTick() == unused_tick &&
+                  !resources.IsMapped(empty_unmap_base, empty_unmap_size),
+              "CPU-only mapped unmaps submitted native GPU work");
+    });
     std::atomic<bool> normal_completed{false};
     gpu.SendCommandSync(
         [&] { scheduler.DeferOperation([&] { normal_completed = true; }); });
@@ -4605,6 +4761,8 @@ public:
                 fault_direct_offset, fault_size) == 0,
             "processor-fault direct-memory allocation release failed");
 
+    CheckGpuUnmapResources(context);
+
     std::binary_semaphore command_entered{0};
     std::binary_semaphore release_command{0};
     std::atomic<bool> shutdown_complete{false};
@@ -4637,6 +4795,151 @@ public:
             "renderer retained mapped coverage after the GPU command lane stopped");
     context.ShutdownGpu();
     std::printf("[host]    %-32s ok\n", "GpuCommandLane");
+  }
+
+  void CheckGpuUnmapResources(RenderContext &context) {
+    constexpr const char *name = "GpuUnmapResources";
+    constexpr uintptr_t base = 0x0000000200600000ull;
+    constexpr uint64_t page = 0x10000;
+    constexpr uint64_t allocation_size = page * 2;
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, page, 0, &direct_offset) == 0,
+            "unmap test direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, page) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "unmap test fixed direct-memory mapping failed");
+    context.MapMemory(base, allocation_size);
+    context.GetGpu().SendCommandSync([&] {
+      auto &scheduler = context.GetCommandScheduler();
+      auto &buffers = context.GetBufferCache();
+      auto &textures = context.GetTextureCache();
+      constexpr uint32_t old_value = 0x1234abcdu;
+      constexpr uint32_t new_value = 0x5678def0u;
+      LibKernel::Memory::WriteBacking(base, &old_value, sizeof(old_value));
+      const auto initial = buffers.ObtainBuffer(base, sizeof(old_value), false,
+                                                false, {}, true);
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      Require(name, "clean buffer setup",
+              initial.first != nullptr &&
+                  buffers.IsRegionRegistered(base, page) &&
+                  !buffers.HasGpuDirtyBytesShared(base, page) &&
+                  !textures.IsRegionRegistered(base, page) &&
+                  !scheduler.HasPendingOperations(),
+              "clean cached buffer is not isolated from other unmap guards");
+      const auto clean_tick = scheduler.CurrentTick();
+      context.UnmapMemory(base, page);
+      Require(name, "clean cached buffer drain",
+              scheduler.CurrentTick() == clean_tick + 1 &&
+                  scheduler.IsFree(clean_tick) && !context.IsMapped(base, page),
+              "unmapping a clean cached buffer skipped its native drain");
+
+      // The address is reused with new CPU bytes. Read the new native upload,
+      // rather than merely checking that mapping bookkeeping changed.
+      LibKernel::Memory::WriteBacking(base, &new_value, sizeof(new_value));
+      context.MapMemory(base, page);
+      const auto [remapped, offset] = buffers.ObtainBuffer(
+          base, sizeof(new_value), false, false, {}, true);
+      Require(name, "remapped buffer", remapped != nullptr,
+              "remapped buffer allocation failed");
+      auto readback = CreateHostBuffer(
+          name, sizeof(new_value), vk::BufferUsageFlagBits::eTransferDst, {0});
+      const vk::BufferCopy copy{offset, 0, sizeof(new_value)};
+      scheduler.Current().Handle().copyBuffer(remapped->Handle(), readback.buffer,
+                                              1, &copy);
+      vk::BufferMemoryBarrier barrier{};
+      barrier.sType = vk::StructureType::eBufferMemoryBarrier;
+      barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.buffer = readback.buffer;
+      barrier.size = readback.size;
+      scheduler.Current().Handle().pipelineBarrier(
+          vk::PipelineStageFlagBits::eTransfer,
+          vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0,
+          nullptr);
+      scheduler.Finish();
+      const auto uploaded = ReadBuffer(name, readback, 1)[0];
+      DestroyBuffer(&readback);
+      Require(name, "remapped buffer contents", uploaded == new_value,
+              "GPU upload reused stale bytes from before the unmap");
+
+      (void)buffers.ObtainBuffer(base, sizeof(new_value), true, false);
+      buffers.FillBuffer(base, sizeof(new_value), old_value, false);
+      Require(name, "dirty buffer setup",
+              buffers.HasGpuDirtyBytesShared(base, sizeof(new_value)),
+              "native buffer write did not establish GPU ownership");
+      const auto dirty_tick = scheduler.CurrentTick();
+      context.UnmapMemory(base, page);
+      const auto dirty_tick_after = scheduler.CurrentTick();
+      const bool dirty_tick_free = scheduler.IsFree(dirty_tick);
+      const bool dirty_bytes_remain = buffers.HasGpuDirtyBytesShared(base, page);
+      const bool dirty_range_mapped = context.IsMapped(base, page);
+      // Invalidation may download the written bytes after draining the writer,
+      // so this path may submit more than the clean range's single buffer.
+      if (dirty_tick_after < dirty_tick + 1 || !dirty_tick_free ||
+          dirty_bytes_remain || dirty_range_mapped) {
+        std::printf("[host]    %s dirty unmap: tick=%" PRIu64 " -> %" PRIu64
+                    " completed=%d dirty=%d pending=%d mapped=%d\n",
+                    name, dirty_tick, dirty_tick_after, dirty_tick_free,
+                    dirty_bytes_remain, scheduler.HasPendingOperations(),
+                    dirty_range_mapped);
+      }
+      Require(name, "dirty buffer drain",
+              dirty_tick_after >= dirty_tick + 1 && dirty_tick_free &&
+                  !dirty_bytes_remain && !dirty_range_mapped,
+              "dirty unmap skipped its native drain or retained stale ownership");
+
+      // Keep this image on a separate page and never bind it through a buffer,
+      // so image registration alone has to retain the drain.
+      constexpr uint64_t image_address = base + page;
+      constexpr uint64_t image_size = 0x1000;
+      auto desc = MakeLinearDesc(
+          image_address, image_size, vk::Format::eR32Uint,
+          Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+          {32, 32, 1}, 1, 4, 1);
+      const auto image_id = textures.FindImage(desc);
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      scheduler.PopPendingOperations(true);
+      Require(name, "registered image boundaries",
+              image_id &&
+                  textures.IsRegionRegistered(image_address, 1) &&
+                  textures.IsRegionRegistered(image_address + image_size - 1, 1) &&
+                  !textures.IsRegionRegistered(image_address - 1, 1) &&
+                  !textures.IsRegionRegistered(image_address + image_size, 1) &&
+                  textures.IsRegionRegistered(image_address - 1, image_size + 2) &&
+                  !buffers.IsRegionRegistered(image_address, page) &&
+                  !buffers.HasGpuDirtyBytesShared(image_address, page) &&
+                  !scheduler.HasPendingOperations(),
+              "image overlap query or isolated image-only setup is incorrect");
+      const auto image_tick = scheduler.CurrentTick();
+      context.UnmapMemory(image_address + image_size / 2, image_size / 2);
+      Require(name, "partial cached image drain",
+              scheduler.CurrentTick() == image_tick + 1 &&
+                  scheduler.IsFree(image_tick) &&
+                  !textures.IsRegionRegistered(image_address, image_size) &&
+                  !TextureCacheTestAccess::Contains(textures, image_id),
+              "partial image unmap skipped its drain or kept a stale image");
+      context.UnmapMemory(image_address, page);
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+    });
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "unmap test direct-memory mapping release failed");
+    Require(name, "free direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "unmap test direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
   }
 
   void CheckUnifiedImageViewCache() {
@@ -6379,6 +6682,236 @@ public:
             "retiring a depth owner left an accepted stencil association");
     TextureCacheTestAccess::DeleteImage(cache, other);
     scheduler.Finish();
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  void CheckSharedHtileLifecycle() {
+    constexpr const char *name = "SharedHtileLifecycle";
+    constexpr uintptr_t base = 0x0000000200600000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "HTile fixture direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 && mapped == reinterpret_cast<void *>(base),
+            "HTile fixture direct-memory mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    {
+      LibKernel::Memory::InstallGpuResources(&context);
+      context.MapMemory(base, allocation_size);
+      auto &texture_cache = context.GetTextureCache();
+      auto MakeMetadataDepth = [&](uint64_t data, uint64_t metadata) {
+        auto desc = MakeLinearDesc(
+            base + data, sizeof(uint32_t), vk::Format::eD32Sfloat,
+            Prospero::BufferFormat::k32Float, Prospero::ImageType::kColor2D,
+            {1, 1, 1}, 1, 4, 1);
+        desc.type = BindingType::DepthTarget;
+        desc.info.metadata.kind = ImageMetadataKind::Htile;
+        desc.info.metadata.range = {base + metadata, 0x80};
+        desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+        desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+        return desc;
+      };
+      // Dynamic target allocations can coexist while sharing the same HTile.
+      // Retiring either allocation must not replay an already consumed clear or
+      // discard the fill used by the remaining depth/stencil target.
+      for (uint32_t retire_first = 0; retire_first < 2; ++retire_first) {
+        constexpr uint64_t shared_metadata = 0x13200;
+        constexpr uint32_t shared_fill = 0x7f03f30fu;
+        std::array shared_depths{MakeMetadataDepth(0x12400, shared_metadata),
+                                 MakeMetadataDepth(0x12500, shared_metadata)};
+        shared_depths[0].info.htile_clear_mask = 0;
+        shared_depths[1].info.metadata.range.size = 0x100;
+        std::array shared_ids{texture_cache.FindImage(shared_depths[0]),
+                              texture_cache.FindImage(shared_depths[1])};
+        for (uint32_t index = 0; index < shared_ids.size(); ++index) {
+          Require(name, "shared HTile depth binding",
+                  texture_cache.FindDepthTarget(shared_ids[index],
+                                                shared_depths[index]) != nullptr,
+                  "shared HTile fixture could not bind its depth image");
+        }
+        Require(name, "shared HTile consumed clear fixture",
+                texture_cache.ClearMeta(base + shared_metadata, shared_fill) &&
+                    texture_cache.TouchMeta(base + shared_metadata, 0, false) &&
+                    texture_cache.MetaSize(base + shared_metadata) == 0x100,
+                "shared HTile clear/fill or largest binding was not recorded");
+        texture_cache.UnmapMemory(shared_depths[retire_first].info.data.address,
+                                  shared_depths[retire_first].info.data.size);
+        const uint32_t remaining = 1 - retire_first;
+        Require(name, "shared HTile owner retirement",
+                !TextureCacheTestAccess::Contains(texture_cache,
+                                                  shared_ids[retire_first]) &&
+                    TextureCacheTestAccess::Contains(texture_cache,
+                                                     shared_ids[remaining]) &&
+                    texture_cache.IsMeta(base + shared_metadata) &&
+                    !texture_cache.IsMetaCleared(base + shared_metadata, 0) &&
+                    texture_cache.IsMetaCleared(base + shared_metadata, 1) &&
+                    texture_cache.MetaFillValue(base + shared_metadata) ==
+                        shared_fill &&
+                    texture_cache.MetaSize(base + shared_metadata) == 0x100,
+                "retiring one depth allocation erased shared HTile clear/fill state");
+        (void)texture_cache.FindDepthTarget(shared_ids[remaining],
+                                           shared_depths[remaining]);
+        Require(name, "shared HTile rebind preserves consumed clear",
+                !texture_cache.IsMetaCleared(base + shared_metadata, 0) &&
+                    texture_cache.IsMetaCleared(base + shared_metadata, 1) &&
+                    texture_cache.MetaFillValue(base + shared_metadata) == shared_fill,
+                "rebinding the surviving depth allocation resurrected a consumed clear");
+        // Merely discovering another image does not give it a metadata binding.
+        auto unbound_depth = MakeMetadataDepth(0x12600, shared_metadata);
+        const auto unbound_id = texture_cache.FindImage(unbound_depth);
+        texture_cache.UnmapMemory(unbound_depth.info.data.address,
+                                  unbound_depth.info.data.size);
+        Require(name, "unbound HTile image retirement",
+                !TextureCacheTestAccess::Contains(texture_cache, unbound_id) &&
+                    !texture_cache.IsMetaCleared(base + shared_metadata, 0) &&
+                    texture_cache.MetaFillValue(base + shared_metadata) == shared_fill,
+                "an image without a depth binding erased another image's HTile");
+        texture_cache.UnmapMemory(shared_depths[remaining].info.data.address,
+                                  shared_depths[remaining].info.data.size);
+        Require(name, "shared HTile final owner retirement",
+                !texture_cache.IsMeta(base + shared_metadata) &&
+                    texture_cache.MetaSize(base + shared_metadata) == 0 &&
+                    !texture_cache.MetaFillValue(base + shared_metadata),
+                "retiring the final depth owner retained stale HTile state");
+      }
+
+      // Explicitly unmapping HTile bytes invalidates their state, even though
+      // depth pixels stay mapped. Exercise the base, an interior subrange, and
+      // an overlapping prefix; a byte immediately after the range is disjoint.
+      for (uint32_t unmap_case = 0; unmap_case < 3; ++unmap_case) {
+        constexpr uint64_t explicit_metadata = 0x13400;
+        auto old_depth = MakeMetadataDepth(0x12400, explicit_metadata);
+        auto live_depth = MakeMetadataDepth(0x12500, explicit_metadata);
+        live_depth.info.metadata.range.size = 0x100;
+        const auto old_id = texture_cache.FindImage(old_depth);
+        const auto live_id = texture_cache.FindImage(live_depth);
+        (void)texture_cache.FindDepthTarget(old_id, old_depth);
+        (void)texture_cache.FindDepthTarget(live_id, live_depth);
+        Require(name, "explicit HTile unmap fixture",
+                texture_cache.ClearMeta(base + explicit_metadata, 0x31415926u) &&
+                    texture_cache.TouchMeta(base + explicit_metadata, 0, false),
+                "explicit HTile unmap fixture was not initialized");
+        texture_cache.UnmapMemory(base + explicit_metadata + 0x100, 4);
+        Require(name, "HTile unmap end is exclusive",
+                texture_cache.MetaFillValue(base + explicit_metadata) == 0x31415926u &&
+                    !texture_cache.IsMetaCleared(base + explicit_metadata, 0),
+                "a disjoint unmap discarded HTile state");
+        const uint64_t unmap_address = unmap_case == 2
+            ? base + explicit_metadata - 4
+            : base + explicit_metadata + (unmap_case == 1 ? 0x80 : 0);
+        texture_cache.UnmapMemory(unmap_address, unmap_case == 2 ? 8 : 4);
+        Require(name, "explicit shared HTile range unmap",
+                TextureCacheTestAccess::Contains(texture_cache, old_id) &&
+                    TextureCacheTestAccess::Contains(texture_cache, live_id) &&
+                    !texture_cache.IsMeta(base + explicit_metadata) &&
+                    !texture_cache.MetaFillValue(base + explicit_metadata),
+                "unmapping HTile bytes retained stale state or retired disjoint depth pixels");
+        (void)texture_cache.FindDepthTarget(live_id, live_depth);
+        Require(name, "HTile rebind after explicit metadata unmap",
+                texture_cache.IsMetaCleared(base + explicit_metadata, 0) &&
+                    !texture_cache.MetaFillValue(base + explicit_metadata) &&
+                    texture_cache.ClearMeta(base + explicit_metadata, 0x76543210u) &&
+                    texture_cache.TouchMeta(base + explicit_metadata, 0, false),
+                "metadata rebind reused state from the unmapped allocation");
+        texture_cache.UnmapMemory(old_depth.info.data.address, old_depth.info.data.size);
+        Require(name, "old HTile owner after metadata re-registration",
+                !texture_cache.IsMetaCleared(base + explicit_metadata, 0) &&
+                    texture_cache.MetaFillValue(base + explicit_metadata) == 0x76543210u,
+                "an old metadata owner erased newly registered HTile state");
+        texture_cache.UnmapMemory(live_depth.info.data.address, live_depth.info.data.size);
+        Require(name, "re-registered HTile final owner retirement",
+                !texture_cache.IsMeta(base + explicit_metadata),
+                "final owner retirement left re-registered HTile state behind");
+      }
+
+      // The cached depth image may bind a different HTile (including a subaddress)
+      // or no HTile at all. Ownership must follow that binding independently of
+      // image.info.metadata, and repeated binds must not add duplicate owners.
+      {
+        constexpr uint64_t old_metadata = 0x13600;
+        constexpr uint64_t new_metadata = old_metadata + 0x40;
+        auto first_desc = MakeMetadataDepth(0x12400, old_metadata);
+        auto second_desc = MakeMetadataDepth(0x12500, old_metadata);
+        const auto first_id = texture_cache.FindImage(first_desc);
+        const auto second_id = texture_cache.FindImage(second_desc);
+        (void)texture_cache.FindDepthTarget(first_id, first_desc);
+        (void)texture_cache.FindDepthTarget(second_id, second_desc);
+        Require(name, "HTile retarget fixture",
+                texture_cache.ClearMeta(base + old_metadata, 0x12345678u) &&
+                    texture_cache.TouchMeta(base + old_metadata, 0, false),
+                "retarget fixture did not record its consumed clear");
+        first_desc.info.metadata.range = {base + new_metadata, 0x40};
+        (void)texture_cache.FindDepthTarget(first_id, first_desc);
+        (void)texture_cache.FindDepthTarget(first_id, first_desc);
+        Require(name, "HTile binding moves to subaddress",
+                !texture_cache.IsMetaCleared(base + old_metadata, 0) &&
+                    texture_cache.MetaFillValue(base + old_metadata) == 0x12345678u &&
+                    texture_cache.IsMetaCleared(base + new_metadata, 0) &&
+                    !texture_cache.MetaFillValue(base + new_metadata) &&
+                    texture_cache.ClearMeta(base + new_metadata, 0x87654321u) &&
+                    texture_cache.TouchMeta(base + new_metadata, 0, false),
+                "retargeting lost the other owner's state or reused the old clear");
+        auto no_metadata = first_desc;
+        no_metadata.info.metadata = {};
+        (void)texture_cache.FindDepthTarget(first_id, no_metadata);
+        Require(name, "HTile binding removed",
+                !texture_cache.IsMeta(base + new_metadata) &&
+                    !texture_cache.IsMetaCleared(base + old_metadata, 0) &&
+                    texture_cache.MetaFillValue(base + old_metadata) == 0x12345678u,
+                "binding without HTile retained stale ownership or erased another owner");
+        (void)texture_cache.FindDepthTarget(first_id, first_desc);
+        Require(name, "HTile binding restored",
+                texture_cache.IsMetaCleared(base + new_metadata, 0) &&
+                    !texture_cache.MetaFillValue(base + new_metadata) &&
+                    texture_cache.ClearMeta(base + new_metadata, 0xabcdef01u) &&
+                    texture_cache.TouchMeta(base + new_metadata, 0, false),
+                "restoring HTile reused the removed binding's state");
+        second_desc.info.metadata = first_desc.info.metadata;
+        (void)texture_cache.FindDepthTarget(second_id, second_desc);
+        Require(name, "last HTile owner retargeted",
+                !texture_cache.IsMeta(base + old_metadata) &&
+                    !texture_cache.IsMetaCleared(base + new_metadata, 0) &&
+                    texture_cache.MetaFillValue(base + new_metadata) == 0xabcdef01u,
+                "last-owner retarget retained old state or reset its new shared state");
+        texture_cache.UnmapMemory(first_desc.info.data.address, first_desc.info.data.size);
+        Require(name, "retargeted HTile owner retired",
+                !texture_cache.IsMetaCleared(base + new_metadata, 0) &&
+                    texture_cache.MetaFillValue(base + new_metadata) == 0xabcdef01u,
+                "retiring a retargeted owner erased the surviving shared binding");
+        texture_cache.UnmapMemory(second_desc.info.data.address, second_desc.info.data.size);
+        Require(name, "retargeted final HTile owner retired",
+                !texture_cache.IsMeta(base + old_metadata) &&
+                    !texture_cache.IsMeta(base + new_metadata),
+                "retargeting or repeated binds left stale HTile ownership");
+      }
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "HTile fixture mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "HTile fixture allocation release failed");
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -19124,6 +19657,9 @@ public:
                 case_index, format_cases);
   }
 
+#include "PssrGpuTests.inc"
+#include "PssrNativeGpuTests.inc"
+
 private:
   bool m_rasterization_supported = true;
   u32   m_skipped_cases          = 0;
@@ -19211,6 +19747,17 @@ private:
     vk::InstanceCreateInfo instance_info{};
     instance_info.sType = vk::StructureType::eInstanceCreateInfo;
     instance_info.pApplicationInfo = &app;
+    std::vector<const char *> instance_extensions;
+    if (g_native_pssr_integration) {
+      const auto available = vk::enumerateInstanceExtensionProperties();
+      RequireVk("PssrNative", "instance extensions", available.result,
+                "vkEnumerateInstanceExtensionProperties");
+      Gt7DlssHost::AddInstanceExtensions(instance_extensions, available.value);
+      Require("PssrNative", "backend ABI", Gt7DlssHost::ApiPssr() != nullptr,
+              "set absolute KYTY_GT7_DLSS_BACKEND and KYTY_GT7_DLSS_RUNTIME paths");
+      instance_info.enabledExtensionCount = static_cast<u32>(instance_extensions.size());
+      instance_info.ppEnabledExtensionNames = instance_extensions.data();
+    }
     RequireVk("VulkanHarness", "dispatch",
               vk::createInstance(&instance_info, nullptr, &m_instance),
               "vkCreateInstance");
@@ -19229,6 +19776,7 @@ private:
               "vkEnumeratePhysicalDevices");
 
     for (auto physical : physical_devices) {
+      if (g_native_pssr_integration && physical.getProperties().vendorID != 0x10de) continue;
       u32 queue_count = 0;
       physical.getQueueFamilyProperties(&queue_count, nullptr);
       std::vector<vk::QueueFamilyProperties> queues(queue_count);
@@ -19448,6 +19996,20 @@ private:
       device_extensions.push_back(
           VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
+    }
+    if (g_native_pssr_integration) {
+      m_runtime_context.instance = m_instance;
+      m_runtime_context.physical_device = m_physical_device;
+      Gt7DlssHost::AddDeviceExtensions(m_runtime_context, device_extensions);
+      device_features.shaderStorageImageExtendedFormats = available_features.shaderStorageImageExtendedFormats;
+      m_runtime_context.gt7_dlss_feature_flags =
+          (device_features12.bufferDeviceAddress ? KYTY_DLSS_FEATURE_BUFFER_DEVICE_ADDRESS : 0u) |
+          (device_features.shaderInt64 ? KYTY_DLSS_FEATURE_SHADER_INT64 : 0u);
+      Require("PssrNative", "device feature contract",
+              m_runtime_context.gt7_dlss_device_enabled && device_features.shaderStorageImageExtendedFormats &&
+              m_runtime_context.gt7_dlss_feature_flags ==
+                  (KYTY_DLSS_FEATURE_BUFFER_DEVICE_ADDRESS | KYTY_DLSS_FEATURE_SHADER_INT64),
+              "production native DLSS device requirements are unavailable");
     }
     device_info.enabledExtensionCount =
         static_cast<uint32_t>(device_extensions.size());
@@ -37161,6 +37723,64 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
                            assembly.find("SpacingFractionalOdd") != std::string::npos &&
                            assembly.find("VertexOrderCw") != std::string::npos),
             "TES must preserve guest triangle domain, partitioning, and winding");
+    const auto keys = [](const ShaderVertexInputInfo &input) {
+      std::vector<u32> memory;
+      BuildStageStaticKey(input, memory);
+      ShaderDiskCache::ByteWriter disk;
+      ShaderDiskCache::AppendInputKey(disk, input);
+      return std::pair{memory, disk.bytes};
+    };
+    const auto key = keys(vertex);
+    using Layout = ShaderTessellationInputInfo;
+    struct Field {
+      u32 Layout::*member;
+      u32 value;
+      const char *stages; // Local, Hull/control, Tessellation evaluation.
+    };
+    const Field fields[] = {
+        {&Layout::input_control_points, 4, "H"},
+        {&Layout::output_control_points, 4, "HT"},
+        {&Layout::ls_stride, tess.ls_stride + 16, "LH"},
+        {&Layout::hs_stride, tess.hs_stride + 16, "HT"},
+        {&Layout::patch_base, tess.patch_base + 16, "HT"},
+        {&Layout::patch_size, tess.patch_size + 16, "HT"},
+        {&Layout::domain, 2, "HT"},
+        {&Layout::partitioning, 3, "T"},
+        {&Layout::output_topology, 3, "T"},
+        {&Layout::min_level_bits, std::bit_cast<u32>(1.0f), "H"},
+        {&Layout::max_level_bits, std::bit_cast<u32>(8.0f), "H"},
+    };
+    for (const auto &field : fields) {
+      auto changed = vertex;
+      changed.tess.*field.member = field.value;
+      const bool depends = std::strchr(field.stages, "LHT"[stage]) != nullptr;
+      const auto changed_keys = keys(changed);
+      Require(name, "stage cache identity",
+              (changed_keys.first != key.first) == depends &&
+                  (changed_keys.second != key.second) == depends,
+              "memory and disk cache keys must use only the stage's tessellation inputs");
+      if (!depends) {
+        auto changed_options = options;
+        changed_options.input_info.vertex = &changed;
+        auto changed_ir = TranslateProgram(code[stage], changed_options);
+        const auto changed_program = CompileProgram(std::move(changed_ir), changed_options, {});
+        Require(name, "unchanged stage code", changed_program.spirv == result.spirv,
+                "a removed layout field changed the emitted tessellation module");
+      }
+    }
+    if (stages[stage] == ShaderType::TessellationControl) {
+      auto clamped = vertex;
+      clamped.tess.min_level_bits = std::bit_cast<u32>(1.0f);
+      clamped.tess.max_level_bits = std::bit_cast<u32>(8.0f);
+      auto clamped_options = options;
+      clamped_options.input_info.vertex = &clamped;
+      auto clamped_ir = TranslateProgram(code[stage], clamped_options);
+      const auto clamped_program = CompileProgram(std::move(clamped_ir), clamped_options, {});
+      ValidateSpirv(name, clamped_program.spirv);
+      Require(name, "factor-clamp specialization",
+              keys(clamped) != key && clamped_program.spirv != result.spirv,
+              "the local HS factor clamp must keep its own shader specialization");
+    }
   }
   std::printf("[host]    %-32s ok\n", name);
 }
@@ -42681,13 +43301,30 @@ void CheckPm4CeCompletion(RenderContext &renderer) {
 } // namespace
 } // namespace Libs::Graphics
 
+void RunPssrDlssContractTests();
+
 int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   SetProbeSetting();
+  const bool native_pssr_1080_4k = argc == 2 &&
+      std::strcmp(argv[1], "--pssr-dlss-1080-4k-integration") == 0;
+  g_native_pssr_integration = native_pssr_1080_4k ||
+      (argc == 2 && std::strcmp(argv[1], "--pssr-dlss-integration") == 0);
+  if (g_native_pssr_integration) InitializeNativePssrDriverForTest();
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (g_native_pssr_integration) {
+    VulkanHarness vulkan;
+    if (native_pssr_1080_4k) vulkan.CheckPssrNative1080To4K();
+    else vulkan.CheckPssrNative();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--pssr-contract-only") == 0) {
+    RunPssrDlssContractTests();
+    return 0;
+  }
   // Without a GPU: every case translated, compiled and its SPIR-V validated, for NVIDIA's host
   // subgroup of 32 (a wave64 as two lanes per invocation) and for 64. The text and count
   // expectations are left out: some depend on the device the harness creates. Round 98: and
@@ -43170,6 +43807,11 @@ int main(int argc, char **argv) {
     CheckPm4CeCompletion(vulkan.RuntimeRenderer());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--pssr-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckPssr();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--suspend-point-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuSuspendPoint();
@@ -43343,6 +43985,11 @@ int main(int argc, char **argv) {
     vulkan.CheckRasterization(false);
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k11_11_10Float);
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--shared-htile-lifecycle-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckSharedHtileLifecycle();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--htile-clear-only") == 0) {
@@ -43599,6 +44246,7 @@ int main(int argc, char **argv) {
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);
   vulkan.CheckGt7WriteGuard();
+  vulkan.CheckSharedHtileLifecycle();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();

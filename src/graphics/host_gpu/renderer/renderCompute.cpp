@@ -1089,11 +1089,12 @@ static void NotePatternFill(PatternFillOutcome outcome) {
 static void CheckGt7DlssConsumedWrite(RenderContext& context, uint64_t shader,
                                       const char* kind, GuestRange range, ImageId image_id = {}) {
 	auto* dlss = context.GetGt7Dlss();
-	if (!dlss || (!dlss->Active() && !dlss->WatchesFrameGenerationOutput())) return;
+	if (!dlss || (!dlss->Active() && !dlss->WatchesFrameGenerationOutput() && !dlss->WatchesFrameGenerationInputs())) return;
 	RenderColorInfo target {};
 	target.image_id = image_id;
 	target.desc.info.data = range;
 	const bool affected = dlss->MatchesScene(target) ||
+	                      dlss->MatchesFrameGenerationInput(target) ||
 	                      dlss->MatchesFrameGenerationOutput(target) ||
 	                      dlss->MatchesWatchedWriteRange(range);
 	static uint64_t accepted = 0, rejected = 0;
@@ -1104,7 +1105,7 @@ static void CheckGt7DlssConsumedWrite(RenderContext& context, uint64_t shader,
 		     affected ? "rejected" : "unrelated", static_cast<unsigned long long>(count),
 		     kind, shader, range.address, range.size, image_id.index, image_id.generation);
 	}
-	if (affected) dlss->CancelFrame("consumed compute write affects watched scene or output");
+	if (affected) dlss->CancelFrameForWrite(target, "consumed compute write affects watched scene or output");
 }
 
 bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
@@ -1534,7 +1535,7 @@ static void CheckGt7DlssComputeWrites(RenderContext& context, const ShaderComput
                                      uint32_t group_y, uint32_t group_z, uint32_t mode,
                                      bool indirect = false) {
 	auto* dlss = context.GetGt7Dlss();
-	if (!dlss || (!dlss->Active() && !dlss->WatchesFrameGenerationOutput())) return;
+	if (!dlss || (!dlss->Active() && !dlss->WatchesFrameGenerationOutput() && !dlss->WatchesFrameGenerationInputs())) return;
 	const auto& runtime = input.stage;
 	const auto& program = *runtime.program;
 	const auto reject_buffer = [&](const char* reason, uint32_t resource, GuestRange raw,
@@ -1549,7 +1550,8 @@ static void CheckGt7DlssComputeWrites(RenderContext& context, const ShaderComput
 			     raw.address, raw.size, actual.address, actual.size, group_x, group_y, group_z,
 			     mode, indirect ? 1u : 0u, reason);
 		}
-		dlss->CancelFrame(reason);
+		if (actual.Valid()) dlss->CancelFrameForWrite(actual, reason);
+		else dlss->CancelFrame(reason);
 	};
 	if (runtime.program->has_address_writes) {
 		dlss->CancelFrame("compute writes through unbounded addresses");
@@ -1560,9 +1562,10 @@ static void CheckGt7DlssComputeWrites(RenderContext& context, const ShaderComput
 		RenderColorInfo target {};
 		target.image_id = bindings.images[i].image_id;
 		target.desc = bindings.images[i].desc;
-		if (dlss->MatchesScene(target) || dlss->MatchesFrameGenerationOutput(target)) {
-			dlss->CancelFrame("compute writes the temporal scene");
-			return;
+		if (dlss->MatchesScene(target) || dlss->MatchesFrameGenerationOutput(target) ||
+		    dlss->MatchesFrameGenerationInput(target)) {
+			dlss->CancelFrameForWrite(target, "compute writes the temporal scene");
+			// Other written resources can affect a different completed output.
 		}
 	}
 	// Use exactly the ranges FindBuffers resolved for the live binding layout. Raw
@@ -1594,13 +1597,14 @@ static void CheckGt7DlssComputeWrites(RenderContext& context, const ShaderComput
 		const GuestRange actual {source.address, source.size};
 		if (!source.id || !actual.Valid()) {
 			reject_buffer("compute resolved buffer range is invalid", resource, raw, actual);
+			dlss->CancelFrame("compute resolved buffer identity cannot bound the write");
 			return;
 		}
 		if (dlss->MatchesWatchedWriteRange(actual)) {
-			if (!indirect && resource == 1 && dlss->PreservesFrameGenerationMetadata(
+			if (!dlss->WatchesFrameGenerationInputs() && !indirect && resource == 1 && dlss->PreservesFrameGenerationMetadata(
 			        input, bindings, group_x, group_y, group_z, mode)) continue;
 			reject_buffer("compute buffer aliases the temporal scene", resource, raw, actual);
-			return;
+			// Continue validating all writes, including other candidate outputs.
 		}
 	}
 }
@@ -2122,10 +2126,10 @@ void RenderExecutor::DispatchIndirectPart(uint64_t submit_id, CommandBuffer& buf
 		return;
 	}
 	// Empty dispatch whose arguments no GPU write can still change: nothing to prepare (no program
-	// lookup, bindings or argument sync). Read from the backing only when no byte is GPU-dirty and
+	// lookup, bindings or argument sync). Read from the backing only when every byte is published and
 	// no command storing through shader addresses (which marks no range) is still on the GPU.
 	if (vk::DispatchIndirectCommand skip_args {};
-	    !m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(skip_args)) &&
+	    m_context.GetBufferCache().IsCleanForConcurrentRead(args_addr, sizeof(skip_args)) &&
 	    !m_context.GetBufferCache().AddressWritesInFlight() &&
 	    Libs::LibKernel::Memory::TryReadBacking(args_addr, &skip_args, sizeof(skip_args)) &&
 	    (skip_args.x == 0 || skip_args.y == 0 || skip_args.z == 0)) {

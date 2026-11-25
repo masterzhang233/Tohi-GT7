@@ -15,10 +15,11 @@ namespace Libs::Graphics::Gt7DlssHost {
 namespace {
 struct Backend {
     KytyDlssApi api {};
+    KytyDlssPssrApi pssr_api {};
     KytyDlssPaths paths {sizeof(KytyDlssPaths), nullptr, nullptr};
     std::wstring runtime, logs;
     KytyDlssExtensions instance_extensions {sizeof(KytyDlssExtensions)};
-    bool loaded = false, instance_ready = false;
+    bool loaded = false, pssr_loaded = false, instance_ready = false;
     Backend() {
         if (!Requested()) return;
 #if defined(_WIN32)
@@ -52,6 +53,21 @@ struct Backend {
                 return;
             }
             loaded = true;
+            if (Config::PssrDlssEnabled()) {
+                const auto get_pssr = reinterpret_cast<PFN_KytyDlssGetPssrApi>(
+                    GetProcAddress(module, "KytyDlssGetPssrApi"));
+                pssr_api.struct_size = sizeof(pssr_api);
+                pssr_loaded = get_pssr &&
+                    get_pssr(KYTY_DLSS_PSSR_ABI_VERSION, &pssr_api) == KYTY_DLSS_OK &&
+                    pssr_api.struct_size == sizeof(pssr_api) &&
+                    pssr_api.abi_version == KYTY_DLSS_PSSR_ABI_VERSION &&
+                    pssr_api.create_session && pssr_api.query_optimal &&
+                    pssr_api.create_feature && pssr_api.record_evaluate &&
+                    pssr_api.destroy_feature && pssr_api.destroy_session;
+                LOGF("PSSR DLSS: %s\n", pssr_loaded
+                    ? "backend extension ready; waiting for native PSSR requests (SR-only experiment)"
+                    : "backend lacks the native PSSR extension; DLSS unavailable, PSSR uses spatial fallback");
+            }
         } catch (const std::exception& error) {
             LOGF("GT7 DLSS disabled: %s\n", error.what());
         }
@@ -80,9 +96,11 @@ bool Valid(const KytyDlssExtensions& extensions) {
 } // namespace
 bool Requested() {
     const auto* value = std::getenv("KYTY_GT7_DLSS");
-    return value && std::strcmp(value, "1") == 0 && !Config::VrEnabled();
+    return !Config::VrEnabled() && (Config::PssrDlssEnabled() ||
+        (value && std::strcmp(value, "1") == 0));
 }
 const KytyDlssApi* Api() { return State().loaded ? &State().api : nullptr; }
+const KytyDlssPssrApi* ApiPssr() { return State().pssr_loaded ? &State().pssr_api : nullptr; }
 const KytyDlssPaths& Paths() { return State().paths; }
 void AddInstanceExtensions(std::vector<const char*>& required,
                            const std::vector<vk::ExtensionProperties>& available) {

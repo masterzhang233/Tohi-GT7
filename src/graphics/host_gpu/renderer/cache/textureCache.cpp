@@ -1199,6 +1199,48 @@ void TextureCache::UnregisterImage(ImageId id) {
 	NoteImageChurn(image, false);
 }
 
+void TextureCache::UnregisterHtileOwner(ImageId id) {
+	const auto owner = m_image_htile_metas.find(id);
+	if (owner == m_image_htile_metas.end()) {
+		return;
+	}
+	const auto address = owner->second;
+	m_image_htile_metas.erase(owner);
+	const auto metadata = m_surface_metas.find(address);
+	if (metadata == m_surface_metas.end() || metadata->second.type != MetaDataInfo::Type::HTile) {
+		return;
+	}
+	std::erase(metadata->second.owners, id);
+	if (metadata->second.owners.empty()) {
+		m_surface_metas.erase(metadata);
+	}
+}
+
+void TextureCache::RegisterHtileOwner(ImageId id, const ImageInfo& info) {
+	const bool has_htile = info.HasMetadata() && info.metadata.kind == ImageMetadataKind::Htile;
+	const auto owner = m_image_htile_metas.find(id);
+	if (owner != m_image_htile_metas.end() &&
+	    (!has_htile || owner->second != info.metadata.range.address)) {
+		UnregisterHtileOwner(id);
+	}
+	if (!has_htile) {
+		return;
+	}
+	const auto address = info.metadata.range.address;
+	const auto [metadata, inserted] =
+	    m_surface_metas.try_emplace(address, MetaDataInfo {.type = MetaDataInfo::Type::HTile,
+	                                                      .clear_mask = info.htile_clear_mask});
+	(void)inserted;
+	if (metadata->second.type != MetaDataInfo::Type::HTile) {
+		return;
+	}
+	// A narrower binding must not shrink the tracked allocation or reset consumed clears.
+	metadata->second.size = std::max(metadata->second.size, info.metadata.range.size);
+	if (m_image_htile_metas.try_emplace(id, address).second) {
+		metadata->second.owners.push_back(id);
+	}
+}
+
 void TextureCache::DeleteImage(ImageId id) {
 	auto* image = m_slot_images.try_get(id);
 	if (image == nullptr || !image->registered) {
@@ -1225,15 +1267,7 @@ void TextureCache::DeleteImage(ImageId id) {
 		m_read_only_aliases--;
 	}
 	m_download_images.erase(id);
-	if (image->info.HasMetadata()) {
-		const auto metadata = m_surface_metas.find(image->info.metadata.range.address);
-		if (metadata != m_surface_metas.end() &&
-		    image->info.metadata.kind == ImageMetadataKind::Htile &&
-		    metadata->second.type == MetaDataInfo::Type::HTile) {
-			// A later binding may have reused this address for another metadata type.
-			m_surface_metas.erase(metadata);
-		}
-	}
+	UnregisterHtileOwner(id);
 	UnregisterImage(id);
 	// Also between guest command buffers (a guest unmap runs there): command buffers submitted
 	// earlier may still be sampling the image on the GPU. Destroying it at once let them read
@@ -4278,15 +4312,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	}
 	image.info.stencil = desc.info.stencil;
 	image.info.metadata = desc.info.metadata;
-	if (desc.info.HasMetadata()) {
-		const auto [meta, inserted] =
-		    m_surface_metas.emplace(desc.info.metadata.range.address,
-		                            MetaDataInfo {.type       = MetaDataInfo::Type::HTile,
-		                                          .clear_mask = image.info.htile_clear_mask});
-		(void)inserted;
-		// The largest binding's: a binding of fewer slices has a smaller HTile range.
-		meta->second.size = std::max(meta->second.size, desc.info.metadata.range.size);
-	}
+	RegisterHtileOwner(id, image.info);
 	RefreshImage(id);
 	CommitGpuWrite(image);
 	if (desc.info.HasStencil()) {
@@ -4359,36 +4385,72 @@ void TextureCache::CommitGpuWrite(Image& image) {
 	}
 }
 
-bool TextureCache::WriteOverlapsImage(GuestRange write, ImageId watched, GuestRange watched_range) {
-	if (!write.Valid() || !watched_range.Valid() || !watched) return true;
-	if (ImageRangeOverlaps(write, watched_range)) return true;
+bool TextureCache::WriteOverlapsImage(GuestRange write, ImageId watched, GuestRange watched_range,
+                                     WriteOverlapDiagnostic* diagnostic) {
+	if (diagnostic != nullptr) *diagnostic = {};
+	const auto overlap = [diagnostic](const char* reason, const char* source, ImageId id,
+	                                  const Image* image = nullptr, ImageId via = {}) {
+		if (diagnostic != nullptr) {
+			diagnostic->reason = reason;
+			diagnostic->source = source;
+			diagnostic->image = id;
+			diagnostic->via = via;
+			if (image != nullptr) {
+				diagnostic->data = image->info.data;
+				diagnostic->stencil = image->info.stencil;
+				diagnostic->metadata = image->info.metadata.range;
+				diagnostic->metadata_kind = image->info.metadata.kind;
+				diagnostic->present = true;
+				diagnostic->registered = image->registered;
+			}
+		}
+		return true;
+	};
+	if (!write.Valid()) return overlap("invalid-write-range", "request", watched);
+	if (!watched_range.Valid()) return overlap("invalid-watched-range", "request", watched);
+	if (!watched) return overlap("invalid-watched-id", "request", watched);
+	if (ImageRangeOverlaps(write, watched_range)) return overlap("direct-watched-bytes", "request", watched);
 	std::scoped_lock lock {m_lock};
-	const auto overlaps_info = [write](const ImageInfo& info) {
-		if (!info.data.Valid() || (info.HasMetadata() && info.metadata.range.Empty())) return true;
+	const auto overlaps_info = [&](const Image& image, const char* source, ImageId id, ImageId via = {}) {
+		const auto& info = image.info;
+		if (!info.data.Valid()) return overlap("invalid-data-range", source, id, &image, via);
+		if (info.HasMetadata() && info.metadata.range.Empty())
+			return overlap("unknown-metadata-range", source, id, &image, via);
+		constexpr const char* invalid[] {"invalid-data-range", "invalid-stencil-range", "invalid-metadata-range"};
+		constexpr const char* hit[] {"data-overlap", "stencil-overlap", "metadata-overlap"};
+		size_t plane = 0;
 		for (const auto range : {info.data, info.stencil, info.metadata.range}) {
+			const auto current_plane = plane++;
 			if (range.Empty()) continue;
-			if (!range.Valid() || ImageRangeOverlaps(write, range)) return true;
+			if (!range.Valid()) return overlap(invalid[current_plane], source, id, &image, via);
+			if (ImageRangeOverlaps(write, range)) return overlap(hit[current_plane], source, id, &image, via);
 		}
 		return false;
 	};
 	const auto* image = m_slot_images.try_get(watched);
-	if (image == nullptr || !image->registered || overlaps_info(image->info)) return true;
+	if (image == nullptr) return overlap("missing-image", "watched", watched);
+	if (!image->registered) return overlap("unregistered-image", "watched", watched, image);
+	if (overlaps_info(*image, "watched", watched)) return true;
 	if (!ImageRangeOverlaps(watched_range, image->info.data) &&
 	    (!image->info.stencil.Valid() || !ImageRangeOverlaps(watched_range, image->info.stencil)))
-		return true;
+		return overlap("watched-range-not-owned", "watched", watched, image);
 	if (image->depth_id) {
 		const auto* owner = m_slot_images.try_get(image->depth_id);
-		if (owner == nullptr || !owner->registered || overlaps_info(owner->info)) return true;
+		if (owner == nullptr) return overlap("missing-image", "watched-owner", image->depth_id, nullptr, watched);
+		if (!owner->registered) return overlap("unregistered-image", "watched-owner", image->depth_id, owner, watched);
+		if (overlaps_info(*owner, "watched-owner", image->depth_id, watched)) return true;
 	}
 	// Metadata need not overlap the pixel bytes. Look at the live aliases of the
 	// watched pixels rather than only comparing the write to the presented image.
 	for (const auto id : FindImagesInRegion(watched_range.address, watched_range.size, false)) {
 		const auto* alias = m_slot_images.try_get(id);
 		if (alias == nullptr) continue;
-		if (overlaps_info(alias->info)) return true;
+		if (overlaps_info(*alias, "alias", id)) return true;
 		if (alias->depth_id) {
 			const auto* owner = m_slot_images.try_get(alias->depth_id);
-			if (owner == nullptr || !owner->registered || overlaps_info(owner->info)) return true;
+			if (owner == nullptr) return overlap("missing-image", "alias-owner", alias->depth_id, nullptr, id);
+			if (!owner->registered) return overlap("unregistered-image", "alias-owner", alias->depth_id, owner, id);
+			if (overlaps_info(*owner, "alias-owner", alias->depth_id, id)) return true;
 		}
 	}
 	return false;
@@ -6937,6 +6999,14 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	return true;
 }
 
+bool TextureCache::IsRegionRegistered(uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid()) {
+		EXIT("TextureCache: invalid registered-region query\n");
+	}
+	std::scoped_lock lock {m_lock};
+	return !FindImagesInRegion(address, size, false).empty();
+}
+
 void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid unmap range\n");
@@ -6946,7 +7016,13 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	ForgetReadbackPrefill(address, size);
 	for (auto metadata = m_surface_metas.begin(); metadata != m_surface_metas.end();) {
 		const auto base = metadata->first;
-		if (base >= address && base < address + size) {
+		const auto metadata_size = std::max<uint64_t>(metadata->second.size, 1);
+		if (base < address + size && address < base + metadata_size) {
+			// Explicitly unmapping any metadata byte invalidates every old binding. A later
+			// rebind owns a new entry even if an old depth allocation has not retired yet.
+			for (const auto owner: metadata->second.owners) {
+				m_image_htile_metas.erase(owner);
+			}
 			metadata = m_surface_metas.erase(metadata);
 		} else {
 			++metadata;

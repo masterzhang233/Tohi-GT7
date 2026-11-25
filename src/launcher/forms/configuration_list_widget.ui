@@ -17,6 +17,10 @@
    <string notr="true"/>
   </property>
   <layout class="QGridLayout" name="gridLayout">
+   <property name="leftMargin"><number>0</number></property>
+   <property name="topMargin"><number>0</number></property>
+   <property name="rightMargin"><number>0</number></property>
+   <property name="bottomMargin"><number>0</number></property>
    <item row="0" column="0">
     <layout class="QHBoxLayout" name="horizontalLayout_2">
      <property name="leftMargin">
@@ -218,13 +222,13 @@
            <property name="minimumSize">
             <size>
              <width>220</width>
-             <height>30</height>
+             <height>34</height>
             </size>
            </property>
            <property name="maximumSize">
             <size>
              <width>320</width>
-             <height>30</height>
+             <height>34</height>
             </size>
            </property>
            <property name="toolTip">

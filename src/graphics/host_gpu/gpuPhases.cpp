@@ -24,6 +24,14 @@ namespace {
 
 constexpr auto ReportInterval = std::chrono::seconds(10);
 
+bool PlaytestDiagnostics() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GT7_PERF_DIAGNOSTICS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 struct Reporter {
 	std::chrono::steady_clock::time_point last_time {};
 	uint64_t                              last_tsc    = 0;
@@ -316,7 +324,7 @@ void ReportIfDue(uint64_t frames) {
 	}
 	g_reporter.next_check = tsc + 50'000'000u;
 	const auto now        = std::chrono::steady_clock::now();
-	if (now - g_reporter.last_time < ReportInterval) {
+	if (now - g_reporter.last_time < (PlaytestDiagnostics() ? std::chrono::seconds(5) : ReportInterval)) {
 		return;
 	}
 	const double seconds = std::chrono::duration<double>(now - g_reporter.last_time).count();
@@ -386,6 +394,26 @@ void ReportIfDue(uint64_t frames) {
 		const auto n = count(per);
 		return n != 0 ? us(phase) / static_cast<double>(n) : 0.0;
 	};
+
+	if (PlaytestDiagnostics()) {
+		const auto ms = [&](Phase phase) { return us(phase) / 1000.0; };
+		const auto longest_ms = [&](Phase phase) {
+			return double(g_reporter.last_longest[static_cast<size_t>(phase)]) / cycles_per_us / 1000.0;
+		};
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "GT7 perf phases: steady_ms={:.3f} guest_frame={} window_s={:.3f} frames={} "
+		    "timed={} cpu_ms(total/max) process={:.3f}/{:.3f} command={:.3f}/{:.3f} draw={:.3f}/{:.3f} "
+		    "dispatch={:.3f}/{:.3f} shader_disk={:.3f}/{:.3f} pipeline_wait={:.3f}/{:.3f} "
+		    "pipeline_compile={:.3f}/{:.3f} pipeline_lookup_skips={} compile_skips={} "
+		    "disk_read_skips={}\n",
+		    std::chrono::duration<double, std::milli>(now.time_since_epoch()).count(), frames,
+		    seconds, new_frames, timed_frames, ms(Phase::Process), longest_ms(Phase::Process),
+		    ms(Phase::Command), longest_ms(Phase::Command),
+		    ms(Phase::Draw), longest_ms(Phase::Draw), ms(Phase::Dispatch), longest_ms(Phase::Dispatch),
+		    ms(Phase::ShaderDisk), longest_ms(Phase::ShaderDisk), ms(Phase::PipelineWait),
+		    longest_ms(Phase::PipelineWait), ms(Phase::PipelineCompile), longest_ms(Phase::PipelineCompile),
+		    count(Phase::PipelineLookupSkip), count(Phase::PipelineSkip), count(Phase::DiskReadSkip)));
+	}
 
 	std::string line = fmt::format("GPU phases ({:.1f} s)", seconds);
 	if (const auto step = Common::PerfStats::WindowConfiguration(); !step.empty()) {

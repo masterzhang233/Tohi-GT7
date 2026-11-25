@@ -3,10 +3,13 @@
 
 #include "common/abi.h"
 #include "common/common.h"
+#include "kernel/eventQueueTraceState.h"
 #include "kernel/pthread.h"
 
 #include <deque>
 #include <memory>
+
+namespace Common::EventTrace { struct CallbackContext; }
 
 namespace Libs::LibKernel::EventQueue {
 
@@ -56,6 +59,8 @@ struct KernelEqueueEvent {
 	KernelEvent             event;
 	KernelFilter            filter;
 	std::deque<KernelEvent> pending_events;
+	// Host-only bounded provenance; never part of the guest KernelEvent ABI.
+	TraceState::State trace_state;
 };
 
 [[nodiscard]] KernelEqueueRef KernelPinEqueue(KernelEqueue eq);
@@ -63,6 +68,9 @@ struct KernelEqueueEvent {
 int KYTY_SYSV_ABI KernelAddEvent(KernelEqueue eq, const KernelEqueueEvent& event);
 int KYTY_SYSV_ABI KernelTriggerEvent(KernelEqueue eq, uintptr_t ident, int16_t filter,
                                      void* trigger_data);
+// Internal diagnostic bridge; the original four-argument ABI is unchanged.
+int KernelTriggerEventTraced(KernelEqueue eq, uintptr_t ident, int16_t filter,
+                            void* trigger_data, const Common::EventTrace::CallbackContext* trace);
 int KYTY_SYSV_ABI KernelDeleteEvent(KernelEqueue eq, uintptr_t ident, int16_t filter);
 
 int KYTY_SYSV_ABI KernelCreateEqueue(KernelEqueue* eq, const char* name);

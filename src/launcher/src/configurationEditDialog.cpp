@@ -347,7 +347,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	    info.title_id.compare(QStringLiteral("PPSA01317"), Qt::CaseInsensitive) == 0 &&
 	    info.gt7_dlss_enabled;
 	if (fixed_gt7_preset) {
-		ListInit(m_ui->comboBox_screen_resolution, Configuration::Resolution::R2560X1440);
+		ListInit(m_ui->comboBox_screen_resolution, Configuration::Resolution::R3840X2160);
 	}
 	m_ui->comboBox_screen_resolution->setEnabled(!fixed_gt7_preset);
 	m_ui->lineEdit_skip_shaders->setText(info.skip_shader_hashes);

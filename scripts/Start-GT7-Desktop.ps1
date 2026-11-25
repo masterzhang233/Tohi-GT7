@@ -19,7 +19,8 @@ try {
         throw 'InstallDirectory must be the extracted Tohi-GT7 release folder.'
     }
     $required = @('launcher.exe', 'kyty_emulator.exe', 'kyty_dlss_backend.dll',
-        'nvngx_dlss.dll', 'amd_fidelityfx_vk.dll')
+        'nvngx_dlss.dll', 'sl.interposer.dll', 'sl.common.dll', 'sl.dlss_g.dll',
+        'sl.reflex.dll', 'sl.pcl.dll', 'nvngx_dlssg.dll', 'NvLowLatencyVk.dll')
     $missing = @($required | Where-Object {
         -not (Test-Path -LiteralPath (Join-Path $install $_) -PathType Leaf)
     })
@@ -34,7 +35,7 @@ try {
             executable = $launcher
             working_directory = $install
             required_files_present = $true
-            graphics_preset = 'Use the saved DLSS checkbox: 1080p to 1440p DLSS + FSR 2x + occlusion guard.'
+            graphics_preset = 'Use the saved graphics checkbox: native PSSR inputs, DLSS 1920x1080 to 3840x2160, NVIDIA fixed 2X (one generated frame per rendered frame). Supported GPUs: GeForce RTX 40/50 series.'
             started = $false
             save_files_modified = $false
         } | ConvertTo-Json

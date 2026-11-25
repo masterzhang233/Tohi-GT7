@@ -12,6 +12,8 @@ struct SmokeGpu {
         VkDeviceMemory memory {};
         VkFormat format {};
         uint32_t width {}, height {};
+        VkImageAspectFlags aspect {VK_IMAGE_ASPECT_COLOR_BIT};
+        uint32_t mip {}, layer {};
     };
     struct Buffer { VkBuffer buffer {}; VkDeviceMemory memory {}; VkDeviceSize size {}; };
     std::array<Image, 8> images {};
@@ -73,14 +75,17 @@ struct SmokeGpu {
         CheckVk(AllocateMemory(device, &info, nullptr, &memory), "Allocate synthetic memory");
     }
 
-    void MakeImage(Image& image, uint32_t width, uint32_t height, VkFormat format, bool output) {
+    void MakeImage(Image& image, uint32_t width, uint32_t height, VkFormat format, bool output,
+                   uint32_t mip=0, uint32_t layer=0) {
         image.width = width; image.height = height; image.format = format;
+        image.mip=mip; image.layer=layer;
+        image.aspect=format==VK_FORMAT_D32_SFLOAT?VK_IMAGE_ASPECT_DEPTH_BIT:VK_IMAGE_ASPECT_COLOR_BIT;
         VkImageCreateInfo info {};
         info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
         info.imageType = VK_IMAGE_TYPE_2D;
         info.format = format;
-        info.extent = {width, height, 1};
-        info.mipLevels = 1; info.arrayLayers = 1;
+        info.extent = {width<<mip, height<<mip, 1};
+        info.mipLevels = mip+1; info.arrayLayers = layer+1;
         info.samples = VK_SAMPLE_COUNT_1_BIT;
         info.tiling = VK_IMAGE_TILING_OPTIMAL;
         info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -96,7 +101,7 @@ struct SmokeGpu {
         view.image = image.image;
         view.viewType = VK_IMAGE_VIEW_TYPE_2D;
         view.format = format;
-        view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        view.subresourceRange = {image.aspect, mip, 1, layer, 1};
         CheckVk(CreateImageView(device, &view, nullptr, &image.view), "Create synthetic image view");
     }
 
@@ -122,7 +127,7 @@ struct SmokeGpu {
         barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         barrier.image = image.image;
-        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        barrier.subresourceRange = {image.aspect, image.mip, 1, image.layer, 1};
         CmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                            0, 0, nullptr, 0, nullptr, 1, &barrier);
     }
@@ -130,7 +135,7 @@ struct SmokeGpu {
     static VkBufferImageCopy CopyRegion(const Image& image, VkDeviceSize offset = 0) {
         VkBufferImageCopy copy {};
         copy.bufferOffset = offset;
-        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageSubresource = {image.aspect, image.mip, image.layer, 1};
         copy.imageExtent = {image.width, image.height, 1};
         return copy;
     }

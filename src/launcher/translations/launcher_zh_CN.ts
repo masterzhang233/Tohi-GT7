@@ -827,8 +827,8 @@ To use your own sound, replace the emulator&apos;s assets/sounds/trophy-unlock.w
         <translation>GT7 画面预设</translation>
     </message>
     <message>
-        <source>Use the DLSS checkbox on the launcher: 1920 x 1080 to 2560 x 1440, with FSR 2x frame generation. Requires an NVIDIA RTX graphics card.</source>
-        <translation>在启动器中勾选 DLSS 即可使用 1920 × 1080 → 2560 × 1440 超分辨率与 FSR 2× 帧生成。需要 NVIDIA RTX 显卡。</translation>
+        <source>Enable 4K + NVIDIA 2X on the launcher for 1920 x 1080 to 3840 x 2160 using native PSSR inputs and DLSS. Supports NVIDIA GeForce RTX 40/50 series only.</source>
+        <translation>在启动器中启用“4K + NVIDIA 2X”，通过原生 PSSR 输入与 DLSS 将 1920 × 1080 重建至 3840 × 2160。仅支持 NVIDIA GeForce RTX 40/50 系列。</translation>
     </message>
 </context>
 <context>
@@ -1491,32 +1491,32 @@ Log folder:
 %2</translation>
     </message>
     <message>
-        <source>Tohi-GT7 1.0.0</source>
-        <translation>Tohi-GT7 1.0.0</translation>
+        <source>Tohi-GT7 1.0.3</source>
+        <translation>Tohi-GT7 1.0.3</translation>
     </message>
     <message>
         <source>Tohi-GT7</source>
         <translation>Tohi-GT7</translation>
     </message>
     <message>
-        <source>1.0.0  /  RELEASE</source>
-        <translation>1.0.0  /  正式版</translation>
+        <source>1.0.3  /  RELEASE</source>
+        <translation>1.0.3  /  正式版</translation>
     </message>
     <message>
         <source>Ready for your next drive.</source>
         <translation>下一程，即刻出发。</translation>
     </message>
     <message>
-        <source>DLSS</source>
-        <translation>DLSS</translation>
+        <source>4K + NVIDIA 2X</source>
+        <translation>4K + NVIDIA 2X</translation>
     </message>
     <message>
-        <source>Fixed 1080p to 1440p DLSS with FSR 2x frame generation and wheel ghosting correction. Requires NVIDIA RTX. Changes apply on the next launch.</source>
-        <translation>固定 1080p → 1440p DLSS，搭配 FSR 2× 帧生成与车轮拖影修正。需要 NVIDIA RTX 显卡，下次启动游戏时生效。</translation>
+        <source>Uses native PSSR inputs with the PC DLSS backend at 1920 x 1080 to 3840 x 2160. NVIDIA fixed 2X adds one generated frame per rendered frame. Supports NVIDIA GeForce RTX 40/50 series only. Changes apply on the next launch.</source>
+        <translation>使用原生 PSSR 输入，通过 PC 端 DLSS 将 1920 × 1080 重建至 3840 × 2160。NVIDIA 固定 2X 为每个实际渲染帧生成一个额外帧。仅支持 NVIDIA GeForce RTX 40/50 系列，下次启动游戏时生效。</translation>
     </message>
     <message>
-        <source>1920 x 1080 → 2560 x 1440 · DLSS + FSR 2x frame generation</source>
-        <translation>1920 × 1080 → 2560 × 1440 · DLSS + FSR 2× 帧生成</translation>
+        <source>1080p → 4K · Native PSSR inputs + DLSS · Fixed 2X frame generation</source>
+        <translation>1080p → 4K · 原生 PSSR 输入 + DLSS · 固定 2X 帧生成</translation>
     </message>
     <message>
         <source>Start game</source>
@@ -1531,19 +1531,30 @@ Log folder:
         <translation>使用 GT7 画面预设前，请禁用自定义游戏补丁。这些预设需要使用各自经过验证的补丁方案。</translation>
     </message>
     <message>
-        <source>The DLSS preset needs the complete Tohi-GT7 release package.
+        <source>The 4K + NVIDIA 2X preset needs the complete Tohi-GT7 release package.
 Missing files: %1
 
-Extract the full package, or turn off DLSS.</source>
-        <translation>DLSS 预设需要完整的 Tohi-GT7 发布包。
+Extract the full package, or turn off the graphics preset.</source>
+        <translation>4K + NVIDIA 2X 预设需要完整的 Tohi-GT7 发布包。
 缺少文件：%1
 
-请完整解压发布包，或关闭 DLSS。</translation>
+请完整解压发布包，或关闭画质预设。</translation>
     </message>
     <message>
         <source>Graphics runtime missing</source>
         <translation>缺少图形运行库</translation>
     </message>
+
+    <message>
+        <source>GeForce RTX 40/50 series only · Applies on next launch</source>
+        <translation>仅支持 GeForce RTX 40/50 系列 · 下次启动生效</translation>
+    </message>
+
+    <message>
+        <source>NVIDIA DLSS Super Resolution + Frame Generation</source>
+        <translation>NVIDIA DLSS 超分辨率 + 帧生成</translation>
+    </message>
+    <message><source>RELEASE</source><translation>正式版</translation></message>
 </context>
 <context>
     <name>MainDialogPrivate</name>
@@ -1722,17 +1733,45 @@ Open this run&apos;s log folder or export a diagnostic ZIP for analysis.</source
         <translation>游戏运行中…</translation>
     </message>
     <message>
-        <source>1920 x 1080 → 2560 x 1440 · DLSS + FSR 2x frame generation</source>
-        <translation>1920 × 1080 → 2560 × 1440 · DLSS + FSR 2× 帧生成</translation>
+        <source>1080p → 4K · Native PSSR inputs + DLSS · Fixed 2X frame generation</source>
+        <translation>1080p → 4K · 原生 PSSR 输入 + DLSS · 固定 2X 帧生成</translation>
     </message>
     <message>
-        <source>DLSS and frame generation off · desktop rendering</source>
-        <translation>DLSS 与帧生成已关闭 · 桌面渲染</translation>
+        <source>4K upscaling and frame generation off · Desktop rendering</source>
+        <translation>4K 超分辨率与帧生成已关闭 · 桌面渲染</translation>
     </message>
     <message>
         <source>Select Gran Turismo 7 in the game library to start.</source>
         <translation>请在游戏库中选择 Gran Turismo 7 后启动。</translation>
     </message>
+
+    <message>
+        <source>Starting...</source>
+        <translation>正在启动…</translation>
+    </message>
+
+    <message>
+        <source>Game running. Graphics settings are locked until it closes.</source>
+        <translation>游戏运行中，退出游戏后可调整画质设置。</translation>
+    </message>
+
+    <message>
+        <source>Ready to start Gran Turismo 7.</source>
+        <translation>Gran Turismo 7 已就绪，随时出发。</translation>
+    </message>
+
+    <message>
+        <source>The 4K + NVIDIA 2X preset needs the complete Tohi-GT7 release package.
+Missing files: %1
+
+Extract the full package, or turn off the graphics preset.</source>
+        <translation>4K + NVIDIA 2X 预设需要完整的 Tohi-GT7 发布包。
+缺少文件：%1
+
+请完整解压发布包，或关闭画质预设。</translation>
+    </message>
+    <message><source>%1 / RELEASE</source><translation>%1 / 正式版</translation></message>
+    <message><source>Preparing the game...</source><translation>正在准备游戏…</translation></message>
 </context>
 <context>
     <name>PatchesDialog</name>

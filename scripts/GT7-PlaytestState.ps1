@@ -78,6 +78,49 @@ function Get-GT7CompletedProgressCandidate {
     }
 }
 
+function Test-GT7ShaderCacheCandidate {
+    param([Parameter(Mandatory=$true)][string]$Root)
+    try {
+        $directory = Join-Path $Root '_ShaderCache\PPSA01317'
+        if (-not (Test-Path -LiteralPath $directory -PathType Container)) { return $false }
+        Assert-GT7StateTreeNoReparse -LiteralPath $directory
+        # A folder containing only pruning markers/call targets is not a warm
+        # cache. The engine reads its keyed .bin entries directly in this folder.
+        return $null -ne (Get-ChildItem -LiteralPath $directory -File -Filter '*.bin' -Force -ErrorAction Stop |
+            Where-Object { $_.Length -gt 0 } | Select-Object -First 1)
+    } catch { return $false }
+}
+
+function Get-GT7DriverCacheFiles {
+    param([Parameter(Mandatory=$true)][string]$Root)
+    $directory = Join-Path $Root '_PipelineCache'
+    Assert-GT7StateTreeNoReparse -LiteralPath $directory
+    # DriverCacheFilePath uses the base file and indices 1..7 (at most eight
+    # files). Preserve its .full sidecars, never pending .tmp or other titles.
+    Get-ChildItem -LiteralPath $directory -File -Force -ErrorAction Stop |
+        Where-Object { $_.Name -cmatch '^PPSA01317(?:\.[1-7])?\.bin(?:\.full)?$' }
+}
+
+function Test-GT7DriverCacheCandidate {
+    param([Parameter(Mandatory=$true)][string]$Root)
+    $stream = $null
+    try {
+        $base = @(Get-GT7DriverCacheFiles -Root $Root) |
+            Where-Object { $_.Name -ceq 'PPSA01317.bin' } | Select-Object -First 1
+        # The engine starts at the base file; a lone split/marker is unusable.
+        if ($null -eq $base -or $base.Length -gt 3840MB) { return $false }
+        $stream = [IO.File]::Open($base.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        $prefix = New-Object byte[] 128
+        $read = $stream.Read($prefix, 0, $prefix.Length)
+        $signature = [regex]::Match([Text.Encoding]::ASCII.GetString($prefix, 0, $read),
+            '\AKytyPC2:[0-9a-f]{8}:[0-9a-f]{8}:[0-9a-f]{8}:[0-9a-f]{32}\n')
+        # Only an envelope/nonempty check. GPU/driver/UUID and payload hash
+        # validation remain with ReadDriverCacheFile; no Vulkan work here.
+        return $signature.Success -and $base.Length -gt ($signature.Length + 8)
+    } catch { return $false }
+    finally { if ($null -ne $stream) { $stream.Dispose() } }
+}
+
 function Select-GT7PlaytestState {
     param(
         [Parameter(Mandatory=$true)][string]$SourceUserDataRoot,
@@ -140,6 +183,44 @@ function Select-GT7PlaytestState {
             Assert-GT7StateTreeNoReparse -LiteralPath $directory
         }
     }
+    # Progress freshness and cache warmth are independent: a later race can
+    # compile useful shaders without updating the career save. Ignore empty,
+    # failed, running and graphics-check runs; never merge into an old run.
+    $cache = $null
+    foreach ($candidate in @($candidates | Sort-Object -Property `
+        @{Expression={$_.finished_utc};Descending=$true}, `
+        @{Expression={$_.root};Descending=$false})) {
+        if (Test-GT7ShaderCacheCandidate -Root $candidate.root) { $cache = $candidate; break }
+    }
+    $cacheKind = 'completed_playtest'
+    if ($null -eq $cache) {
+        $cacheKind = 'none'
+        # A legacy seed has no manifest. If it is itself a playtest, accept its
+        # cache only through the successfully completed candidate list above.
+        if (-not (Test-Path -LiteralPath (Join-Path $seed 'playtest-manifest.json')) -and
+            (Test-GT7ShaderCacheCandidate -Root $seed)) {
+            $cacheKind = 'seed_fallback'
+            $cache = [pscustomobject]@{root=$seed;finished_utc=$null}
+        }
+    }
+    # Driver pipelines can be saved less frequently than shader translations.
+    # Select independently so a newer shader-only run does not discard an older
+    # successfully saved driver cache.
+    $driverCache = $null
+    foreach ($candidate in @($candidates | Sort-Object -Property `
+        @{Expression={$_.finished_utc};Descending=$true}, `
+        @{Expression={$_.root};Descending=$false})) {
+        if (Test-GT7DriverCacheCandidate -Root $candidate.root) { $driverCache = $candidate; break }
+    }
+    $driverKind = 'completed_playtest'
+    if ($null -eq $driverCache) {
+        $driverKind = 'none'
+        if (-not (Test-Path -LiteralPath (Join-Path $seed 'playtest-manifest.json')) -and
+            (Test-GT7DriverCacheCandidate -Root $seed)) {
+            $driverKind = 'seed_fallback'
+            $driverCache = [pscustomobject]@{root=$seed;finished_utc=$null}
+        }
+    }
     return [pscustomobject]@{
         selection = $kind; selected_root = $selected.root; seed_root = $seed
         search_roots = $search; save_path = $selected.save_path
@@ -147,7 +228,18 @@ function Select-GT7PlaytestState {
         source_finished_utc = $(if ($null -ne $selected.finished_utc) { $selected.finished_utc.ToString('o') } else { $null })
         save_bytes = $selected.save_bytes
         save_sha256 = $(if ($null -ne $selected.save_path) { (Get-FileHash -LiteralPath $selected.save_path -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant() } else { $null })
-        shader_cache_source = $seed
+        shader_cache_selection = $cacheKind
+        shader_cache_source = $(if ($null -ne $cache) { $cache.root } else { $null })
+        shader_cache_finished_utc = $(if ($null -ne $cache -and $null -ne $cache.finished_utc) { $cache.finished_utc.ToString('o') } else { $null })
+        shader_cache_relative_path = '_ShaderCache\PPSA01317'
+        shader_cache_compatibility = 'Engine validates format, recompiler source version, GPU/device switches, recompiler environment, exact entry key and payload hash; incompatible entries are ignored. Copying is not proof of cache hits or a stutter-free run.'
+        driver_cache_selection = $driverKind
+        driver_cache_source = $(if ($null -ne $driverCache) { $driverCache.root } else { $null })
+        driver_cache_finished_utc = $(if ($null -ne $driverCache -and $null -ne $driverCache.finished_utc) { $driverCache.finished_utc.ToString('o') } else { $null })
+        driver_cache_relative_files = @($(if ($null -ne $driverCache) {
+            Get-GT7DriverCacheFiles -Root $driverCache.root | Sort-Object Name | ForEach-Object { Join-Path '_PipelineCache' $_.Name }
+        }))
+        driver_cache_compatibility = 'Only the file envelope is checked here. Engine validates vendor, device, driver version, pipeline-cache UUID and payload hash before use; Vulkan can reject incompatible data. Copying does not prove cache hits.'
     }
 }
 
@@ -162,6 +254,30 @@ function Copy-GT7PlaytestState {
         $null -eq (Get-GT7CompletedProgressCandidate -Root $Selection.selected_root)) {
         throw 'Selected progress is no longer an inactive successfully completed playtest.'
     }
+    if ($null -ne $Selection.shader_cache_source) {
+        if (($Selection.shader_cache_selection -eq 'completed_playtest' -and
+             $null -eq (Get-GT7CompletedProgressCandidate -Root $Selection.shader_cache_source)) -or
+            ($Selection.shader_cache_selection -eq 'seed_fallback' -and
+             (Test-Path -LiteralPath (Join-Path $Selection.shader_cache_source 'playtest-manifest.json'))) -or
+            -not (Test-GT7ShaderCacheCandidate -Root $Selection.shader_cache_source)) {
+            throw 'Selected shader cache is no longer an inactive, nonempty and safe cache source.'
+        }
+    }
+    $driverFiles = @()
+    if ($null -ne $Selection.driver_cache_source) {
+        if (($Selection.driver_cache_selection -eq 'completed_playtest' -and
+             $null -eq (Get-GT7CompletedProgressCandidate -Root $Selection.driver_cache_source)) -or
+            ($Selection.driver_cache_selection -eq 'seed_fallback' -and
+             (Test-Path -LiteralPath (Join-Path $Selection.driver_cache_source 'playtest-manifest.json'))) -or
+            -not (Test-GT7DriverCacheCandidate -Root $Selection.driver_cache_source)) {
+            throw 'Selected driver cache is no longer an inactive, nonempty and safe cache source.'
+        }
+        $driverFiles = @(Get-GT7DriverCacheFiles -Root $Selection.driver_cache_source | Sort-Object Name)
+        $relativeFiles = @($driverFiles | ForEach-Object { Join-Path '_PipelineCache' $_.Name })
+        if (($relativeFiles -join '|') -cne ($Selection.driver_cache_relative_files -join '|')) {
+            throw 'Selected driver cache files changed after selection.'
+        }
+    }
     $guard = $null
     try {
         if ($null -ne $Selection.save_path) {
@@ -172,8 +288,9 @@ function Copy-GT7PlaytestState {
                 throw 'Selected progress changed after selection; refusing an inconsistent copy.'
             }
         }
-        foreach ($relative in @('_SaveData\PPSA01317', '_Trophies\PPSA01317', '_DownloadData\PPSA01317', '_ShaderCache')) {
-            $fromRoot = $(if ($relative -eq '_ShaderCache') { $Selection.seed_root } else { $Selection.selected_root })
+        foreach ($relative in @('_SaveData\PPSA01317', '_Trophies\PPSA01317', '_DownloadData\PPSA01317', '_ShaderCache\PPSA01317')) {
+            $fromRoot = $(if ($relative -eq '_ShaderCache\PPSA01317') { $Selection.shader_cache_source } else { $Selection.selected_root })
+            if ($null -eq $fromRoot) { continue }
             $from = Join-Path $fromRoot $relative
             if (-not (Test-Path -LiteralPath $from -PathType Container)) { continue }
             Assert-GT7StateTreeNoReparse -LiteralPath $from
@@ -181,6 +298,15 @@ function Copy-GT7PlaytestState {
             if (Test-Path -LiteralPath $to) { throw "Refusing to overwrite existing state: $to" }
             [void][IO.Directory]::CreateDirectory((Split-Path -Parent $to))
             Copy-Item -LiteralPath $from -Destination $to -Recurse -Force -ErrorAction Stop
+        }
+        if ($driverFiles.Count) {
+            $to = Join-Path $DestinationRoot '_PipelineCache'
+            if (Test-Path -LiteralPath $to) { throw "Refusing to overwrite existing state: $to" }
+            [void][IO.Directory]::CreateDirectory($to)
+            foreach ($file in $driverFiles) {
+                Assert-GT7StatePathNoReparse -LiteralPath $file.FullName
+                Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $to $file.Name) -ErrorAction Stop
+            }
         }
         if ($null -ne $Selection.save_path) {
             $copied = Join-Path $DestinationRoot '_DownloadData\PPSA01317\gt7save.bin'

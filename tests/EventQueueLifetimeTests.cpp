@@ -1,7 +1,9 @@
 #include "kernel/eventQueue.h"
+#include "common/eventTrace.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -508,6 +510,112 @@ void TestConcurrentDelete() {
 	}
 }
 
+struct TraceResetProbe {
+	std::array<EventQueue::TraceState::Occurrence, 64> occurrences {};
+	std::array<uint64_t, 64> registrations {};
+	size_t count = 0;
+};
+
+void CaptureTraceAndReset(EventQueue::KernelEqueueEvent* event) {
+	auto& probe = *static_cast<TraceResetProbe*>(event->filter.data);
+	Check(probe.count < probe.occurrences.size(), "fixture reset capture bounded");
+	probe.occurrences[probe.count] = event->trace_state.CurrentOccurrence();
+	probe.registrations[probe.count++] = event->trace_state.Registration();
+	ResetDuplicateEvent(event);
+}
+
+void TestTraceIntegrationPreservesQueue() {
+	namespace E = Common::EventTrace;
+	namespace S = Common::SourceTrace;
+	namespace F = EventQueue::TraceState;
+	EventQueue::KernelEqueue queue = EventQueue::KERNEL_EQUEUE_INVALID;
+	Check(EventQueue::KernelCreateEqueue(&queue, "trace-integration") == OK, "create trace queue");
+	TraceResetProbe probe;
+	EventQueue::KernelEqueueEvent event {};
+	event.event.ident = 91;
+	event.event.filter = EventQueue::KERNEL_EVFILT_GRAPHICS;
+	event.filter.data = &probe;
+	event.filter.trigger_func = QueueDuplicateEvent;
+	event.filter.reset_func = CaptureTraceAndReset;
+	Check(EventQueue::KernelAddEvent(queue, event) == OK, "register traced fixture event");
+	Check(EventQueue::KernelTriggerEvent(queue, 91, event.event.filter,
+	                                    reinterpret_cast<void*>(10)) == OK,
+	      "unarmed trigger retains guest event");
+	// Fixture startup only: earlier tests finished with tracing disabled and no
+	// live traced scope. Production arming never resets this timestamp.
+	S::Detail::g_arm_ns.store(0);
+	S::Detail::g_enabled.store(true);
+	S::Detail::g_chain_enabled.store(true);
+	S::Detail::g_observed_threads.store(uint64_t {E::ThreadId()} << 32u);
+	Check(S::TryArm(S::NowNs()), "fixture arms once after earlier lifetime tests finish");
+#ifdef _WIN32
+	Check(_putenv_s("KYTY_GT7_EVENT_TRACE", "1") == 0, "set fixture event trace option");
+#else
+	Check(setenv("KYTY_GT7_EVENT_TRACE", "1", 1) == 0, "set fixture event trace option");
+#endif
+	E::Initialize(true);
+	Check(E::Enabled(), "actual event trace initialization enables fixture");
+	EventQueue::KernelEvent returned[40] {};
+	int out = 0;
+	Libs::LibKernel::KernelUseconds timeout = 0;
+	Check(EventQueue::KernelWaitEqueue(queue, returned, 1, &out, &timeout) == OK &&
+	      out == 1 && returned[0].data == 10, "first observed wait preserves pre-arm item");
+	Check((probe.occurrences[0].flags & (F::Unknown | F::PreArm)) == (F::Unknown | F::PreArm) &&
+	      probe.occurrences[0].first == 0, "pre-arm pending item never gains a fabricated token");
+	const auto registration = probe.registrations[0];
+	Check(registration != 0, "first observed registration has a generation");
+	const auto callback = E::CaptureCallback(501, 9, 91, 0, 0);
+	for (intptr_t value: {11, 12}) {
+		Check(EventQueue::KernelTriggerEventTraced(queue, 91, event.event.filter,
+		                                          reinterpret_cast<void*>(value), &callback) == OK,
+		      "trace context does not change queued trigger result");
+	}
+	event.event.udata = reinterpret_cast<void*>(0x4567);
+	Check(EventQueue::KernelAddEvent(queue, event) == OK, "update traced registration");
+	for (intptr_t value: {11, 12}) {
+		Check(EventQueue::KernelWaitEqueue(queue, returned, 1, &out, &timeout) == OK &&
+		      out == 1 && returned[0].data == value && returned[0].udata == event.event.udata,
+		      "partial traced delivery preserves FIFO and duplicate-add userdata");
+	}
+	Check(probe.occurrences[1].flags == 0 && probe.occurrences[2].flags == 0 &&
+	      probe.occurrences[1].first != 0 && probe.occurrences[2].first != 0 &&
+	      probe.occurrences[1].first != probe.occurrences[2].first &&
+	      probe.registrations[1] == registration && probe.registrations[2] == registration,
+	      "duplicate add preserves generation and distinct queued occurrence identities");
+	for (intptr_t value = 100; value < 134; ++value) {
+		Check(EventQueue::KernelTriggerEvent(queue, 91, event.event.filter,
+		                                    reinterpret_cast<void*>(value)) == OK,
+		      "guest pending queue remains usable past diagnostic capacity");
+	}
+	Check(EventQueue::KernelWaitEqueue(queue, returned, 40, &out, &timeout) == OK && out == 34,
+	      "diagnostic overflow does not drop guest occurrences");
+	for (int i = 0; i < 34; ++i) {
+		Check(returned[i].data == 100 + i && probe.occurrences[3 + i].first == 0 &&
+		      (probe.occurrences[3 + i].flags & (F::Unknown | F::Overflow)) ==
+		          (F::Unknown | F::Overflow), "overflow stays unknown through real FIFO drain");
+	}
+	Check(EventQueue::KernelTriggerEvent(queue, 91, event.event.filter,
+	                                    reinterpret_cast<void*>(200)) == OK &&
+	      EventQueue::KernelWaitEqueue(queue, returned, 1, &out, &timeout) == OK &&
+	      returned[0].data == 200 && probe.occurrences[37].flags == 0 &&
+	      probe.occurrences[37].first != 0, "empty queue restores exact occurrence tracking");
+	Check(EventQueue::KernelDeleteEvent(queue, 91, event.event.filter) == OK &&
+	      EventQueue::KernelAddEvent(queue, event) == OK &&
+	      EventQueue::KernelTriggerEvent(queue, 91, event.event.filter,
+	                                    reinterpret_cast<void*>(201)) == OK &&
+	      EventQueue::KernelWaitEqueue(queue, returned, 1, &out, &timeout) == OK &&
+	      probe.registrations[38] != registration && returned[0].data == 201,
+	      "delete/re-add changes generation without changing delivery");
+	Check(EventQueue::KernelTriggerEventTraced(queue, 999, event.event.filter, nullptr, &callback) ==
+	          KERNEL_ERROR_ENOENT, "explicit traced missing registration preserves ENOENT");
+	Check(EventQueue::KernelDeleteEqueue(queue) == OK &&
+	      EventQueue::KernelTriggerEventTraced(queue, 91, event.event.filter, nullptr, &callback) ==
+	          KERNEL_ERROR_EBADF, "explicit traced deleted queue preserves EBADF");
+	E::Drain(); // Real transport output is available for the offline parser fixture.
+	E::Detail::g_enabled.store(false);
+	S::Detail::g_enabled.store(false);
+}
+
 } // namespace
 
 int main() {
@@ -519,6 +627,7 @@ int main() {
 	TestStaleHandleNeverAliasesNewQueue();
 	TestConcurrentCloseCallback();
 	TestConcurrentDelete();
+	TestTraceIntegrationPreservesQueue();
 	std::printf("EventQueueLifetimeTests: all cases passed\n");
 	return 0;
 }

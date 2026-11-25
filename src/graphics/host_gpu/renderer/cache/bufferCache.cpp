@@ -1215,7 +1215,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			note.then_fast = step.outcome == ReadOutcome::Fast;
 		}
 		steps++;
-		if (step.ticket.Valid()) {
+		const auto dependency = ReadbackWait::ForStep(step.outcome, step.wait_tick,
+		                                               step.ticket.Valid());
+		if (dependency == ReadbackWait::Dependency::FastTicket) {
 			// Round 152: the copy of the faulting pages' bytes (this read's, or another's) is on
 			// its way on the readback queue. This thread waits for it and puts the bytes in guest
 			// memory, not the GPU thread, then asks again (the pages are then lifted).
@@ -1226,7 +1228,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			}
 			continue;
 		}
-		if (step.wait_tick == 0) {
+		if (dependency == ReadbackWait::Dependency::None) {
 			break;
 		}
 		const auto wait_from  = measure ? now_ns() : 0;
@@ -1236,10 +1238,13 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			// The writer's command buffer, submitted already; then the read asks again, its
 			// bytes now final (one such wait a read).
 			writer_wait = false;
-			m_scheduler.GetMasterSemaphore().Wait(step.wait_tick);
-		} else {
-			m_scheduler.WaitPriorityOperations(step.wait_tick);
 		}
+		// Bitmap refinement also needs the GPU writer itself to finish. Waiting
+		// only for priority callbacks can return immediately when there are none,
+		// causing repeated GPU-lane round trips while the writer is still running.
+		ReadbackWait::WaitForTick(dependency, step.wait_tick,
+		    [this](uint64_t tick) { m_scheduler.GetMasterSemaphore().Wait(tick); },
+		    [this](uint64_t tick) { m_scheduler.WaitPriorityOperations(tick); });
 		m_scheduler.OnWaited(step.wait_tick, known, StallWatch::NowNs() - stall_from);
 		if (measure) {
 			wait_ns += now_ns() - wait_from;
@@ -3473,6 +3478,39 @@ bool BufferCache::HasGpuDirtyBytesShared(uint64_t vaddr, uint64_t size) {
 	std::shared_lock lock(m_dirty_ranges_mutex);
 	return m_gpu_modified_ranges.Intersects(vaddr, size) ||
 	       m_fast_pending_ranges.Intersects(vaddr, size);
+}
+
+bool BufferCache::FinishPendingBacking(uint64_t vaddr, uint64_t size) {
+	FinishFastReadbacks(vaddr, size);
+	uint64_t publication_tick = 0;
+	{
+		std::shared_lock lock(m_dirty_ranges_mutex);
+		// A newer GPU write needs a fresh download, even if an older copy is pending.
+		if (m_gpu_modified_ranges.Intersects(vaddr, size)) {
+			return false;
+		}
+		if (!m_downloading_ranges.Intersects(vaddr, size)) {
+			return true;
+		}
+		for (const auto& batch: m_download_batches) {
+			if (batch.begin < vaddr + size && vaddr < batch.end) {
+				publication_tick = std::max(publication_tick, batch.tick);
+			}
+		}
+	}
+	// Missing batch information must not make unpublished bytes readable. The caller retains
+	// the ordinary readback path, including its conservative latest-download fallback.
+	if (publication_tick == 0 || publication_tick > m_scheduler.CurrentTick()) {
+		return false;
+	}
+	if (publication_tick == m_scheduler.CurrentTick()) {
+		// Submit the existing copy without the before-flush hook or any new download.
+		m_scheduler.Wait(publication_tick);
+	}
+	m_scheduler.WaitPriorityOperations(publication_tick);
+	// A batch's bounds can include holes; waiting is conservative. Recheck the exact bytes,
+	// leaving other GPU-written bytes on their page protected and in their cached buffer.
+	return IsCleanForConcurrentRead(vaddr, size);
 }
 
 void BufferCache::DownloadRangeForDiagnostics(uint64_t vaddr, uint64_t size) {

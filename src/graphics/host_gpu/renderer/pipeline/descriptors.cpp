@@ -2494,7 +2494,7 @@ void RenderExecutor::PrepareBindlessSamplers(const ShaderStageRuntime& runtime,
 				const uint64_t address = use.base + use.table_offset;
 				const uint64_t bytes   = records.size() * sizeof(records[0]);
 				if (!records.empty() &&
-				    !m_context.GetBufferCache().HasGpuDirtyBytes(address, bytes) &&
+				    m_context.GetBufferCache().IsCleanForConcurrentRead(address, bytes) &&
 				    Libs::LibKernel::Memory::TryReadBacking(address, records.data(), bytes)) {
 					(void)table.MirrorSamplerHeap(*heap, records, cache);
 				}

@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderDiskCache.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -28,6 +29,7 @@
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
+#include "kernel/memory.h"
 #include "libs/agc.h"
 #include "spirv-tools/libspirv.hpp"
 #include "xxhash.h"
@@ -1875,6 +1877,161 @@ void TestVertexBufferGrouping() {
               input.resources[2].Base48() == input.buffers[0].addr,
           "a later lower-address attribute or changed table left stale vertex offsets");
   }
+}
+
+void TestVertexScanSafety() {
+  // The scanner is speculative. A failed description must not publish partial
+  // input state or kill the process, and must not change the real draw contract.
+  static const uint32_t shader[] = {EncodeSopp(0x01)};
+  ShaderUserData user_data{};
+  ShaderMappedData mapped{};
+  mapped.user_data = &user_data;
+  mapped.code_size_bytes = sizeof(shader);
+  mapped.scratch_size_dwords = 16;
+  HW::VertexShaderInfo regs{};
+  regs.es_regs.data_addr = reinterpret_cast<uint64_t>(shader);
+  regs.gs_regs.rsrc2.user_sgpr = 2;
+  regs.gs_user_sgpr.value[0] = 0x12345678;
+  regs.gs_user_sgpr.value[1] = 0xabcdef01;
+  ShaderMapUserData(regs.es_regs.data_addr, mapped);
+  ShaderVertexInputInfo scan{};
+  ShaderParams params{};
+  scan.resources_num = 17;
+  params.hash = 0x1234;
+  const auto declined = [&](const HW::VertexShaderInfo &candidate,
+                            const HW::Context &context, const char *message) {
+    Check(!PrepareVertexProgramForScan(candidate, context, scan, params), message);
+    Check(scan.resources_num == 17 && params.hash == 0x1234,
+          "declined vertex scan published a partial description");
+  };
+  declined(regs, HW::Context{}, "cold vertex metadata was speculatively parsed");
+  for (const uint32_t wave_size : {32u, 64u}) {
+    HW::Context context{};
+    context.SetShaderStages(wave_size == 32u ? 0x00400000u : 0u);
+    ShaderVertexInputInfo normal{};
+    const auto expected = PrepareProgram(regs, context, HW::UserConfig{}, normal);
+    Check(PrepareVertexProgramForScan(regs, context, scan, params),
+          "a warm vertex shader without tables was rejected by the scanner");
+    Check(!scan.prepare_failed && scan.wave_size == wave_size &&
+              scan.scratch_size_dwords == 16 &&
+              MakeStageStaticKey(scan) == MakeStageStaticKey(normal) &&
+              params.hash == expected.hash && params.code.data() == expected.code.data() &&
+              params.user_data == expected.user_data &&
+              params.user_data_count == expected.user_data_count,
+          "vertex scan changed the real draw's stage key or shader parameters");
+  }
+  scan.resources_num = 17;
+  params.hash = 0x1234;
+  auto invalid = regs;
+  invalid.gs_regs.rsrc2.user_sgpr = HW::UserSgprInfo::SGPRS_MAX + 1;
+  declined(invalid, HW::Context{}, "oversized SGPR count entered vertex scan");
+  invalid = regs;
+  invalid.es_regs.data_addr = 0;
+  declined(invalid, HW::Context{}, "zero shader address entered vertex scan");
+  invalid.es_regs.data_addr = 0x12340;
+  declined(invalid, HW::Context{}, "unregistered shader entered vertex scan");
+  HW::Context merged{};
+  merged.SetShaderStages(0x20u);
+  declined(regs, merged, "merged mesh shader entered ordinary vertex scan");
+  ShaderMapUserData(regs.es_regs.data_addr, mapped);
+  declined(regs, HW::Context{}, "re-registered shader reused stale table registers");
+}
+
+void TestVertexScanBackingMismatch() {
+  // Actual guest backing, not host arrays: otherwise TryReadGpuCleanBacking
+  // would reject before reaching the NumRecords mismatch that crashed GT7.
+  Common::Subsystems memory;
+  memory.Initialize<LibKernel::Memory::Lifecycle>();
+  constexpr uint64_t allocation_size = 0x10000;
+  int64_t physical = -1;
+  Check(LibKernel::Memory::KernelAllocateDirectMemory(
+            0, LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+            allocation_size, 0, &physical) == 0,
+        "vertex scan fixture could not allocate backing");
+  void *mapping = nullptr;
+  Check(LibKernel::Memory::KernelMapDirectMemory(
+            &mapping, allocation_size, 0x3, 0, physical, allocation_size) == 0,
+        "vertex scan fixture could not map backing");
+  const auto buffer_address = reinterpret_cast<uint64_t>(mapping);
+  const auto attribute_address = buffer_address + 0x200;
+  static const uint32_t shader[] = {EncodeSopp(0x01)};
+  std::array<uint16_t, static_cast<size_t>(AgcDirectResourceType::Last) + 1> offsets;
+  offsets.fill(AGC_ILLEGAL_DIRECT_OFFSET);
+  offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexBufferTable)] = 0;
+  offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexAttribDescTable)] = 2;
+  ShaderUserData user_data{};
+  user_data.direct_resource_count = offsets.size();
+  user_data.direct_resource_offset = offsets.data();
+  std::array<ShaderSemantic, 4> semantics{};
+  std::array<ShaderBufferResource, 4> descriptors{};
+  const std::array<uint32_t, 4> attributes{0, 1u | (1u << 26u), 2, 3};
+  for (uint32_t i = 0; i < semantics.size(); ++i) {
+    semantics[i].semantic = semantics[i].hardware_mapping = i;
+    semantics[i].size_in_elements = 1;
+    descriptors[i].fields[1] = 16u << 16u;
+    descriptors[i].fields[2] = 8;
+    descriptors[i].UpdateAddress48(buffer_address + 0x1000);
+  }
+  descriptors[0].UpdateAddress48(buffer_address + 0x1008);
+  descriptors[1].UpdateAddress48(buffer_address + 0x1004);
+  descriptors[3].fields[1] = 0;
+  const auto write_descriptors = [&] {
+    Check(LibKernel::Memory::TryWriteBacking(buffer_address, descriptors.data(),
+                                            sizeof(descriptors)),
+          "vertex descriptor fixture write failed");
+  };
+  write_descriptors();
+  Check(LibKernel::Memory::TryWriteBacking(attribute_address, attributes.data(),
+                                          sizeof(attributes)),
+        "vertex attribute fixture write failed");
+  ShaderMappedData mapped{};
+  mapped.user_data = &user_data;
+  mapped.code_size_bytes = sizeof(shader);
+  mapped.input_semantics = semantics.data();
+  mapped.num_input_semantics = semantics.size();
+  HW::VertexShaderInfo regs{};
+  regs.es_regs.data_addr = reinterpret_cast<uint64_t>(shader);
+  regs.gs_regs.rsrc2.user_sgpr = 4;
+  const std::array<uint64_t, 2> pointers{buffer_address, attribute_address};
+  std::memcpy(regs.gs_user_sgpr.value, pointers.data(), sizeof(pointers));
+  ShaderMapUserData(regs.es_regs.data_addr, mapped);
+  ShaderVertexInputInfo normal{}, scan{};
+  const auto expected = PrepareProgram(regs, HW::Context{}, HW::UserConfig{}, normal);
+  ShaderParams params{};
+  Check(!normal.prepare_failed && normal.resources_num == 4 && normal.buffers_num == 3 &&
+            PrepareVertexProgramForScan(regs, HW::Context{}, scan, params) &&
+            MakeStageStaticKey(scan) == MakeStageStaticKey(normal) &&
+            params.hash == expected.hash,
+        "clean vertex backing did not produce the same scan and real draw description");
+  // Same binding/base/stride, but unequal record counts: the exact fatal predicate.
+  descriptors[2].fields[2] = 7;
+  write_descriptors();
+  scan.resources_num = 17;
+  params.hash = 0x1234;
+  Check(!PrepareVertexProgramForScan(regs, HW::Context{}, scan, params) &&
+            scan.resources_num == 17 && params.hash == 0x1234,
+        "mismatched vertex records did not decline speculative preparation atomically");
+  descriptors[2].fields[2] = 8;
+  write_descriptors();
+  Check(PrepareVertexProgramForScan(regs, HW::Context{}, scan, params) &&
+            MakeStageStaticKey(scan) == MakeStageStaticKey(normal),
+        "a declined scan poisoned subsequent valid vertex preparation");
+  ShaderVertexInputInfo recovered{};
+  (void)PrepareProgram(regs, HW::Context{}, HW::UserConfig{}, recovered);
+  Check(!recovered.prepare_failed && MakeStageStaticKey(recovered) == MakeStageStaticKey(normal),
+        "normal drawing did not recover after a mismatched speculative input");
+  // Counts may differ across distinct bindings; do not reject the whole draw.
+  descriptors[1].fields[2] = 11;
+  write_descriptors();
+  Check(PrepareVertexProgramForScan(regs, HW::Context{}, scan, params) &&
+            scan.buffers[1].num_records == 11,
+        "independent instance-rate binding lost its own record count");
+  regs.gs_user_sgpr.value[0] = 1;
+  regs.gs_user_sgpr.value[1] = 0;
+  Check(!PrepareVertexProgramForScan(regs, HW::Context{}, scan, params),
+        "unreadable vertex table was dereferenced by the scanner");
+  Check(LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, allocation_size) == 0,
+        "vertex scan fixture failed to release backing");
 }
 
 void TestNggVertexEntryState() {
@@ -11107,17 +11264,61 @@ void TestEmbeddedFetchPreservesSharedScalarLoad() {
   Check(MakeStageStaticKey(layout) == key,
         "pipeline-only vertex layout fragmented the shader module cache key");
 
+  const auto disk_key = [](const ShaderVertexInputInfo &vertex) {
+    ShaderDiskCache::ByteWriter writer;
+    ShaderDiskCache::AppendInputKey(writer, vertex);
+    return writer.bytes;
+  };
+  // Vulkan decodes these formats differently, but both expose three float channels to the
+  // same vertex SPIR-V. Reuse that module without reusing its incompatible vertex pipeline.
+  auto packed_float = input;
+  packed_float.resources[0].fields[3] =
+      (static_cast<uint32_t>(Prospero::BufferFormat::k11_11_10Float) << 12u) |
+      DstSel(4, 5, 6, 7);
+  Check(compile(packed_float) == result.spirv &&
+            MakeStageStaticKey(packed_float) == key && disk_key(packed_float) == disk_key(input),
+        "equivalent vertex formats duplicated a shader in memory or on disk");
+  PipelineVertexInputState float_pipeline{};
+  float_pipeline.binding_count = float_pipeline.attribute_count = 1;
+  float_pipeline.bindings[0].stride = 16;
+  float_pipeline.attributes[0].format = input.resources[0].RawFormat();
+  auto packed_pipeline = float_pipeline;
+  packed_pipeline.attributes[0].format = packed_float.resources[0].RawFormat();
+  Check(float_pipeline != packed_pipeline,
+        "shared vertex module reused a pipeline with a different input format");
+  auto two_channels = input;
+  two_channels.resources[0].fields[3] =
+      (static_cast<uint32_t>(Prospero::BufferFormat::k32_32Float) << 12u) |
+      DstSel(4, 5, 6, 7);
+  Check(compile(two_channels) != result.spirv && MakeStageStaticKey(two_channels) != key &&
+            disk_key(two_channels) != disk_key(input),
+        "vertex channel-count specialization disappeared from a module cache");
+
   auto formatted = input;
   formatted.resources[0].fields[3] =
       (static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32UInt) << 12u) |
       DstSel(4, 5, 6, 7);
-  Check(compile(formatted) != result.spirv && MakeStageStaticKey(formatted) != key,
+  Check(compile(formatted) != result.spirv && MakeStageStaticKey(formatted) != key &&
+            disk_key(formatted) != disk_key(input),
         "vertex input numeric type lost its shader module specialization");
   auto swizzled = input;
   swizzled.resources[0].fields[3] =
       (swizzled.resources[0].fields[3] & ~0xfffu) | DstSel(5, 4, 6, 7);
-  Check(compile(swizzled) != result.spirv && MakeStageStaticKey(swizzled) != key,
+  Check(compile(swizzled) != result.spirv && MakeStageStaticKey(swizzled) != key &&
+            disk_key(swizzled) != disk_key(input),
         "vertex input destination selectors lost their shader module specialization");
+  auto legacy113 = input, legacy121 = input;
+  legacy113.resources[0].fields[3] = (113u << 12u) | DstSel(4, 5, 6, 7);
+  legacy121.resources[0].fields[3] = (121u << 12u) | DstSel(4, 5, 6, 7);
+  Check(MakeStageStaticKey(legacy113) != MakeStageStaticKey(legacy121) &&
+            disk_key(legacy113) != disk_key(legacy121),
+        "temporary formats 113 and 121 lost their distinct compatibility mappings");
+  auto packed_integer = formatted;
+  packed_integer.resources[0].fields[3] =
+      (static_cast<uint32_t>(Prospero::BufferFormat::k11_11_10UInt) << 12u) |
+      DstSel(4, 5, 6, 7);
+  Check(MakeStageStaticKey(packed_integer) != MakeStageStaticKey(formatted),
+        "a packed integer reused the local emitter's different unpacked integer interface");
 }
 
 void TestEmbeddedVertexFormatSwizzle() {
@@ -15339,6 +15540,19 @@ int main(int argc, char** argv) {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  if (argc == 2 && std::strcmp(argv[1], "--vertex-prep-safety-only") == 0) {
+    TestVertexBufferGrouping();
+    TestVertexScanSafety();
+    TestVertexScanBackingMismatch();
+    std::puts("ShaderCfgTests: speculative vertex preparation safety tests passed");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--shader-stage-keys-only") == 0) {
+    TestEmbeddedFetchPreservesSharedScalarLoad();
+    TestEmbeddedVertexFormatSwizzle();
+    std::puts("ShaderCfgTests: stage cache identity tests passed");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--pixel-input-contract-only") == 0) {
     TestPixelInputContract();
     std::puts("ShaderCfgTests: pixel input contract tests passed");
@@ -15367,7 +15581,7 @@ int main(int argc, char** argv) {
   }
   if (argc != 1) {
     std::fprintf(stderr, "Usage: %s [--vte-only | --gt7-camera-only | --font-unicode-only | "
-                         "--pixel-input-contract-only | "
+                         "--pixel-input-contract-only | --shader-stage-keys-only | --vertex-prep-safety-only | "
                          "--gt7-camera-shader <code.bin> <user-base> <user-count> [wave-size] | "
                          "--pixel-input-shader <code.bin> <input-count> <system-base> <no-perspective> "
                          "[user-base user-count wave-size]]\n", argv[0]);
@@ -15393,6 +15607,8 @@ int main(int argc, char** argv) {
   TestMemRealtimeClockShift();
   TestShaderStageBarriers();
   TestVertexBufferGrouping();
+  TestVertexScanSafety();
+  TestVertexScanBackingMismatch();
   TestNggVertexEntryState();
   TestNewShaderRecompilerClipDisabledPosition();
   TestNewShaderRecompilerVtePositionFormats();

@@ -1,4 +1,7 @@
 #include "kyty_dlss_backend.h"
+#include "kyty_dlss_pssr.h"
+#include "model_preset.h"
+#include "feature_support.h"
 #include <windows.h>
 #include <nvsdk_ngx_helpers.h>
 #include <nvsdk_ngx_vk.h>
@@ -8,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -19,6 +23,7 @@ constexpr char ProjectId[] = "9410e655-dcb1-4bcc-aa6e-90584f4a3877";
 constexpr char EngineVersion[] = "Kyty-GT7-DLSS-Backend-1";
 std::mutex global_mutex;
 bool context_active = false; // NGX library lifecycle is process-global in this first ABI.
+kyty_dlss::FeatureSupportCache supported_devices;
 struct Failure : std::runtime_error {
     KytyDlssStatus status;
     uint32_t ngx;
@@ -63,6 +68,13 @@ struct Discovery {
         runtime = std::filesystem::weakly_canonical(r).wstring();
         logs = std::filesystem::weakly_canonical(l).wstring();
         paths[0] = runtime.c_str(); common.PathListInfo.Path = paths; common.PathListInfo.Length = 1;
+        wchar_t logging[2] {};
+        if (GetEnvironmentVariableW(L"KYTY_GT7_DLSS_NGX_LOG", logging, 2) == 1 && logging[0] == L'1') {
+            common.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_VERBOSE;
+            common.LoggingInfo.LoggingCallback = [](const char* message, NVSDK_NGX_Logging_Level, NVSDK_NGX_Feature) {
+                std::fprintf(stderr, "GT7 DLSS NGX: %s\n", message ? message : "");
+            };
+        }
         info.SDKVersion = NVSDK_NGX_Version_API;
         info.FeatureID = NVSDK_NGX_Feature_SuperSampling;
         info.Identifier.IdentifierType = NVSDK_NGX_Application_Identifier_Type_Project_Id;
@@ -83,6 +95,23 @@ struct Discovery {
                 "An unexpected DLSS runtime is already loaded in this process");
     }
 };
+void VerifyFeatureSupport(VkInstance instance, VkPhysicalDevice physical, Discovery& discovery) {
+    NVSDK_NGX_FeatureRequirement requirements {};
+    const auto result = NVSDK_NGX_VULKAN_GetFeatureRequirements(instance, physical, &discovery.info, &requirements);
+    // NGX specifies the output flags only for a successful query.
+    const auto flags = result == NVSDK_NGX_Result_Success ? static_cast<uint32_t>(requirements.FeatureSupported) : 0u;
+    const auto decision = supported_devices.Observe(
+        {reinterpret_cast<uintptr_t>(instance), reinterpret_cast<uintptr_t>(physical), discovery.runtime},
+        result, flags);
+    if (decision == kyty_dlss::SupportDecision::QueryFailed) {
+        Ngx(result, "Feature support query");
+        throw Failure(KYTY_DLSS_NGX_FAILED, "Feature support query returned an unknown non-success result", result);
+    }
+    if (decision == kyty_dlss::SupportDecision::Unsupported)
+        throw Failure(KYTY_DLSS_UNSUPPORTED, "DLSS is unsupported on the host physical device");
+    if (decision == kyty_dlss::SupportDecision::VerifiedEarlier)
+        std::fprintf(stderr, "GT7 DLSS: feature requirements unavailable after NGX initialization; using earlier verified same-instance/GPU/runtime support; fresh capability and driver checks still required\n");
+}
 void CopyExtensions(uint32_t count, VkExtensionProperties* required, KytyDlssExtensions* out) {
     Require(out && out->struct_size == sizeof(*out), "Extensions struct size mismatch");
     Require(count <= KYTY_DLSS_EXTENSION_CAPACITY, "Extension list exceeds ABI capacity");
@@ -106,6 +135,13 @@ const char* PresetKey(KytyDlssQuality q) {
     default: throw Failure(KYTY_DLSS_INVALID_ARGUMENT, "Unknown quality mode");
     }
 }
+NVSDK_NGX_DLSS_Hint_Render_Preset NgxPreset(kyty_dlss::ModelPreset preset) {
+    switch (preset.letter) {
+    case 'M': return NVSDK_NGX_DLSS_Hint_Render_Preset_M;
+    case 'L': return NVSDK_NGX_DLSS_Hint_Render_Preset_L;
+    default: return NVSDK_NGX_DLSS_Hint_Render_Preset_K;
+    }
+}
 } // namespace
 
 struct KytyDlssContext {
@@ -113,11 +149,28 @@ struct KytyDlssContext {
     VkDevice device {};
     uint32_t width {}, height {}, out_width {}, out_height {};
     KytyDlssQuality quality {};
+    kyty_dlss::ModelPreset preset {'K', false};
     NVSDK_NGX_Parameter* capabilities {};
     NVSDK_NGX_Parameter* parameters {};
     NVSDK_NGX_Handle* feature {};
     bool initialized {}, poisoned {};
     uint64_t evaluations {};
+    void ReportModelRequest() const noexcept {
+        // A preset hint plus a successful record is not an effective-model or
+        // GPU-completion query. Driver/NVIDIA App overrides may still apply.
+        std::fprintf(stderr, "GT7 DLSS SR: requested preset %c (%s), fixed %ux%u -> %ux%u; effective model unverified\n",
+                     preset.letter, preset.generation(), width, height, out_width, out_height);
+        try {
+            std::ofstream report(std::filesystem::path(discovery->logs) / L"dlss-backend-model.json");
+            report << "{\n  \"schema\": 1,\n  \"requested_preset\": \"" << preset.letter
+                   << "\",\n  \"requested_model_generation\": \"" << preset.generation()
+                   << "\",\n  \"request_source\": \"" << (preset.explicitly_requested ? "KYTY_GT7_DLSS_PRESET" : "default")
+                   << "\",\n  \"input\": [" << width << ", " << height
+                   << "],\n  \"output\": [" << out_width << ", " << out_height
+                   << "],\n  \"first_evaluation_recorded\": true,\n  \"effective_preset_verified\": false,\n"
+                      "  \"gpu_completion_verified_by_backend\": false\n}\n";
+        } catch (...) { /* Optional diagnostics must never poison recorded GPU work. */ }
+    }
     // Destruction is legal only after caller-owned GPU work completes.
     ~KytyDlssContext() {
         if (feature) NVSDK_NGX_VULKAN_ReleaseFeature(feature);
@@ -146,6 +199,11 @@ KytyDlssStatus QueryDevice(const KytyDlssPaths* paths, VkInstance instance, VkPh
         uint32_t count {}; VkExtensionProperties* required {};
         Ngx(NVSDK_NGX_VULKAN_GetFeatureDeviceExtensionRequirements(instance, physical, &d.info, &count, &required), "Device extension discovery");
         CopyExtensions(count, required, out);
+        // This host query precedes vkCreateDevice. Streamline initializes NGX
+        // inside that call, after which the driver's requirements query may
+        // return NotImplemented. Obtain real SR support evidence beforehand.
+        VerifyFeatureSupport(instance, physical, d);
+        std::fprintf(stderr, "GT7 DLSS: SR support verified before host device creation\n");
     });
 }
 KytyDlssStatus Create(const KytyDlssCreateInfo* i, KytyDlssContext** out, KytyDlssError* e) {
@@ -154,6 +212,9 @@ KytyDlssStatus Create(const KytyDlssCreateInfo* i, KytyDlssContext** out, KytyDl
         std::lock_guard lock(global_mutex);
         Require(i && i->struct_size == sizeof(*i) && out, "Create struct size or output mismatch");
         if (context_active) throw Failure(KYTY_DLSS_BUSY, "ABI v1 permits one active NGX context per process");
+        kyty_dlss::ModelPreset preset {};
+        try { preset = kyty_dlss::ReadModelPreset(); }
+        catch (const std::invalid_argument& failure) { throw Failure(KYTY_DLSS_INVALID_ARGUMENT, failure.what()); }
         Require(i->instance && i->physical_device && i->device && i->get_instance_proc_addr && i->get_device_proc_addr,
                 "Missing host Vulkan handles or dispatch functions");
         Require(i->input_width >= 64 && i->input_height >= 64 && i->output_width >= i->input_width &&
@@ -183,13 +244,15 @@ KytyDlssStatus Create(const KytyDlssCreateInfo* i, KytyDlssContext** out, KytyDl
         Require(i->queue_family_index < queues && properties[i->queue_family_index].queueCount &&
                 (properties[i->queue_family_index].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) ==
                 (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT), "NGX command buffer needs a graphics+compute queue family");
-        NVSDK_NGX_FeatureRequirement requirements {};
-        Ngx(NVSDK_NGX_VULKAN_GetFeatureRequirements(i->instance, i->physical_device, &d.info, &requirements), "Feature support query");
-        if (requirements.FeatureSupported != 0) throw Failure(KYTY_DLSS_UNSUPPORTED, "DLSS is unsupported on the host physical device");
+        // Recheck support. Only NotImplemented can reuse a genuine earlier
+        // query for the identical instance/GPU/runtime. Initialization, loaded
+        // runtime identity, capability and driver checks below always run.
+        VerifyFeatureSupport(i->instance, i->physical_device, d);
         auto ctx = std::make_unique<KytyDlssContext>();
         ctx->discovery = std::move(discovery);
         ctx->device=i->device; ctx->width=i->input_width; ctx->height=i->input_height;
         ctx->out_width=i->output_width; ctx->out_height=i->output_height; ctx->quality=i->quality;
+        ctx->preset=preset;
         Ngx(NVSDK_NGX_VULKAN_Init_with_ProjectID(ProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM, EngineVersion,
             d.logs.c_str(), i->instance, i->physical_device, i->device, i->get_instance_proc_addr,
             i->get_device_proc_addr, &d.common), "NGX Init with borrowed host device");
@@ -201,8 +264,25 @@ KytyDlssStatus Create(const KytyDlssCreateInfo* i, KytyDlssContext** out, KytyDl
         Ngx(NVSDK_NGX_Parameter_GetI(ctx->capabilities, NVSDK_NGX_Parameter_SuperSampling_NeedsUpdatedDriver, &driver), "DLSS driver check");
         if (!available || driver) throw Failure(KYTY_DLSS_UNSUPPORTED, "DLSS unavailable or driver update required");
         Ngx(NVSDK_NGX_VULKAN_AllocateParameters(&ctx->parameters), "Allocate feature parameters");
-        NVSDK_NGX_Parameter_SetUI(ctx->parameters, PresetKey(ctx->quality), NVSDK_NGX_DLSS_Hint_Render_Preset_K);
-        NVSDK_NGX_Parameter_SetUI(ctx->capabilities, PresetKey(ctx->quality), NVSDK_NGX_DLSS_Hint_Render_Preset_K);
+        // The custom 75% ratio is not the SDK's standard Quality ratio. Set
+        // every ratio hint for an explicit model request so runtime ratio
+        // classification cannot select an unconfigured model slot. Keep the
+        // original single Quality/Performance/DLAA hint for the default K path.
+        if (ctx->preset.explicitly_requested) {
+            const char* keys[] {NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA,
+                NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality,
+                NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced,
+                NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance,
+                NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance,
+                NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality};
+            for (const char* key : keys) {
+                NVSDK_NGX_Parameter_SetUI(ctx->parameters, key, NgxPreset(ctx->preset));
+                NVSDK_NGX_Parameter_SetUI(ctx->capabilities, key, NgxPreset(ctx->preset));
+            }
+        } else {
+            NVSDK_NGX_Parameter_SetUI(ctx->parameters, PresetKey(ctx->quality), NgxPreset(ctx->preset));
+            NVSDK_NGX_Parameter_SetUI(ctx->capabilities, PresetKey(ctx->quality), NgxPreset(ctx->preset));
+        }
         *out = ctx.release(); context_active = true;
     });
 }
@@ -265,6 +345,7 @@ KytyDlssStatus Evaluate(KytyDlssContext* c, const KytyDlssEvaluateInfo* i, KytyD
             p.InPreExposure=i->pre_exposure; p.InExposureScale=i->exposure_scale;
             Ngx(NGX_VULKAN_EVALUATE_DLSS_EXT(i->command_buffer, c->feature, c->parameters, &p), "Record DLSS evaluation");
             out->reset_used=p.InReset; out->evaluations_recorded=++c->evaluations;
+            if (c->evaluations == 1) c->ReportModelRequest();
         } catch (const Failure& failure) {
             c->poisoned=true;
             // INVALID_ARGUMENT is reserved for pre-record validation. In
@@ -289,3 +370,7 @@ extern "C" __declspec(dllexport) KytyDlssStatus KytyDlssGetApi(uint32_t version,
     *api = {sizeof(*api), KYTY_DLSS_ABI_VERSION, QueryInstance, QueryDevice, Create, Optimal, Evaluate, Destroy};
     return KYTY_DLSS_OK;
 }
+
+// Kept in the same translation unit to share the v1 owner's initialization,
+// serialization, runtime verification and model-selection policy.
+#include "pssr_backend.inl"

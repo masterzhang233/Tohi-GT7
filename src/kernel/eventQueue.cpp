@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/eventTrace.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -38,6 +39,122 @@ static std::unordered_map<KernelEqueue, KernelEqueueRef> g_equeues;
 static Common::Mutex                                     g_equeues_mutex;
 static uint64_t                                          g_next_equeue = 1;
 
+namespace Trace = Common::EventTrace;
+
+// Stack-owned invocation identity. No TLS pairing: nested/parallel waits cannot
+// replace another wait's queue or output-item identity.
+struct TraceWait {
+	uint64_t id = 0, begin_ns = 0, queue = 0, timeout = 0;
+	uint32_t tid = 0, mode = 0;
+	bool waited = false;
+};
+
+static uint32_t TraceFlags(uint32_t state) {
+	uint32_t flags = 0;
+	if ((state & TraceState::Unknown) != 0) flags |= Trace::Unknown;
+	if ((state & TraceState::PreArm) != 0) flags |= Trace::PreArm;
+	if ((state & TraceState::Overflow) != 0) flags |= Trace::Overflow;
+	if ((state & TraceState::Coalesced) != 0) flags |= Trace::Coalesced;
+	if ((state & TraceState::Repeated) != 0) flags |= Trace::Repeated;
+	return flags;
+}
+
+static Trace::Event QueueTraceEvent(Trace::Kind kind, KernelEqueue queue,
+                                    const KernelEqueueEvent& event) {
+	Trace::Event record {};
+	record.kind = kind;
+	record.queue_id = static_cast<uint64_t>(queue);
+	record.registration_id = event.trace_state.Registration();
+	record.filter = event.event.filter;
+	record.ident = event.event.ident;
+	record.data = static_cast<uint64_t>(event.event.data);
+	record.fflags = event.event.fflags;
+	record.event_flags = event.event.flags;
+	if (event.event.filter == KERNEL_EVFILT_TIMER || event.event.filter == KERNEL_EVFILT_HRTIMER) {
+		record.flags |= Trace::Timer;
+	}
+	return record;
+}
+
+// Registration mode: 1=new, 2=first observed existing, 3=update, 4=delete, 5=close.
+static void RecordRegistration(KernelEqueue queue, const KernelEqueueEvent& event, uint32_t mode) {
+	auto record = QueueTraceEvent(Trace::Kind::Registration, queue, event);
+	record.id = event.trace_state.Registration();
+	record.mode = mode;
+	record.flags |= TraceFlags(event.trace_state.CurrentOccurrence().flags);
+	Trace::Record(record);
+}
+
+static void EnsureTraceRegistration(KernelEqueue queue, KernelEqueueEvent& event, bool prearm) {
+	if (event.trace_state.Registration() == 0) {
+		event.trace_state.Initialize(Trace::NewIdentity(), event.triggered,
+		                             event.pending_events.size(), prearm);
+		RecordRegistration(queue, event, prearm ? 2u : 1u);
+	}
+}
+
+static TraceWait BeginTraceWait(KernelEqueue queue, int num, uint32_t mode, uint64_t timeout) {
+	if (!Trace::Enabled()) return {};
+	const auto tid = Trace::ThreadId();
+	if (!Trace::ThreadEligible(tid)) return {};
+	TraceWait wait {Trace::NewIdentity(), Trace::NowNs(), static_cast<uint64_t>(queue), timeout,
+	                tid, mode, false};
+	Trace::Event record {};
+	record.kind = Trace::Kind::WaitBegin;
+	record.id = wait.id;
+	record.queue_id = wait.queue;
+	record.tid = tid;
+	record.time_ns = wait.begin_ns;
+	record.begin_ns = wait.begin_ns;
+	record.mode = mode; // 0=infinite, 1=zero-time poll, 2=timed.
+	record.extra = timeout;
+	record.count = static_cast<uint32_t>(num);
+	Trace::Record(record);
+	return wait;
+}
+
+static void EndTraceWait(const TraceWait& wait, int count) {
+	if (wait.id == 0) return;
+	Trace::Event record {};
+	record.kind = Trace::Kind::WaitEnd;
+	record.id = wait.id;
+	record.queue_id = wait.queue;
+	record.tid = wait.tid;
+	record.begin_ns = wait.begin_ns;
+	record.time_ns = Trace::NowNs();
+	record.mode = wait.mode;
+	record.extra = wait.timeout;
+	record.count = count > 0 ? static_cast<uint32_t>(count) : 0;
+	record.result = count == KERNEL_ERROR_EBADF ? KERNEL_ERROR_EBADF :
+	                count == 0 ? KERNEL_ERROR_ETIMEDOUT : OK;
+	if (count == KERNEL_ERROR_EBADF) record.flags |= Trace::Closed;
+	if (!wait.waited && count > 0) record.flags |= Trace::AlreadyReady;
+	Trace::Record(record);
+}
+
+static void RecordTriggerFailure(KernelEqueue queue, uintptr_t ident, int16_t filter,
+                                 const Trace::CallbackContext* trace, int result, bool observed) {
+	if (!Trace::Enabled() || (!observed && (trace == nullptr || trace->id == 0))) return;
+	Trace::Event record {};
+	record.kind = Trace::Kind::Trigger;
+	record.queue_id = static_cast<uint64_t>(queue);
+	record.ident = ident;
+	record.filter = filter;
+	record.result = result;
+	record.flags = Trace::Unknown;
+	if (result == KERNEL_ERROR_EBADF) record.flags |= Trace::Closed;
+	if (trace != nullptr && trace->id != 0) {
+		record.parent_id = trace->id;
+		record.scheduler_id = trace->scheduler_id;
+		record.tick = trace->tick;
+		record.submission_id = trace->submission_id;
+		record.request_id = trace->request_id;
+	} else {
+		record.flags |= trace == nullptr ? Trace::Direct : Trace::PreArm;
+	}
+	Trace::Record(record); // No occurrence or registration exists for this failed trigger.
+}
+
 class KernelEqueuePrivate {
 public:
 	explicit KernelEqueuePrivate(KernelEqueue handle): m_handle(handle) {}
@@ -49,11 +166,12 @@ public:
 	void                             SetName(const std::string& m_name) { this->m_name = m_name; }
 
 	int AddEvent(const KernelEqueueEvent& event);
-	int TriggerEvent(uintptr_t ident, int16_t filter, void* trigger_data);
+	int TriggerEvent(uintptr_t ident, int16_t filter, void* trigger_data,
+	                 const Trace::CallbackContext* trace = nullptr);
 	int DeleteEvent(uintptr_t ident, int16_t filter);
 
-	int  GetTriggeredEvents(KernelEvent* ev, int num);
-	int  WaitForEvents(KernelEvent* ev, int num, uint32_t micros);
+	int  GetTriggeredEvents(KernelEvent* ev, int num, TraceWait* trace = nullptr);
+	int  WaitForEvents(KernelEvent* ev, int num, uint32_t micros, TraceWait* trace = nullptr);
 	void Close();
 
 	// Guests poll some queues with short timeouts in a tight loop. Only the first
@@ -72,6 +190,7 @@ private:
 	std::string                  m_name;
 	KernelEqueue                 m_handle = KERNEL_EQUEUE_INVALID;
 	bool                         m_closed = false;
+	bool                         m_trace_observed = false; // guarded by m_mutex
 };
 
 KernelEqueuePrivate::~KernelEqueuePrivate() {
@@ -86,6 +205,9 @@ void KernelEqueuePrivate::Close() {
 	}
 	m_closed = true;
 	for (auto& event: m_events) {
+		if (m_trace_observed && Trace::Enabled() && event.trace_state.Registration() != 0) {
+			RecordRegistration(m_handle, event, 5);
+		}
 		if (event.filter.delete_event_func != nullptr) {
 			auto owner = event.filter.owner;
 			event.filter.delete_event_func(m_handle, &event);
@@ -95,13 +217,15 @@ void KernelEqueuePrivate::Close() {
 	m_cond_var.SignalAll();
 }
 
-int KernelEqueuePrivate::GetTriggeredEvents(KernelEvent* ev, int num) {
+int KernelEqueuePrivate::GetTriggeredEvents(KernelEvent* ev, int num, TraceWait* trace) {
 	Common::LockGuard lock(m_mutex);
 
 	EXIT_IF(num < 1);
 	if (m_closed) {
 		return KERNEL_ERROR_EBADF;
 	}
+	if (trace != nullptr && trace->id != 0) m_trace_observed = true;
+	const bool trace_active = m_trace_observed && Trace::Enabled();
 
 	TriggerExpiredTimers(MonotonicTimeNs());
 
@@ -111,7 +235,33 @@ int KernelEqueuePrivate::GetTriggeredEvents(KernelEvent* ev, int num) {
 		auto& event = *it;
 		bool  erase = false;
 		while (event.triggered) {
-			ev[ret++] = event.event;
+			if (trace_active) {
+				EnsureTraceRegistration(m_handle, event, true);
+				event.trace_state.Check(event.triggered, event.pending_events.size());
+			}
+			if (trace_active && trace != nullptr && trace->id != 0) {
+				const auto occurrence = event.trace_state.CurrentOccurrence();
+				auto record = QueueTraceEvent(Trace::Kind::Delivery, m_handle, event);
+				record.id = occurrence.first;
+				record.parent_id = trace->id;
+				record.tid = trace->tid;
+				record.index = static_cast<uint32_t>(ret);
+				record.count = static_cast<uint32_t>(std::min<uint64_t>(occurrence.count, UINT32_MAX));
+				record.extra = occurrence.last;
+				record.mode = occurrence.flags; // Preserve all local unknown reasons.
+				record.flags |= TraceFlags(occurrence.flags);
+				if (occurrence.count > UINT32_MAX) {
+					record.flags |= Trace::Unknown | Trace::Overflow;
+					record.mode |= TraceState::Unknown | TraceState::Overflow;
+				}
+				if (!trace->waited) record.flags |= Trace::AlreadyReady;
+				record.begin_ns = Trace::NowNs();
+				ev[ret++] = event.event;
+				record.time_ns = Trace::NowNs();
+				Trace::Record(record);
+			} else {
+				ev[ret++] = event.event;
+			}
 			if ((event.event.flags & EV_ONESHOT) != 0) {
 				erase = true;
 				break;
@@ -125,10 +275,16 @@ int KernelEqueuePrivate::GetTriggeredEvents(KernelEvent* ev, int num) {
 				event.event.data   = 0;
 			}
 
+			bool popped_pending = false;
 			if (!event.pending_events.empty()) {
 				event.event = event.pending_events.front();
 				event.pending_events.pop_front();
 				event.triggered = true;
+				popped_pending = true;
+			}
+			if (trace_active) {
+				event.trace_state.AfterDelivery(event.triggered, event.pending_events.size(),
+				                                popped_pending);
 			}
 
 			if (ret >= num) {
@@ -147,13 +303,39 @@ int KernelEqueuePrivate::GetTriggeredEvents(KernelEvent* ev, int num) {
 void KernelEqueuePrivate::TriggerExpiredTimers(uint64_t now_ns) {
 	for (auto& event: m_events) {
 		if (event.deadline_ns != 0 && event.deadline_ns <= now_ns) {
+			const bool trace_active = m_trace_observed && Trace::Enabled();
+			const auto deadline = event.deadline_ns;
+			const bool was_triggered = event.triggered;
+			const auto pending = event.pending_events.size();
+			if (trace_active) EnsureTraceRegistration(m_handle, event, true);
+			uint64_t expirations = was_triggered ? 0 : 1;
 			if (event.event.filter == KERNEL_EVFILT_TIMER) {
 				const auto count = event.interval_ns == 0 ? !event.triggered :
 				    1 + (now_ns - event.deadline_ns) / event.interval_ns;
 				event.event.data += static_cast<intptr_t>(count);
 				event.deadline_ns += count * event.interval_ns;
+				expirations = count;
 			}
 			event.triggered = true;
+			if (trace_active && expirations != 0) {
+				const auto token = Trace::NewIdentity();
+				event.trace_state.ObserveTrigger(token, was_triggered, pending,
+				                                event.triggered, event.pending_events.size(),
+				                                TraceState::Semantics::Coalesced);
+				auto record = QueueTraceEvent(Trace::Kind::Trigger, m_handle, event);
+				record.id = token;
+				record.begin_ns = now_ns;
+				record.time_ns = Trace::NowNs();
+				record.extra = deadline; // Logical deadline, not a notifying-thread timestamp.
+				record.count = static_cast<uint32_t>(std::min<uint64_t>(expirations, UINT32_MAX));
+				record.mode = event.trace_state.CurrentOccurrence().flags;
+				record.flags |= Trace::Timer | TraceFlags(record.mode);
+				if (expirations > UINT32_MAX) {
+					record.flags |= Trace::Unknown | Trace::Overflow;
+					record.mode |= TraceState::Unknown | TraceState::Overflow;
+				}
+				Trace::Record(record);
+			}
 		}
 	}
 }
@@ -177,7 +359,7 @@ bool KernelEqueuePrivate::GetNextTimerWaitMicros(uint64_t now_ns, uint32_t* wait
 	return true;
 }
 
-int KernelEqueuePrivate::WaitForEvents(KernelEvent* ev, int num, uint32_t micros) {
+int KernelEqueuePrivate::WaitForEvents(KernelEvent* ev, int num, uint32_t micros, TraceWait* trace) {
 	Common::LockGuard lock(m_mutex);
 
 	EXIT_IF(num < 1);
@@ -190,7 +372,7 @@ int KernelEqueuePrivate::WaitForEvents(KernelEvent* ev, int num, uint32_t micros
 	t.Start();
 
 	for (;;) {
-		int ret = GetTriggeredEvents(ev, num);
+		int ret = GetTriggeredEvents(ev, num, trace);
 
 		if (ret != 0 || (elapsed >= micros && micros != 0)) {
 			return ret;
@@ -198,6 +380,7 @@ int KernelEqueuePrivate::WaitForEvents(KernelEvent* ev, int num, uint32_t micros
 
 		uint32_t   timer_wait = 0;
 		const bool has_timer  = GetNextTimerWaitMicros(MonotonicTimeNs(), &timer_wait);
+		if (trace != nullptr && trace->id != 0) trace->waited = true;
 		if (micros == 0 && !has_timer) {
 			m_cond_var.Wait(&m_mutex);
 		} else {
@@ -230,18 +413,32 @@ int KernelEqueuePrivate::AddEvent(const KernelEqueueEvent& event) {
 		for (auto& pending: it->pending_events) {
 			pending.udata = event.event.udata;
 		}
+		if (m_trace_observed && Trace::Enabled()) {
+			EnsureTraceRegistration(m_handle, *it, true);
+			RecordRegistration(m_handle, *it, 3);
+		}
 	} else {
 		m_events.push_back(event);
+		auto& added = m_events.back();
+		added.trace_state.Initialize(0, false, 0, false);
+		if (m_trace_observed && Trace::Enabled()) {
+			// A new registration must not inherit the source object's sidecar identity.
+			added.trace_state.Initialize(Trace::NewIdentity(), added.triggered,
+			                             added.pending_events.size(), false);
+			RecordRegistration(m_handle, added, 1);
+		}
 	}
 
 	m_cond_var.Signal();
 	return OK;
 }
 
-int KernelEqueuePrivate::TriggerEvent(uintptr_t ident, int16_t filter, void* trigger_data) {
+int KernelEqueuePrivate::TriggerEvent(uintptr_t ident, int16_t filter, void* trigger_data,
+                                    const Trace::CallbackContext* trace) {
 	Common::LockGuard lock(m_mutex);
 
 	if (m_closed) {
+		RecordTriggerFailure(m_handle, ident, filter, trace, KERNEL_ERROR_EBADF, m_trace_observed);
 		return KERNEL_ERROR_EBADF;
 	}
 	auto it = std::find_if(m_events.begin(), m_events.end(), [ident, filter](const auto& e) {
@@ -249,11 +446,70 @@ int KernelEqueuePrivate::TriggerEvent(uintptr_t ident, int16_t filter, void* tri
 	});
 	if (it != m_events.end()) {
 		auto& event = *it;
+		const bool trace_active = m_trace_observed && Trace::Enabled();
+		bool was_triggered = false;
+		size_t pending_before = 0;
+		uint64_t token = 0, begin = 0;
+		if (trace_active) {
+			was_triggered = event.triggered;
+			pending_before = event.pending_events.size();
+			EnsureTraceRegistration(m_handle, event, true);
+			token = Trace::NewIdentity();
+			begin = Trace::NowNs();
+		}
 
 		if (event.filter.trigger_func != nullptr) {
 			event.filter.trigger_func(&event, trigger_data);
 		} else {
 			event.triggered = true;
+		}
+		if (trace_active) {
+			const auto end = Trace::NowNs();
+			const auto pending_after = event.pending_events.size();
+			const auto semantics = filter == KERNEL_EVFILT_GRAPHICS || filter == KERNEL_EVFILT_AMPR ||
+			                               filter == KERNEL_EVFILT_VIDEO_OUT
+			                           ? TraceState::Semantics::Queued
+			                           : filter == KERNEL_EVFILT_USER
+			                                 ? TraceState::Semantics::Coalesced
+			                                 : TraceState::Semantics::Unknown;
+			event.trace_state.ObserveTrigger(token, was_triggered, pending_before,
+			                                event.triggered, pending_after, semantics);
+			auto record = QueueTraceEvent(Trace::Kind::Trigger, m_handle, event);
+			// A queued callback leaves current event intact; its newly appended payload
+			// is the occurrence this invocation actually produced.
+			if (pending_after > pending_before) {
+				const auto& payload = event.pending_events.back();
+				record.filter = payload.filter;
+				record.ident = payload.ident;
+				record.data = static_cast<uint64_t>(payload.data);
+				record.fflags = payload.fflags;
+				record.event_flags = payload.flags;
+			}
+			record.id = token;
+			record.begin_ns = begin;
+			record.time_ns = end;
+			record.count = 1;
+			record.mode = event.trace_state.CurrentOccurrence().flags & ~TraceState::Repeated;
+			if (semantics == TraceState::Semantics::Queued &&
+			    (record.mode & TraceState::Unknown) == 0) {
+				// The new queued occurrence is independent of any coalesced/repeated
+				// metadata on the still-current head.
+				record.mode = 0;
+			}
+			record.flags |= TraceFlags(record.mode);
+			if (trace == nullptr) {
+				record.flags |= Trace::Direct;
+			} else if (trace->id == 0) {
+				// A callback captured before arming remains unknown; never recapture TLS.
+				record.flags |= Trace::Unknown | Trace::PreArm;
+			} else {
+				record.parent_id = trace->id;
+				record.scheduler_id = trace->scheduler_id;
+				record.tick = trace->tick;
+				record.submission_id = trace->submission_id;
+				record.request_id = trace->request_id;
+			}
+			Trace::Record(record);
 		}
 
 		m_cond_var.Signal();
@@ -261,6 +517,7 @@ int KernelEqueuePrivate::TriggerEvent(uintptr_t ident, int16_t filter, void* tri
 		return OK;
 	}
 
+	RecordTriggerFailure(m_handle, ident, filter, trace, KERNEL_ERROR_ENOENT, m_trace_observed);
 	return KERNEL_ERROR_ENOENT;
 }
 
@@ -303,6 +560,10 @@ int KernelEqueuePrivate::DeleteEvent(uintptr_t ident, int16_t filter) {
 	});
 	if (it != m_events.end()) {
 		auto& event = *it;
+		if (m_trace_observed && Trace::Enabled()) {
+			EnsureTraceRegistration(m_handle, event, true);
+			RecordRegistration(m_handle, event, 4);
+		}
 
 		if (event.filter.delete_event_func != nullptr) {
 			auto owner = event.filter.owner;
@@ -361,12 +622,18 @@ int KYTY_SYSV_ABI KernelAddEvent(KernelEqueue eq, const KernelEqueueEvent& event
 
 int KYTY_SYSV_ABI KernelTriggerEvent(KernelEqueue eq, uintptr_t ident, int16_t filter,
                                      void* trigger_data) {
+	return KernelTriggerEventTraced(eq, ident, filter, trigger_data, nullptr);
+}
+
+int KernelTriggerEventTraced(KernelEqueue eq, uintptr_t ident, int16_t filter,
+                            void* trigger_data, const Trace::CallbackContext* trace) {
 	auto owner = KernelPinEqueue(eq);
 	if (!owner) {
+		RecordTriggerFailure(eq, ident, filter, trace, KERNEL_ERROR_EBADF, false);
 		return KERNEL_ERROR_EBADF;
 	}
 
-	return owner->TriggerEvent(ident, filter, trigger_data);
+	return owner->TriggerEvent(ident, filter, trigger_data, trace);
 }
 
 int KYTY_SYSV_ABI KernelDeleteEvent(KernelEqueue eq, uintptr_t ident, int16_t filter) {
@@ -433,17 +700,24 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 	// what woke it (the first event's ident and filter).
 	Libs::Graphics::Timeline::Mark("eq-wait", static_cast<uint64_t>(eq),
 	                               timo == nullptr ? UINT64_MAX : static_cast<uint64_t>(*timo));
+	TraceWait trace_wait {};
+	int delivered = 0;
 	if (timo == nullptr) {
-		*out = owner->WaitForEvents(ev, num, 0);
+		trace_wait = BeginTraceWait(eq, num, 0, UINT64_MAX);
+		*out = delivered = owner->WaitForEvents(ev, num, 0, &trace_wait);
 	}
 
 	if (timo != nullptr) {
 		if (*timo == 0) {
-			*out = owner->GetTriggeredEvents(ev, num);
+			trace_wait = BeginTraceWait(eq, num, 1, 0);
+			*out = delivered = owner->GetTriggeredEvents(ev, num, &trace_wait);
 		} else {
-			*out = owner->WaitForEvents(ev, num, *timo);
+			const auto micros = *timo; // The existing timed-call read; no diagnostic guest read.
+			trace_wait = BeginTraceWait(eq, num, 2, micros);
+			*out = delivered = owner->WaitForEvents(ev, num, micros, &trace_wait);
 		}
 	}
+	EndTraceWait(trace_wait, delivered);
 	Libs::Graphics::Timeline::Mark(
 	    "eq-woke", *out > 0 ? static_cast<uint64_t>(ev[0].ident) : 0,
 	    *out > 0 ? static_cast<uint64_t>(static_cast<uint32_t>(ev[0].filter)) : 0);

@@ -1897,6 +1897,18 @@ KYTY_CP_OP_PARSER(CpOpIncrementDeCounter) {
 	return 1;
 }
 
+KYTY_CP_OP_PARSER(CpOpPssr) {
+	KYTY_PROFILER_FUNCTION();
+	const auto packet_dw = KYTY_PM4_LEN(cmd_id);
+	// Process passes the remaining stream length including this packet's header.
+	// Validate the full packet before copying its fixed-size request payload.
+	EXIT_NOT_IMPLEMENTED(!Pssr::PacketFits(packet_dw, dw));
+	Pssr::Request request {};
+	std::memcpy(&request, buffer, sizeof(request));
+	cp.ProcessPssr(request);
+	return packet_dw - 1;
+}
+
 KYTY_CP_OP_PARSER(CpOpIndexType) {
 	KYTY_PROFILER_FUNCTION();
 

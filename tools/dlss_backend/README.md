@@ -14,6 +14,17 @@ technical boundary, not a licensing determination.
 
 ## Build and run
 
+The host's device-extension query also records a successful SR feature-support
+query before `vkCreateDevice`. Streamline initializes NGX during device creation;
+some driver/SDK combinations then return `NotImplemented` to the first native SR
+support query. Only that result may reuse earlier affirmative evidence for the
+same instance, physical device and canonical runtime path. Other failures or
+unsupported flags invalidate the cached evidence. NGX initialization, loaded DLL
+identity, capability and driver checks still run when creating the SR session.
+`kyty_dlss_feature_support_tests` covers this policy without loading NGX or a GPU.
+This addresses the observed query-order failure; coexistence with live FG and its
+visual/performance behavior still require runtime verification.
+
 Use a Visual Studio developer shell with CMake/Ninja and MSVC or clang-cl:
 
 ```powershell
@@ -49,6 +60,68 @@ the actual input, recommendation, supported minimum/maximum and range membership
 Production backend dimensions and Quality selection already use the existing ABI;
 this option changes only the diagnostic host.
 
+## Explicit DLSS 4.5 model selection
+
+The existing ABI and default **Preset K** behavior are unchanged. To request the
+DLSS 4.5 second-generation transformer on an RTX 5080, set this process environment
+variable before creating the backend context:
+
+```powershell
+$env:KYTY_GT7_DLSS_PRESET = 'M'
+C:/work/dlss-backend-build/kyty_dlss_backend_smoke.exe `
+  C:/work/dlss-backend-build/kyty_dlss_backend.dll `
+  C:/external/DLSS/lib/Windows_x86_64/rel C:/work/dlss45-smoke --quality-1440p
+```
+
+Accepted values are exactly `K`, `M` and `L`. Unset/empty selects K; any other value
+returns `INVALID_ARGUMENT` before initializing NGX. The value is captured once
+per context; changing it requires GPU completion and context recreation. It does
+not alter input/output dimensions, quality hint, jitter, motion, exposure or
+history handling. The existing 1920x1080 -> 2560x1440 custom 75% ratio remains
+fixed, with a Quality hint. There is no automatic fallback from M/L to K, because
+that would conceal failure to activate the explicitly requested model.
+
+NVIDIA identifies M and L as DLSS 4.5 models. M is optimized for Performance and
+L for 4K Ultra Performance, but both support Quality/Balanced/DLAA. We choose M
+for the explicit 5080 trial at the existing fixed ratio, **not** as a claim that
+it is NVIDIA's recommended Quality preset. K remains the default, particularly
+for RTX 20/30 cards that lack native FP8 support. See the official
+[NVIDIA DLSS 4.5 FAQ](https://www.nvidia.com/en-us/geforce/forums/geforce-graphics-cards/5/580689/dlss-45-super-resolution-faq-updated-jan-14/)
+and [SDK preset definitions](https://github.com/NVIDIA/DLSS/blob/main/include/nvsdk_ngx_defs.h).
+
+An explicit request fills all six official ratio-specific preset hint slots.
+Setting only the Quality slot was insufficient in the 75% custom-ratio test:
+M produced the same GPU output as K. Filling every slot made selection affect
+GPU output and the runtime log acknowledged the M hints. The default unset path
+retains the original single quality-mode K hint.
+
+The SDK must expose the named M/L enums, and the supplied runtime must support
+them; the verified local runtime is 310.9.16.0. Its version alone does not mean
+that the second-generation model is selected. After the first successful
+evaluation recording, the backend prints the requested preset and writes
+`dlss-backend-model.json` in its NGX log directory. This is **request evidence**,
+not an effective-model/GPU-completion claim: the public NGX interface used here
+has no effective-preset query, and NVIDIA App/driver overrides may apply. The
+NVIDIA overlay's DLSS statistics are the external effective-model check. The
+smoke report likewise keeps `effective_preset_verified: false` and verifies
+that an invalid preset is rejected. A successful smoke only verifies the GPU
+record/submit/readback path and persistent history contract; it does not establish
+in-game quality, frame generation or performance.
+
+Set `KYTY_GT7_DLSS_NGX_LOG=1` for NVIDIA's verbose callback and file logs during
+diagnosis (off by default). `validate_model_presets.ps1` runs default K, explicit
+K, M and L in separate processes at fixed 1080p -> 1440p. It checks all four GPU
+smokes, confirms explicit/default K agree, and rejects bit-identical K/M results
+so a silently ignored model request cannot pass this regression. A differing
+output is not an independent identification of a neural model. For example:
+
+```powershell
+./tools/dlss_backend/validate_model_presets.ps1 `
+  -BackendBuild C:/work/dlss-backend-build `
+  -RuntimeDirectory C:/external/DLSS/lib/Windows_x86_64/rel `
+  -OutputDirectory C:/work/dlss-model-regression-new
+```
+
 To validate the renderer's actual input-conversion compute shader, compile
 `src/graphics/host_gpu/shaders/gt7_dlss_prepare.comp` with `glslangValidator -V`
 and supply the verified four-frame 1920x1080-to-3840x2160 `gt7.ngx-replay.v2`
@@ -73,7 +146,7 @@ per-resource mismatch counts and output finite-RGB checks. This mode enables
 `shaderStorageImageExtendedFormats` for the RG32F/R8 storage outputs. Raw depth
 bytes are uploaded as R32F, so this verifies numerical conversion rather than the
 live guest depth view's lifetime/layout. Invalid motion stays a zero placeholder;
-the verified mask is not passed to Preset K and the saved NGX images have no host
+the verified mask is not passed to DLSS and the saved NGX images have no host
 fallback composite. These are diagnostic outputs, not a quality acceptance result.
 
 The independent compositor test uses the renderer's actual
@@ -137,7 +210,77 @@ selector. `omit_extension` can remove one extension for a controlled comparison.
 `emulator_identity` uses the renderer's Vulkan application/engine names and
 versions. Reports retain loaded NGX/CUDA/Vulkan/RTSS module paths at each stage
 and the actual `vkCreateDevice` result. The probe creates no SDL window or Win32
-surface and does not reproduce all injected-module or guest-memory-map behavior.
+surface by default and does not reproduce all injected-module or guest-memory-map
+behavior. Independent diagnostic switches can narrow those differences:
+
+- `guest_placeholders: true` uses the emulator's `VirtualAlloc2` placeholder
+  reservations for the guest intervals instead of ordinary `MEM_RESERVE`.
+- `backing_mib: 16384` adds a lazily committed, writable 16 GiB section mapping
+  with the emulator's `SEC_RESERVE` flags. The diagnostic maximum is 65536 MiB.
+- `win32_surface: true` creates a hidden Win32 window and Vulkan surface before
+  device enumeration. It does not create a swapchain or present frames.
+
+All options default off. The backing mapping and hidden surface are destroyed
+after the device. This remains a device-creation check, not a DLSS evaluation or
+game rendering check.
+
+Set `KYTY_DEVICE_CREATE_REPORT` to an absolute JSON path to record the exact
+device creation inputs through the same helper used by the emulator. The report
+includes extension names, every known core/chain feature value, queue priorities,
+and a Windows address-region map (addresses and allocation metadata only, no memory
+contents). Unknown chain types are explicitly marked. No report work runs when
+the environment variable is unset. Exclude `address_space` when comparing device
+parameters across processes.
+
+The optional build targets `kyty_dlss_device_probe_fixedbase` and
+`kyty_dlss_device_probe_highbase` compile the identical diagnostic with ASLR
+disabled at image bases `0x140000000` and `0x100000000000`. They isolate executable
+address-layout differences from Vulkan parameters; neither is part of the default
+build or a change to the emulator's linker settings.
+
+### RTX 5080 address-layout reproduction
+
+On the RTX 5080 with driver 621.14, the same full device-creation configuration
+succeeds with the default ASLR probe and fails with `VK_ERROR_INITIALIZATION_FAILED`
+(`-3`) with both fixed-base probes. Core features, all 18 feature-chain structures,
+extensions and queue creation inputs compare equal after removing `address_space`
+from the reports. Merely moving a fixed executable from `0x140000000` to 16 TiB
+does not fix this reproduction.
+
+The smaller fixed-base comparison needs only these inputs:
+
+```json
+{"api_minor":3,"reservations":"guest","emulator_extensions":false}
+```
+
+It fails with the required NGX extensions. Changing only `reservations` to `none`
+succeeds. Keeping the reservations and adding
+`"omit_extension":"VK_NVX_binary_import"` also succeeds. Omitting a required
+extension is a diagnostic comparison, not a usable DLSS configuration. Early CUDA
+initialization reports `2` in both passing and failing cases, so its return value
+alone does not identify this Vulkan failure.
+
+Build the alternate executables explicitly and run them sequentially with the
+same backend, runtime, JSON configuration and process environment:
+
+```powershell
+cmake --build C:/work/dlss-backend-build --target `
+  kyty_dlss_device_probe kyty_dlss_device_probe_fixedbase kyty_dlss_device_probe_highbase
+$env:DISABLE_RTSS_LAYER = '1'
+$env:KYTY_DEVICE_CREATE_REPORT = 'C:/work/aslr-create-info.json'
+C:/work/dlss-backend-build/kyty_dlss_device_probe.exe `
+  C:/work/dlss-backend-build/kyty_dlss_backend.dll `
+  C:/external/DLSS/lib/Windows_x86_64/rel `
+  C:/work/device-config.json C:/work/aslr-result.json
+```
+
+Repeat with a distinct report/output path for each executable. The opt-in report
+also records the loaded image base and virtual memory regions; disabling ASLR
+changes more process allocations than the executable's image base alone. These
+checks establish device creation only. The emulator subsequently passed its
+SR-only graphics initialization and shutdown check with `/DYNAMICBASE
+/HIGHENTROPYVA`. That check loads no guest code and does not establish DLSS
+evaluation, gameplay stability, frame generation or visual quality.
 
 ## Host call order
 
@@ -157,10 +300,15 @@ surface and does not reproduce all injected-module or guest-memory-map behavior.
    input/output extents, quality mode and paths. It checks support and initializes
    NGX without creating a Vulkan instance, device, queue, command pool or fence.
    Version 1 permits one active context per process and requires serialized API
-   calls. The host must not use other NGX clients concurrently with this lifecycle.
+   calls. Uncoordinated NGX clients in the same process are unsupported. The
+   experimental native-FG path shares the verified runtime directory and drains
+   and frees FG resources before destroying SR, then shuts down Streamline.
+   This controlled coexistence still requires live validation; the ABI does not
+   provide general cross-client ownership guarantees.
 4. `query_optimal` returns the runtime's recommendation for the requested output
    and quality. Context creation fixes extents; changing extents or mode requires
-   host GPU completion and context recreation. Preset K is requested; the API does
+   host GPU completion and context recreation. Preset K is the default; an
+   explicit `KYTY_GT7_DLSS_PRESET` requests K, M or L. The API does
    not claim that the runtime's effective model selection has been inspected.
 5. Prepare actual pre-temporal HDR color, reversed depth and clean backward motion
    in **input render pixels**, with projection jitter removed from motion. Format
@@ -206,7 +354,7 @@ a GPU-completion claim.
 
 The fixed feature flags are HDR, reversed depth, low-resolution motion and auto
 exposure. Motion scale is `(1,1)` after host conversion, MVJittered is disabled,
-and no BiasCurrentColor mask is supplied for Preset K. The host explicitly supplies
+and no BiasCurrentColor mask is supplied. The host explicitly supplies
 frame time, pre-exposure and exposure scale; auto exposure is not proof of matching
 the game's exposure pipeline. Invalid or missing game motion still needs a
 separate host fallback policy.
@@ -220,3 +368,43 @@ device creation cannot add the NVX extensions. Renderer input conversion, guarde
 TAA matching, effect-layer replay, fallback compositing and scheduler integration
 remain host work. This target changes none of those paths and does not add a
 user-facing DLSS toggle.
+
+## Native PSSR resource extension
+
+`KytyDlssGetPssrApi` is a separate, optional versioned C export described by
+`kyty_dlss_pssr.h`. It reuses this backend's existing signed runtime path and
+`KYTY_GT7_DLSS_PRESET` policy. The original `KytyDlssGetApi` v1 layout, fixed GT7
+resource contract and default behavior are unchanged.
+
+A native session owns one NGX initialization on the host device. Individual
+features have separate parameters and temporal history, and may have different
+output dimensions. The session cannot be destroyed while any feature remains.
+The native session and a v1 context are mutually exclusive. There is no second
+driver NGX loader and no per-feature initialization/shutdown.
+
+The SDK can return `NotImplemented` for the requirements query between shutdown
+and a second initialization. The `--v1-reentry` control reproduced this in the
+original v1 path. The backend now reuses an earlier successful requirements
+result only for the same instance, physical device and runtime directory when
+that exact error occurs. It still checks live DLSS availability and driver
+requirements after every initialization; other errors remain failures.
+
+Native evaluation accepts one selected mip/layer per borrowed image view,
+including depth-aspect images, R11G11B10 HDR output, input subrect offsets, a
+dynamic render extent within the queried mode range, native motion-vector
+scales, jitter, explicit exposure or auto exposure, and history reset. The host
+must supply truthful view/format/range metadata, layouts and barriers; it retains
+all Vulkan resource ownership. This API performs super resolution only.
+
+Feature allocation is CPU-only. The first evaluation records creation plus
+evaluation. `INVALID_ARGUMENT` means validation recorded nothing and the caller
+can use a spatial fallback. Every other recording failure requires abandoning
+the command buffer; the emulator terminates rather than submit partially
+recorded NGX commands. Deferred release must wait for all feature GPU work.
+
+Run `kyty_dlss_backend_smoke <backend.dll> <runtime-directory> <output-directory>
+--pssr` with absolute paths for the synthetic native-resource GPU test. It uses
+no game files and exercises two concurrent histories, changing output sizes,
+dynamic input size, depth aspect and mip/layer 1, input subrects, packed HDR
+readback, exposure, reset, replacement and v1 lifecycle re-entry. A passing test
+does not establish that GT7 actually issues native PSSR requests.

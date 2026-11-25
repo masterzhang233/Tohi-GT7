@@ -1,4 +1,7 @@
 #include "graphics/host_gpu/renderer/gt7Dlss.h"
+#include "common/emulatorConfig.h"
+#include "graphics/guest_gpu/pssr.h"
+#include "graphics/host_gpu/renderer/gt7NativePssrInputs.h"
 
 #include "graphics/host_gpu/gt7DlssDevice.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
@@ -6,8 +9,16 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
 #include "graphics/host_gpu/renderer/gt7FrameGenCamera.h"
+#include "graphics/host_gpu/renderer/gt7FrameGenInputWitness.h"
+#include "graphics/host_gpu/renderer/gt7FrameGenLifecycle.h"
+#include "graphics/host_gpu/renderer/gt7NativeAttachmentPolicy.h"
+#include "graphics/host_gpu/renderer/gt7NativeDepthProjection.h"
+#include "graphics/host_gpu/renderer/gt7NativeCameraPair.h"
+#include "graphics/host_gpu/renderer/gt7FrameGenTonemapInputs.h"
+#include "graphics/host_gpu/renderer/gt7FrameGenAssociation.h"
 #include "graphics/host_gpu/renderer/gt7FrameGenDcc.h"
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/shader.h"
@@ -15,6 +26,7 @@
 #include "kernel/memory.h"
 #include "gpu_dlss_shaders/gt7_dlss_prepare_spv.h"
 #include "gpu_dlss_shaders/gt7_dlss_composite_spv.h"
+#include "gpu_dlss_shaders/gt7_native_fg_prepare_spv.h"
 
 #include <algorithm>
 #include <array>
@@ -90,12 +102,44 @@ struct ComputePass {
     vk::Pipeline pipeline;
 };
 
+Gt7FrameGenInputWitness::Stamp InputWitnessStamp(ImageId id, GuestRange range, vk::Image image,
+                                                 uint64_t version, uint64_t epoch) {
+    return {uint64_t(id.index) | (uint64_t(id.generation) << 32),
+        std::bit_cast<uint64_t>(static_cast<VkImage>(image)), range.address, range.size, version, epoch};
+}
+
+Gt7FrameGenInputWitness::Stamp CurrentInputWitness(const Image& image, GuestRange range) {
+    // Marks advance epoch before version. Read version first so a concurrent
+    // invalidation cannot be accepted as completion of the prepared old state.
+    const auto version = image.ExternalWriteVersion();
+    const auto epoch = image.ExternalWriteEpoch();
+    return InputWitnessStamp(image.self_id, range, image.backing.image, version, epoch);
+}
+
 struct FrameGenerationCamera {
     ImageId depth_id {}, motion_id {};
+    GuestRange depth_range {}, motion_range {};
+    Gt7FrameGenCamera::DepthRange viewport_depth {};
+    vk::Image depth_image {}, motion_image {};
+    uint64_t depth_external_version = 0, motion_external_version = 0;
+    uint64_t depth_external_epoch = 0, motion_external_epoch = 0;
+    bool native_witness_pending = false;
     Gt7FrameGenCamera::Matrix view_projection {}, view {}, projection {};
     Gt7FrameGenCamera::Parameters parameters {};
+    // Already-read producer values, including a matrix that failed Decode.
+    // These diagnostics never stand in for the verified parameters above.
+    bool diagnostic_matrices_read = false;
+    float diagnostic_projection_jitter_x = 0, diagnostic_projection_jitter_y = 0;
+    Gt7FrameGenCamera::DepthRange diagnostic_viewport_depth {};
     bool valid = false, rejected = false;
     const char* reject_reason = nullptr;
+
+    Gt7FrameGenInputWitness::Stamp DepthWitness() const {
+        return InputWitnessStamp(depth_id, depth_range, depth_image, depth_external_version, depth_external_epoch);
+    }
+    Gt7FrameGenInputWitness::Stamp MotionWitness() const {
+        return InputWitnessStamp(motion_id, motion_range, motion_image, motion_external_version, motion_external_epoch);
+    }
 };
 
 // Recording-thread diagnostics only. Keep each frame's last meaningful HUD
@@ -139,12 +183,221 @@ struct SceneDiagnostic {
     }
 };
 
+// Metadata only, on the recording thread. A boundary is the producer's flip
+// preparation, not the later asynchronous host present. Keep the two preceding
+// boundaries and at most three TAA descriptions per boundary; never read back
+// images or retain pointers into caller-owned binding data for this diagnostic.
+struct FgAssociationDiagnostics {
+    using Clock = std::chrono::steady_clock;
+    struct Taa {
+        uint64_t serial = 0, at_us = 0, evaluations_before = 0, composites_before = 0;
+        // depth, motion, color, history input, history output, scene output.
+        std::array<ImageId, 6> images {};
+        float jitter_x = 0, jitter_y = 0;
+        bool constants_valid = false, evaluated = false, camera_matched = false, reset = false;
+    };
+    struct Frame {
+        uint64_t serial = 0, at_us = 0, evaluations = 0, composites = 0;
+        uint64_t snapshot_epoch_us = 0, boundary_epoch_us = 0, presented_address = 0, presented_size = 0;
+        uint32_t presented_format = 0;
+        std::array<Taa, 3> taa {};
+        uint32_t attempts = 0, snapshots = 0, scene_mask = 0, hud_mask = UINT32_MAX;
+        uint32_t late_writers = 0, tonemaps = 0;
+        bool accepted = false, camera_valid = false, reset = true;
+        ImageId presented {}, output {}, scene {};
+        const char* stage = "none";
+        uint64_t writer_vs = 0;
+        uint32_t result = 0;
+    } current;
+
+    const bool enabled = [] {
+        const auto* value = std::getenv("KYTY_GT7_PERF_DIAGNOSTICS");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    Clock::time_point origin {}, next_report {}, next_incident {};
+    uint64_t taa_serial = 0, incident = 0, frames = 0, snapshots = 0, accepted = 0;
+    uint64_t boundary_evaluations = 0, boundary_composites = 0;
+    uint64_t no_snapshot = 0, two_to_zero = 0, zero_to_two = 0;
+    std::array<uint64_t, 4> taa_counts {};
+    std::array<uint64_t, 6> scene_bits {};
+    std::array<uint64_t, 7> hud_bits {};
+    std::array<Frame, 2> previous {};
+    uint32_t previous_count = 0, previous_attempts = 0, trailing = 0;
+    bool previous_valid = false, seen_accepted = false;
+
+    uint64_t At(Clock::time_point now) {
+        if (origin.time_since_epoch().count() == 0) origin = now;
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now - origin).count());
+    }
+
+    Taa* BeginTaa(const PreparedBindings& pixel, std::span<const RenderColorInfo> colors,
+                  uint64_t evaluations, uint64_t composites) {
+        if (!enabled) return nullptr;
+        ++taa_serial;
+        const auto attempt = ++current.attempts;
+        if (attempt == 0 || attempt > current.taa.size()) return nullptr;
+        auto& item = current.taa[attempt - 1];
+        item.serial = taa_serial;
+        item.at_us = At(Clock::now());
+        item.evaluations_before = evaluations;
+        item.composites_before = composites;
+        for (size_t i = 0; i < std::min(pixel.images.size(), size_t(4)); ++i)
+            item.images[i] = pixel.images[i].image_id;
+        for (size_t i = 0; i < std::min(colors.size(), size_t(2)); ++i)
+            item.images[4 + i] = colors[i].image_id;
+        return &item;
+    }
+
+    void Snapshot(const Image& presented, uint32_t scene_mask, uint32_t hud_mask,
+                  bool ready, Gt7FrameGen::StatusReason reason) {
+        if (!enabled) return;
+        ++current.snapshots;
+        current.snapshot_epoch_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now().time_since_epoch()).count());
+        current.presented = presented.self_id;
+        current.presented_address = presented.info.data.address;
+        current.presented_size = presented.info.data.size;
+        current.presented_format = static_cast<uint32_t>(presented.backing.format);
+        current.scene_mask = scene_mask;
+        current.hud_mask = hud_mask; // UINT32_MAX means the HUD guard was not reached.
+        current.accepted = ready;
+        current.result = static_cast<uint32_t>(reason);
+    }
+
+    void PrintFrame(const Frame& frame, const char* relation) const {
+        // A whole frame is emitted once, with a hard upper bound on log size.
+        std::array<char, 2304> text {};
+        size_t used = 0;
+        const auto append = [&](const char* format, auto... args) {
+            if (used >= text.size() - 1) return;
+            const auto count = std::snprintf(text.data() + used, text.size() - used, format, args...);
+            if (count > 0) used += std::min(static_cast<size_t>(count), text.size() - used - 1);
+        };
+        const auto ull = [](uint64_t n) { return static_cast<unsigned long long>(n); };
+        append("GT7 FG association frame: incident=%llu relation=%s frame=%llu at_us=%llu snapshot_epoch_us=%llu boundary_epoch_us=%llu snapshot_requests=%u accepted=%u result=%u taa=%u eval=%llu composite=%llu scene_mask=0x%x hud_mask=0x%x camera=%u reset=%u late=%u tones=%u presented=%u:%u presented_range=0x%llx+0x%llx format=%u output=%u:%u scene=%u:%u stage=%s writer_vs=%016llx",
+            ull(incident), relation, ull(frame.serial), ull(frame.at_us), ull(frame.snapshot_epoch_us), ull(frame.boundary_epoch_us), frame.snapshots,
+            frame.accepted ? 1u : 0u, frame.result, frame.attempts, ull(frame.evaluations),
+            ull(frame.composites), frame.scene_mask, frame.hud_mask, frame.camera_valid ? 1u : 0u,
+            frame.reset ? 1u : 0u, frame.late_writers, frame.tonemaps,
+            frame.presented.index, frame.presented.generation, ull(frame.presented_address), ull(frame.presented_size), frame.presented_format,
+            frame.output.index, frame.output.generation,
+            frame.scene.index, frame.scene.generation, frame.stage, ull(frame.writer_vs));
+        for (size_t i = 0; i < std::min(static_cast<size_t>(frame.attempts), frame.taa.size()); ++i) {
+            const auto& taa = frame.taa[i];
+            append(" T%zu={seq:%llu us:%llu pre:%llu/%llu d:%u:%u m:%u:%u c:%u:%u hi:%u:%u ho:%u:%u so:%u:%u j:%.9g,%.9g constants:%u eval:%u cam:%u reset:%u}",
+                i + 1, ull(taa.serial), ull(taa.at_us), ull(taa.evaluations_before), ull(taa.composites_before),
+                taa.images[0].index, taa.images[0].generation, taa.images[1].index, taa.images[1].generation,
+                taa.images[2].index, taa.images[2].generation, taa.images[3].index, taa.images[3].generation,
+                taa.images[4].index, taa.images[4].generation, taa.images[5].index, taa.images[5].generation,
+                taa.jitter_x, taa.jitter_y, taa.constants_valid ? 1u : 0u, taa.evaluated ? 1u : 0u,
+                taa.camera_matched ? 1u : 0u, taa.reset ? 1u : 0u);
+        }
+        if (frame.attempts > frame.taa.size()) append(" omitted_taa=%u", frame.attempts - static_cast<uint32_t>(frame.taa.size()));
+        std::printf("%s\n", text.data());
+    }
+
+    void Report(bool final = false) {
+        if (!enabled || frames == 0) return;
+        const auto now = Clock::now();
+        if (!final && now < next_report) return;
+        next_report = now + std::chrono::seconds(5);
+        const auto ull = [](uint64_t n) { return static_cast<unsigned long long>(n); };
+        const auto last_frame = current.serial ? current.serial : previous_count ? previous[previous_count - 1].serial : 0;
+        std::printf("GT7 FG association histogram: frame=%llu final=%u boundaries=%llu snapshot_requests=%llu accepted=%llu no_snapshot=%llu taa=[%llu,%llu,%llu,%llu] two_to_zero=%llu zero_to_two=%llu scene_bits=[%llu,%llu,%llu,%llu,%llu,%llu] hud_bits=[%llu,%llu,%llu,%llu,%llu,%llu,%llu]\n",
+            ull(last_frame), final ? 1u : 0u, ull(frames), ull(snapshots), ull(accepted), ull(no_snapshot),
+            ull(taa_counts[0]), ull(taa_counts[1]), ull(taa_counts[2]), ull(taa_counts[3]),
+            ull(two_to_zero), ull(zero_to_two),
+            ull(scene_bits[0]), ull(scene_bits[1]), ull(scene_bits[2]), ull(scene_bits[3]), ull(scene_bits[4]), ull(scene_bits[5]),
+            ull(hud_bits[0]), ull(hud_bits[1]), ull(hud_bits[2]), ull(hud_bits[3]), ull(hud_bits[4]), ull(hud_bits[5]), ull(hud_bits[6]));
+        frames = snapshots = accepted = no_snapshot = two_to_zero = zero_to_two = 0;
+        taa_counts.fill(0); scene_bits.fill(0); hud_bits.fill(0);
+    }
+
+    void Boundary() {
+        if (!enabled) return;
+        const auto now = Clock::now();
+        current.at_us = At(now);
+        current.boundary_epoch_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count());
+        if (next_report.time_since_epoch().count() == 0) next_report = now + std::chrono::seconds(5);
+        ++frames;
+        snapshots += current.snapshots;
+        accepted += current.accepted;
+        no_snapshot += current.snapshots == 0;
+        ++taa_counts[std::min(current.attempts, 3u)];
+        if (previous_valid) {
+            two_to_zero += previous_attempts == 2 && current.attempts == 0;
+            zero_to_two += previous_attempts == 0 && current.attempts == 2;
+        }
+        previous_attempts = current.attempts;
+        previous_valid = true;
+        if (current.snapshots) {
+            for (size_t i = 0; i < scene_bits.size(); ++i) scene_bits[i] += (current.scene_mask >> i) & 1u;
+            if (current.hud_mask != UINT32_MAX)
+                for (size_t i = 0; i < hud_bits.size(); ++i) hud_bits[i] += (current.hud_mask >> i) & 1u;
+        }
+        if (trailing) {
+            PrintFrame(current, "after");
+            --trailing;
+        } else if (seen_accepted && current.snapshots && !current.accepted && now >= next_incident) {
+            ++incident;
+            next_incident = now + std::chrono::seconds(5);
+            for (uint32_t i = 0; i < previous_count; ++i) PrintFrame(previous[i], "before");
+            PrintFrame(current, "failure");
+            trailing = 2;
+        }
+        seen_accepted |= current.accepted;
+        if (previous_count < previous.size()) previous[previous_count++] = current;
+        else { previous[0] = previous[1]; previous[1] = current; }
+        Report();
+        current = {};
+    }
+};
+
 #include "gt7FrameGenCameraProbe.inl"
 
 enum CameraObservation : size_t {
     CameraCalls, CameraDepth, CameraMotion, CameraShape, CameraLate, CameraLimit,
     CameraAlreadyRejected, CameraUser, CameraAddress, CameraUnmapped, CameraGpuDirty,
     CameraRead, CameraMatrix, CameraChanged, CameraAccepted, CameraObservationCount
+};
+
+// Fixed storage on the recording thread. A reason gets one immediate report;
+// alternating known reasons cannot bypass the five-second session limit.
+struct NativeInputDiagnostics {
+    using Clock = std::chrono::steady_clock;
+    struct Reason {
+        std::array<char, 192> text {};
+        uint64_t count = 0;
+    };
+    std::array<Reason, 24> reasons {};
+    uint64_t rejected = 0, overflow = 0;
+    Clock::time_point next_rejection {}, next_capture {};
+
+    bool Reject(const char* why, Clock::time_point now, uint64_t& reason_count) {
+        ++rejected;
+        const auto key = std::string_view(why ? why : "none").substr(0, reasons[0].text.size() - 1);
+        Reason* slot = nullptr;
+        for (auto& reason : reasons) {
+            if (reason.count && std::string_view(reason.text.data()) == key) { slot = &reason; break; }
+            if (!reason.count && !slot) slot = &reason;
+        }
+        bool first = false;
+        if (slot) {
+            first = slot->count == 0;
+            if (first) std::copy(key.begin(), key.end(), slot->text.begin());
+            reason_count = ++slot->count;
+        } else {
+            reason_count = ++overflow;
+        }
+        if (!first && now < next_rejection) return false;
+        next_rejection = now + std::chrono::seconds(5);
+        return true;
+    }
+
+    bool Capture(uint64_t captures, Clock::time_point now) {
+        if (captures != 1 && now < next_capture) return false;
+        next_capture = now + std::chrono::seconds(5);
+        return true;
+    }
 };
 
 bool ConfigureFrameGenerationImage(GraphicContext& graphics, VulkanImage& image, vk::Format format,
@@ -171,6 +424,29 @@ bool ConfigureFrameGenerationImage(GraphicContext& graphics, VulkanImage& image,
     create.sharingMode = vk::SharingMode::eExclusive;
     create.initialLayout = vk::ImageLayout::eUndefined;
     return graphics.CreateImage(create, image);
+}
+
+Gt7FrameGenAssociation::OutputIdentity OutputIdentity(const Image& image) {
+    return {uint64_t(image.self_id.index) | (uint64_t(image.self_id.generation) << 32),
+        std::bit_cast<uint64_t>(static_cast<VkImage>(image.backing.image)),
+        image.info.data.address, image.info.data.size, image.backing.extent.width,
+        image.backing.extent.height, static_cast<uint32_t>(image.backing.format)};
+}
+
+ImageId OutputId(const Gt7FrameGenAssociation::OutputIdentity& output) {
+    return {static_cast<uint32_t>(output.image_id), static_cast<uint32_t>(output.image_id >> 32)};
+}
+
+// Candidate allocations never change shape during their owner's lifetime.
+// In particular, do not delete an image that a prior render submission may use.
+bool ConfigureCompletedImage(GraphicContext& graphics, VulkanImage& image, vk::Format format,
+                             uint32_t width, uint32_t height) {
+    if (!image.image) return ConfigureFrameGenerationImage(graphics, image, format, width, height);
+    const auto usage = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc |
+                       vk::ImageUsageFlagBits::eSampled;
+    return image.extent == vk::Extent3D {width, height, 1} && image.format == format &&
+        image.image_type == vk::ImageType::e2D && image.layers == 1 && image.mip_levels == 1 &&
+        image.samples == 1 && (image.usage & usage) == usage;
 }
 
 void TransitFrameGenerationImage(vk::CommandBuffer command, VulkanImage& image,
@@ -268,6 +544,18 @@ struct Gt7Dlss::Impl {
     const KytyDlssApi* api = nullptr;
     KytyDlssContext* ngx = nullptr;
     ComputePass prepare, composite;
+    ComputePass native_prepare;
+    const bool native_mode = Config::PssrDlssEnabled();
+    bool native_initialized = false, native_ready = false, native_reset_pending = true;
+    bool native_prior_reset = true;
+    uint32_t native_pending_sources = Gt7FrameGenLifecycle::PendingInitial;
+    uint32_t native_prior_reset_sources = Gt7FrameGenLifecycle::PendingInitial;
+    Gt7FrameGenLifecycle::ResetDiagnostics native_reset_diagnostics;
+    uint64_t native_context = 0, native_output_serial = 0, native_output_write_version = 0;
+    uint64_t native_input_captures = 0;
+    NativeInputDiagnostics native_input_diagnostics;
+    vk::Image native_output_image {};
+    GuestRange native_output_range {};
     vk::Sampler nearest, linear;
     std::unique_ptr<Image> color, depth, motion, invalid, output, effect, composed;
     ImageId scene_id {};
@@ -283,6 +571,7 @@ struct Gt7Dlss::Impl {
     std::vector<FrameGenerationCamera> fg_cameras;
     CameraProbeState fg_camera_probe;
     std::array<uint32_t, CameraObservationCount> fg_camera_observations {};
+    std::array<uint64_t, CameraObservationCount> native_camera_observations {};
     std::vector<std::array<uint64_t, 2>> fg_draw_signatures;
     uint32_t fg_candidate_draws = 0;
     uint64_t fg_camera_match_failures = 0, fg_hudless_captures = 0, fg_hudless_rejections = 0;
@@ -296,6 +585,16 @@ struct Gt7Dlss::Impl {
     bool fg_hudless_valid = false;
     HudlessDiagnostic fg_hudless_diagnostic;
     SceneDiagnostic fg_scene_diagnostic;
+    FgAssociationDiagnostics fg_association;
+    struct CompletedScene {
+        Gt7FrameGen::FrameInputs inputs;
+        uint64_t external_write_version = 0;
+        Gt7FrameGen::StatusReason rejection = Gt7FrameGen::StatusReason::SceneUnverified;
+    };
+    Gt7FrameGenAssociation::CandidateState fg_completed_state;
+    std::array<CompletedScene, Gt7FrameGenAssociation::CandidateState::Capacity> fg_completed;
+    uint64_t fg_scene_serial = 1, fg_completed_captures = 0, fg_completed_consumed = 0;
+    bool fg_scene_closed = false, fg_boundary_seen = false;
     uint32_t fg_tonemap_attempts = 0, fg_ui_draws = 0;
     Gt7FrameGenCamera::Parameters fg_camera {};
     float fg_jitter_x = 0.0f, fg_jitter_y = 0.0f, fg_frame_time_ms = 0.0f;
@@ -305,13 +604,66 @@ struct Gt7Dlss::Impl {
     std::chrono::steady_clock::time_point fg_next_camera_report {};
     std::chrono::steady_clock::time_point fg_next_hudless_report {};
     std::chrono::steady_clock::time_point fg_next_scene_report {};
+    // Complete snapshot counts, rather than a single sampled failure every five
+    // seconds. These distinguish race coverage from occasional camera/menu cuts.
+    std::array<uint64_t, 6> fg_input_results {};
+    std::chrono::steady_clock::time_point fg_next_input_report {};
+
+    void ReportNativeCameraObservations() const {
+        const auto& o = native_camera_observations;
+        std::printf("GT7 native FG camera totals: calls=%llu depth=%llu motion=%llu shape=%llu late=%llu limit=%llu already_rejected=%llu user=%llu address=%llu unmapped=%llu gpu_dirty=%llu read=%llu matrix=%llu changed=%llu accepted=%llu\n",
+            static_cast<unsigned long long>(o[CameraCalls]), static_cast<unsigned long long>(o[CameraDepth]),
+            static_cast<unsigned long long>(o[CameraMotion]), static_cast<unsigned long long>(o[CameraShape]),
+            static_cast<unsigned long long>(o[CameraLate]), static_cast<unsigned long long>(o[CameraLimit]),
+            static_cast<unsigned long long>(o[CameraAlreadyRejected]), static_cast<unsigned long long>(o[CameraUser]),
+            static_cast<unsigned long long>(o[CameraAddress]), static_cast<unsigned long long>(o[CameraUnmapped]),
+            static_cast<unsigned long long>(o[CameraGpuDirty]), static_cast<unsigned long long>(o[CameraRead]),
+            static_cast<unsigned long long>(o[CameraMatrix]), static_cast<unsigned long long>(o[CameraChanged]),
+            static_cast<unsigned long long>(o[CameraAccepted]));
+    }
+
+    void ReportFrameInputResults(bool final = false) {
+        if (std::all_of(fg_input_results.begin(), fg_input_results.end(), [](auto n) { return n == 0; })) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (!final && now < fg_next_input_report) return;
+        fg_next_input_report = now + std::chrono::seconds(5);
+        std::printf("GT7 FG input coverage: frame=%llu final=%u ready=%llu scene=%llu camera=%llu hudless=%llu duplicate=%llu unavailable=%llu\n",
+            static_cast<unsigned long long>(fg_frame), final ? 1u : 0u,
+            static_cast<unsigned long long>(fg_input_results[0]),
+            static_cast<unsigned long long>(fg_input_results[1]),
+            static_cast<unsigned long long>(fg_input_results[2]),
+            static_cast<unsigned long long>(fg_input_results[3]),
+            static_cast<unsigned long long>(fg_input_results[4]),
+            static_cast<unsigned long long>(fg_input_results[5]));
+    }
+
+    void NoteFrameInputResult(bool accepted, Gt7FrameGen::StatusReason reason) {
+        using Reason = Gt7FrameGen::StatusReason;
+        const size_t bucket = accepted ? 0 : reason == Reason::SceneUnverified ? 1 :
+            reason == Reason::CameraUnverified ? 2 : reason == Reason::HudlessUnverified ? 3 :
+            reason == Reason::DuplicateFrame ? 4 : 5;
+        ++fg_input_results[bucket];
+        ReportFrameInputResults();
+    }
 
     ~Impl() {
         // RenderContext owns this object and has already finished its scheduler.
+        ReportFrameInputResults(true);
+        fg_association.Report(true);
+        if (native_input_captures || native_input_diagnostics.rejected) {
+            std::printf("GT7 native FG input totals: captured=%llu rejected=%llu reason_overflow=%llu\n",
+                static_cast<unsigned long long>(native_input_captures),
+                static_cast<unsigned long long>(native_input_diagnostics.rejected),
+                static_cast<unsigned long long>(native_input_diagnostics.overflow));
+            ReportNativeCameraObservations();
+            for (const auto& reason : native_input_diagnostics.reasons) if (reason.count)
+                std::printf("GT7 native FG reject total: count=%llu reason=%s\n",
+                    static_cast<unsigned long long>(reason.count), reason.text.data());
+        }
         LOGF("GT7 DLSS: session summary: evaluated=%llu composited=%llu cancelled=%llu rejected=%llu\n",
             static_cast<unsigned long long>(evaluations), static_cast<unsigned long long>(composites),
             static_cast<unsigned long long>(cancellations), static_cast<unsigned long long>(rejected));
-        if (Gt7FrameGen::Requested())
+        if (Gt7FrameGen::InputsRequested(graphics))
             LOGF("GT7 FSR FG: input summary: captured=%llu rejected=%llu\n",
                  static_cast<unsigned long long>(fg_snapshots), static_cast<unsigned long long>(fg_rejected));
         if (ngx) {
@@ -321,9 +673,13 @@ struct Gt7Dlss::Impl {
         }
         DestroyPass(graphics.device, prepare);
         DestroyPass(graphics.device, composite);
+        DestroyPass(graphics.device, native_prepare);
         if (nearest) graphics.device.destroySampler(nearest, nullptr);
         if (linear) graphics.device.destroySampler(linear, nullptr);
         if (fg_hudless.image) graphics.DeleteImage(fg_hudless);
+        for (auto& completed : fg_completed)
+            for (auto* image : {&completed.inputs.depth, &completed.inputs.motion, &completed.inputs.hudless_color})
+                if (image->image) graphics.DeleteImage(*image);
     }
 
     std::unique_ptr<Image> MakeImage(uint32_t w, uint32_t h, vk::Format format, uint32_t bytes) {
@@ -382,8 +738,36 @@ struct Gt7Dlss::Impl {
         effect = MakeImage(InputWidth, InputHeight, vk::Format::eR16G16B16A16Sfloat, 8);
         composed = MakeImage(GuestWidth, GuestHeight, vk::Format::eR16G16B16A16Sfloat, 8);
         initialized = true;
-        LOGF("GT7 DLSS: experimental GPU helper ready, 1920x1080 -> 2560x1440, preset K quality (fixed input); guest tone-map/UI 3840x2160\n");
+        const auto* requested_preset = std::getenv("KYTY_GT7_DLSS_PRESET");
+        LOGF("GT7 DLSS: experimental GPU helper ready, 1920x1080 -> 2560x1440, requested preset %s quality (fixed input); guest tone-map/UI 3840x2160\n",
+             requested_preset && *requested_preset ? requested_preset : "K (default)");
         return true;
+    }
+
+    bool InitializeNativeInputs() {
+        if (native_initialized) return true;
+        if (disabled || !native_mode || !Gt7FrameGen::InputsRequested(graphics)) return false;
+        if (!CreatePass(graphics, native_prepare, GT7_NATIVE_FG_PREPARE_SPV, 2, 2)) {
+            disabled = true;
+            LOGF("GT7 native FG: input conversion unavailable; ordinary presentation retained\n");
+            return false;
+        }
+        vk::SamplerCreateInfo sampler {};
+        sampler.magFilter = sampler.minFilter = vk::Filter::eNearest;
+        sampler.mipmapMode = vk::SamplerMipmapMode::eNearest;
+        sampler.addressModeU = sampler.addressModeV = sampler.addressModeW = vk::SamplerAddressMode::eClampToEdge;
+        RequireVulkanSuccess(graphics.device.createSampler(&sampler, nullptr, &nearest), "create native FG sampler");
+        depth = MakeImage(InputWidth, InputHeight, vk::Format::eR32Sfloat, 4);
+        motion = MakeImage(InputWidth, InputHeight, vk::Format::eR32G32Sfloat, 8);
+        native_initialized = true;
+        LOGF("GT7 native FG: capture-only inputs ready, 1920x1080 temporal inputs, 3840x2160 HUD-less output\n");
+        return true;
+    }
+
+    bool SceneReady() const {
+        return !active && !fg_input_ambiguous && fg_temporal_attempts == 1 &&
+            (native_mode ? native_initialized && native_ready :
+             initialized && evaluations == boundary_evaluations + 1 && composites == boundary_composites + 1);
     }
 
     bool Reject(const char* reason) {
@@ -394,12 +778,83 @@ struct Gt7Dlss::Impl {
         if (Report(++rejected)) LOGF("GT7 DLSS: rejected temporal pass #%llu: %s\n", static_cast<unsigned long long>(rejected), reason);
         return false;
     }
+
+    bool WatchesNativeSource() const {
+        return Gt7FrameGenLifecycle::WatchesNativeSource(native_ready, fg_scene_closed);
+    }
+
+    void ResetLiveScene() {
+        // Only the recording lane owns this state. Completed resources have
+        // independent copies and must never be reset by a delayed CPU flip.
+        if (active || evaluations == boundary_evaluations) reset = true;
+        if (native_mode && !native_ready) {
+            native_reset_pending = true;
+            native_pending_sources |= Gt7FrameGenLifecycle::PendingSceneBoundary;
+        }
+        native_ready = false;
+        native_output_image = nullptr;
+        native_output_range = {};
+        active = false;
+        boundary_evaluations = evaluations;
+        boundary_composites = composites;
+        fg_temporal_attempts = 0;
+        fg_camera_valid = false;
+        fg_input_ambiguous = false;
+        fg_cameras.clear();
+        fg_camera_probe.pending.clear();
+        fg_camera_observations.fill(0);
+        fg_candidate_draws = 0;
+        fg_scaled_scene_id = {};
+        fg_output_id = {};
+        fg_output_range = {};
+        fg_output_image = nullptr;
+        fg_hudless_valid = false;
+        fg_tonemap_attempts = fg_ui_draws = 0;
+        fg_hudless_diagnostic = {};
+        fg_scene_diagnostic = {};
+        fg_scene_closed = fg_boundary_seen = false;
+        ++fg_scene_serial;
+    }
+
+    bool HasCompletedOutputs() const {
+        for (size_t i = 0; i < fg_completed.size(); ++i) {
+            const auto& candidate = fg_completed_state.Get(i);
+            if (candidate.ready && !candidate.consumed) return true;
+        }
+        return false;
+    }
+
+    void InvalidateCompleted(size_t slot, Gt7FrameGen::StatusReason reason) {
+        fg_completed_state.InvalidateSlot(slot);
+        fg_completed[slot].rejection = reason;
+    }
 };
 
 Gt7Dlss::Gt7Dlss(RenderContext& context) : m_impl(std::make_unique<Impl>(context)) {}
 Gt7Dlss::~Gt7Dlss() = default;
 bool Gt7Dlss::Active() const {
     return m_impl->active;
+}
+bool Gt7Dlss::NativeFrameGenerationInputs() const {
+    return m_impl->native_mode && Gt7FrameGen::InputsRequested(m_impl->graphics);
+}
+bool Gt7Dlss::WatchesFrameGenerationInputs() const {
+    const auto& s = *m_impl;
+    return s.native_mode && !s.fg_scene_closed && s.fg_temporal_attempts == 0 &&
+        std::any_of(s.fg_cameras.begin(), s.fg_cameras.end(), [](const auto& camera) {
+            return camera.valid && !camera.rejected;
+        });
+}
+bool Gt7Dlss::MatchesFrameGenerationInput(const RenderColorInfo& target) const {
+    if (!WatchesFrameGenerationInputs()) return false;
+    const auto& s = *m_impl;
+    auto& textures = s.context.GetTextureCache();
+    return std::any_of(s.fg_cameras.begin(), s.fg_cameras.end(), [&](const auto& camera) {
+        return camera.valid && !camera.rejected &&
+            ((target.image_id && (target.image_id == camera.depth_id || target.image_id == camera.motion_id)) ||
+             textures.WriteOverlapsImage(target.desc.info.data, camera.depth_id, camera.depth_range) ||
+             textures.WriteOverlapsImage(target.desc.info.data, camera.motion_id, camera.motion_range));
+    });
 }
 Image* Gt7Dlss::EffectLayer() { return Active() ? m_impl->effect.get() : nullptr; }
 bool Gt7Dlss::MatchesScene(const RenderColorInfo& color) const {
@@ -408,16 +863,85 @@ bool Gt7Dlss::MatchesScene(const RenderColorInfo& color) const {
 }
 bool Gt7Dlss::MatchesWatchedWriteRange(GuestRange range) const {
     const auto& s = *m_impl;
-    if (!s.active && !s.fg_hudless_valid) return false;
     auto& textures = s.context.GetTextureCache();
-    return (s.active && textures.WriteOverlapsImage(range, s.scene_id, s.scene_range)) ||
-           (s.fg_hudless_valid && textures.WriteOverlapsImage(range, s.fg_output_id, s.fg_output_range));
+    if (WatchesFrameGenerationInputs()) for (const auto& camera : s.fg_cameras) {
+        if (camera.valid && !camera.rejected &&
+            (textures.WriteOverlapsImage(range, camera.depth_id, camera.depth_range) ||
+             textures.WriteOverlapsImage(range, camera.motion_id, camera.motion_range))) return true;
+    }
+    if ((s.WatchesNativeSource() && textures.WriteOverlapsImage(range, s.fg_scaled_scene_id, s.native_output_range)) ||
+        (s.active && textures.WriteOverlapsImage(range, s.scene_id, s.scene_range)) ||
+        (s.fg_hudless_valid && textures.WriteOverlapsImage(range, s.fg_output_id, s.fg_output_range))) return true;
+    for (size_t i = 0; i < s.fg_completed.size(); ++i) {
+        const auto& candidate = s.fg_completed_state.Get(i);
+        if (candidate.ready && !candidate.consumed && textures.WriteOverlapsImage(range,
+            OutputId(candidate.output), {candidate.output.address, candidate.output.size})) return true;
+    }
+    return false;
 }
 void Gt7Dlss::CancelFrame(const char* reason, bool invalidate_history) {
     auto& s = *m_impl;
+    if (s.native_mode && s.fg_temporal_attempts == 0) for (auto& camera : s.fg_cameras) {
+        camera.valid = false;
+        camera.rejected = true;
+        camera.reject_reason = reason;
+    }
+    for (size_t i = 0; i < s.fg_completed.size(); ++i)
+        s.InvalidateCompleted(i, Gt7FrameGen::StatusReason::SceneUnverified);
+    CancelLiveFrame(reason, invalidate_history);
+}
+
+void Gt7Dlss::CancelFrameForWrite(GuestRange range, const char* reason) {
+    auto& s = *m_impl;
+    auto& textures = s.context.GetTextureCache();
+    if (WatchesFrameGenerationInputs()) for (auto& camera : s.fg_cameras) {
+        if (textures.WriteOverlapsImage(range, camera.depth_id, camera.depth_range) ||
+            textures.WriteOverlapsImage(range, camera.motion_id, camera.motion_range)) {
+            camera.valid = false;
+            camera.rejected = true;
+            camera.reject_reason = reason;
+        }
+    }
+    for (size_t i = 0; i < s.fg_completed.size(); ++i) {
+        const auto& candidate = s.fg_completed_state.Get(i);
+        if (candidate.ready && !candidate.consumed && textures.WriteOverlapsImage(range,
+            OutputId(candidate.output), {candidate.output.address, candidate.output.size}))
+            s.InvalidateCompleted(i, Gt7FrameGen::StatusReason::HudlessUnverified);
+    }
+    if ((s.WatchesNativeSource() && textures.WriteOverlapsImage(range, s.fg_scaled_scene_id, s.native_output_range)) ||
+        (s.active && textures.WriteOverlapsImage(range, s.scene_id, s.scene_range)) ||
+        (s.fg_hudless_valid && textures.WriteOverlapsImage(range, s.fg_output_id, s.fg_output_range)))
+        CancelLiveFrame(reason);
+}
+
+void Gt7Dlss::CancelFrameForWrite(const RenderColorInfo& target, const char* reason) {
+    auto& s = *m_impl;
+    if (WatchesFrameGenerationInputs() && target.image_id) for (auto& camera : s.fg_cameras) {
+        if (target.image_id == camera.depth_id || target.image_id == camera.motion_id) {
+            camera.valid = false;
+            camera.rejected = true;
+            camera.reject_reason = reason;
+        }
+    }
+    const bool live = (s.WatchesNativeSource() && target.image_id == s.fg_scaled_scene_id) ||
+        MatchesScene(target) || (s.fg_hudless_valid && target.image_id &&
+                                               target.image_id == s.fg_output_id);
+    // A resolved image can alias a requested guest view with a different range.
+    // Preserve identity matches in addition to range/metadata overlap checks.
+    if (target.image_id) for (size_t i = 0; i < s.fg_completed.size(); ++i) {
+        const auto& candidate = s.fg_completed_state.Get(i);
+        if (candidate.ready && !candidate.consumed && OutputId(candidate.output) == target.image_id)
+            s.InvalidateCompleted(i, Gt7FrameGen::StatusReason::HudlessUnverified);
+    }
+    CancelFrameForWrite(target.desc.info.data, reason);
+    if (live) CancelLiveFrame(reason);
+}
+
+void Gt7Dlss::CancelLiveFrame(const char* reason, bool invalidate_history) {
+    auto& s = *m_impl;
     // Calls before the first temporal pass are often no-ops. Do not let those
     // hide the first cancellation which actually discarded scene state.
-    if (s.active || s.fg_hudless_valid || invalidate_history)
+    if (s.active || s.native_ready || s.fg_hudless_valid || invalidate_history)
         s.fg_scene_diagnostic.NoteFirst("scene cancelled", reason);
     // A clear, unbounded writer or later unverified operation must also discard
     // the already captured display-color scene, even after SR has composited.
@@ -439,6 +963,12 @@ void Gt7Dlss::CancelFrame(const char* reason, bool invalidate_history) {
                  static_cast<unsigned long long>(s.fg_frame), reason);
     }
     s.fg_hudless_valid = false;
+    if (s.native_mode) {
+        s.native_ready = false;
+        s.native_reset_pending = true;
+        s.native_pending_sources |= Gt7FrameGenLifecycle::PendingCancelled;
+        s.fg_camera_valid = false;
+    }
     if (invalidate_history) {
         s.reset = true;
         s.fg_camera_valid = false;
@@ -466,14 +996,48 @@ void Gt7Dlss::CancelSceneWriterFrame(const char* reason, uint64_t vertex_shader,
         std::snprintf(diagnostic.writer_details.data(), diagnostic.writer_details.size(),
                       "%s", details ? details : "details unavailable");
     }
-    CancelFrame(reason);
+    CancelLiveFrame(reason);
 }
 
-void Gt7Dlss::FrameBoundary() {
+void Gt7Dlss::FrameBoundary(bool discard_completed) {
     auto& s = *m_impl;
+    if (s.fg_association.enabled) {
+        auto& frame = s.fg_association.current;
+        frame.serial = s.fg_frame;
+        // These are flip-window diagnostics, independent of the live scene
+        // boundaries used for completed-output association.
+        frame.evaluations = s.evaluations - s.fg_association.boundary_evaluations;
+        frame.composites = s.composites - s.fg_association.boundary_composites;
+        s.fg_association.boundary_evaluations = s.evaluations;
+        s.fg_association.boundary_composites = s.composites;
+        frame.camera_valid = s.fg_camera_valid;
+        frame.reset = s.fg_reset;
+        frame.late_writers = s.fg_camera_observations[CameraLate];
+        frame.tonemaps = s.fg_tonemap_attempts;
+        frame.output = s.fg_output_id;
+        frame.scene = s.fg_scaled_scene_id;
+        frame.stage = s.fg_scene_diagnostic.stage;
+        frame.writer_vs = s.fg_scene_diagnostic.writer_vs;
+        s.fg_association.Boundary();
+    }
+    if (Gt7FrameGen::InputsRequested(s.graphics) && !discard_completed) {
+        // CPU flip preparation can arrive after the next scene has begun.
+        // Leave that scene intact even when the requested output has no candidate.
+        // A later producer starts a new scope only after a completed tone-map,
+        // or after a failed temporal sequence has crossed a flip boundary.
+        s.fg_boundary_seen = true;
+        ++s.fg_frame;
+        return;
+    }
+    if (discard_completed) {
+        for (size_t i = 0; i < s.fg_completed.size(); ++i)
+            s.InvalidateCompleted(i, Gt7FrameGen::StatusReason::SceneUnverified);
+        s.reset = true;
+    }
+    // SR-only retains its original reset-at-flip behavior.
     // Retiring a completed frame is not an unverified writer rejection.
     if (!s.active) s.fg_hudless_valid = false;
-    CancelFrame("scene reached presentation without a verified composite");
+    CancelLiveFrame("scene reached presentation without a verified composite");
     // Motion vectors refer to the previous guest frame, not the previous NGX call.
     if (s.evaluations == s.boundary_evaluations) s.reset = true;
     s.boundary_evaluations = s.evaluations;
@@ -493,6 +1057,8 @@ void Gt7Dlss::FrameBoundary() {
     s.fg_tonemap_attempts = s.fg_ui_draws = 0;
     s.fg_hudless_diagnostic = {};
     s.fg_scene_diagnostic = {};
+    s.fg_scene_closed = s.fg_boundary_seen = false;
+    ++s.fg_scene_serial;
     ++s.fg_frame;
 }
 
@@ -502,9 +1068,11 @@ void Gt7Dlss::FrameBoundary() {
 bool Gt7Dlss::BeginTaa(CommandBuffer& buffer, const PreparedBindings& pixel,
                        std::span<const RenderColorInfo> colors) {
     auto& s = *m_impl;
+    if (s.native_mode) return false;
     ++s.fg_temporal_attempts;
+    auto* association = s.fg_association.BeginTaa(pixel, colors, s.evaluations, s.composites);
     s.fg_camera_valid = false;
-    if (s.active) CancelFrame("new temporal pass before composite");
+    if (s.active) CancelLiveFrame("new temporal pass before composite");
     if (!pixel.runtime || !*pixel.runtime || pixel.images.size() != 4 ||
         pixel.buffer_sources.size() != 1 || colors.size() != 2 ||
         !pixel.bindless_heaps.empty() || !pixel.bindless_patches.empty())
@@ -560,7 +1128,7 @@ bool Gt7Dlss::BeginTaa(CommandBuffer& buffer, const PreparedBindings& pixel,
     if (!source.address || source.address > std::numeric_limits<uint64_t>::max() - ConstantBytes ||
         source.size != ConstantBytes ||
         Libs::LibKernel::Memory::TryClampRangeSize(source.address, ConstantBytes) != ConstantBytes ||
-        s.context.GetBufferCache().HasGpuDirtyBytes(source.address, ConstantBytes))
+        !s.context.GetBufferCache().IsCleanForConcurrentRead(source.address, ConstantBytes))
         return s.Reject("temporal constants are not clean CPU data");
     std::array<float, 32> constants {};
     if (!Libs::LibKernel::Memory::TryReadBacking(source.address, constants.data(), ConstantBytes) ||
@@ -571,6 +1139,11 @@ bool Gt7Dlss::BeginTaa(CommandBuffer& buffer, const PreparedBindings& pixel,
         !std::isfinite(constants[20]) || !std::isfinite(constants[21]) ||
         std::abs(constants[20] * 960.0f) > 2.0f || std::abs(constants[21] * 540.0f) > 2.0f)
         return s.Reject("temporal dimensions or jitter contract changed");
+    if (association) {
+        association->constants_valid = true;
+        association->jitter_x = constants[20];
+        association->jitter_y = constants[21];
+    }
     if (!s.Initialize()) return s.Reject("backend initialization unavailable");
 
     // Handle drains pending CPU recording, not GPU execution. Every subsequent
@@ -636,7 +1209,7 @@ bool Gt7Dlss::BeginTaa(CommandBuffer& buffer, const PreparedBindings& pixel,
     if (CameraProbeEnabled())
         WriteCameraProbes(s.fg_camera_probe, pixel.images[0].image_id, pixel.images[1].image_id,
                          s.fg_frame, constants[20], constants[21]);
-    if (s.graphics.gt7_fsr_present_queue && Gt7FrameGen::Requested()) {
+    if (Gt7FrameGen::InputsRequested(s.graphics)) {
         // Require camera and temporal resources from this guest frame, including
         // the precise projection jitter used by the producer and resolve.
         for (const auto& camera : s.fg_cameras) {
@@ -710,6 +1283,11 @@ bool Gt7Dlss::BeginTaa(CommandBuffer& buffer, const PreparedBindings& pixel,
         s.fg_reset = result.reset_used != 0 || s.fg_frame_time_ms > 100.0f;
     }
     s.last_time = now;
+    if (association) {
+        association->evaluated = true;
+        association->camera_matched = s.fg_camera_valid;
+        association->reset = result.reset_used != 0;
+    }
     s.reset = false;
     s.active = true;
     if (s.evaluations == 1) {
@@ -725,6 +1303,8 @@ bool Gt7Dlss::BeginTaa(CommandBuffer& buffer, const PreparedBindings& pixel,
 }
 
 #include "gt7DlssComposite.inl"
+
+#include "gt7NativePssrInputs.inl"
 
 #include "gt7FrameGenInputs.inl"
 

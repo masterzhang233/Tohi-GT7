@@ -4,14 +4,15 @@ QDialog#MainDialog { background: transparent; }
 QLabel { background: transparent; }
 QFrame#gt7_feature_panel { background: rgba(11, 15, 24, 175); border: 1px solid rgba(150, 163, 184, 52); border-radius: 12px; }
 QFrame#gt7_graphics_panel, QFrame#game_library_panel, QFrame#support_panel { background: rgba(10, 13, 20, 226); border: 1px solid rgba(150, 163, 184, 45); border-radius: 10px; }
-QLabel#gt7_feature_title { font-size: 36px; font-weight: 700; letter-spacing: 1px; color: #ffffff; }
+QLabel#gt7_feature_title { font-size: 32px; font-weight: 700; letter-spacing: 1px; color: #ffffff; }
 QLabel#gt7_release_badge { color: #ff7580; background: rgba(193, 26, 46, 45); border: 1px solid rgba(255, 73, 92, 90); border-radius: 5px; padding: 7px 10px; font-size: 11px; font-weight: 600; }
 QLabel#gt7_feature_hint { color: #dbe2ed; font-size: 15px; }
 QLabel#graphics_credit, QLabel#gt7_feature_credit, QLabel#label_Version { color: #9da9bb; font-size: 11px; }
-QLabel#gt7_feature_summary { color: #cad3e1; font-size: 12px; }
+QLabel#gt7_feature_summary { color: #d6deeb; font-size: 13px; }
+QLabel#gt7_graphics_support { color: #9da9bb; font-size: 11px; }
 QLabel#game_library_title { color: #ec6571; font-size: 11px; font-weight: 700; letter-spacing: 1px; padding: 0 5px 2px 5px; }
 QCheckBox { spacing: 8px; min-height: 22px; }
-QCheckBox#gt7_dlss_checkbox { font-size: 16px; font-weight: 700; }
+QCheckBox#gt7_dlss_checkbox { font-size: 17px; font-weight: 700; }
 QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid #657086; border-radius: 3px; background: #202632; }
 QCheckBox::indicator:checked { background: #d52c42; border: 1px solid #ef576a; image: url(:/icons/check.svg); }
 QCheckBox::indicator:hover { border-color: #fb7d8a; }
@@ -27,7 +28,7 @@ QPushButton#gt7_start_button:hover { background: #e9324b; }
 QPushButton#gt7_start_button:pressed { background: #ad152a; }
 QPushButton#gt7_start_button:disabled { color: #b9838c; background: #58222e; border-color: #78333f; }
 GameListTreeWidget#cfgs_list { background: transparent; border: 1px solid #30394a; border-radius: 5px; color: #e9edf5; outline: 0; }
-GameListTreeWidget#cfgs_list::item { background: transparent; border-bottom: 1px solid rgba(120, 141, 166, 35); padding: 6px 4px; }
+GameListTreeWidget#cfgs_list::item { background: transparent; border-bottom: 1px solid rgba(120, 141, 166, 35); padding: 8px 6px; }
 GameListTreeWidget#cfgs_list::item:hover { background: rgba(100, 118, 149, 35); }
 GameListTreeWidget#cfgs_list::item:selected { background: rgba(180, 37, 56, 130); color: #ffffff; }
 QHeaderView::section { background: #202633; color: #aebbd0; border: 0; border-right: 1px solid #343e4d; border-bottom: 1px solid #343e4d; padding: 8px 7px; }
@@ -39,6 +40,7 @@ QComboBox QAbstractItemView { background: #202733; color: #ecf1fa; border: 1px s
 QToolButton { background: transparent; border: 1px solid transparent; border-radius: 5px; padding: 4px; }
 QToolButton:hover { background: #303a4c; border-color: #566177; }
 QToolButton:pressed { background: #17202e; }
+QToolButton:focus { border-color: #ef6578; }
 QToolTip { color: #ecf0f8; background: #252d3c; border: 1px solid #657087; padding: 5px; }
 QGroupBox { border: 1px solid #3e495d; border-radius: 6px; margin-top: 10px; padding-top: 13px; }
 QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 5px; color: #f27686; font-weight: 600; }

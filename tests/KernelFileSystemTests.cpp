@@ -783,7 +783,7 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
   }
 }
 
-void CheckAprPaths(const std::filesystem::path &root) {
+void CheckAprPaths(const std::filesystem::path &root, bool ordering_only = false) {
   Loader::SymbolDatabase symbols;
   Libs::LibKernelApr::InitLibKernel_1_Apr(&symbols);
   const auto *resolve_symbol = symbols.FindByNid("w5fcCG+t31g", Loader::SymbolType::Func);
@@ -815,6 +815,12 @@ void CheckAprPaths(const std::filesystem::path &root) {
       expected_id = id;
     }
     Check(id == expected_id, "equivalent APR paths return the same ID");
+  }
+
+  if (ordering_only) {
+    CheckAmprOrdering(symbols, expected_id);
+    FileSystem::Umount("/app0");
+    return;
   }
 
   const char *paths[] = {"/app0/missing.dat", "/app0/apr.dat"};
@@ -1164,7 +1170,19 @@ void CheckSocketWakeup() {
 
 } // namespace
 
-int main(int, char**) {
+int RunKernelWaitsTests();
+
+int main(int argc, char** argv) {
+  if (argc == 2 && std::string_view(argv[1]) == "--kernel-waits-only") {
+    return RunKernelWaitsTests();
+  }
+  const bool apr_ordering_only =
+      argc == 2 && std::string_view(argv[1]) == "--apr-ordering-only";
+  if (argc != 1 && !apr_ordering_only) {
+    std::fprintf(stderr, "Usage: KernelFileSystemTests [--apr-ordering-only|--kernel-waits-only]\n");
+    return 2;
+  }
+
   Common::InitializeThreads();
   Common::Subsystems subsystems;
   subsystems.Initialize<Config::Lifecycle>();
@@ -1184,6 +1202,15 @@ int main(int, char**) {
 
   TempDirectory temporary;
   FileSystem::Initialize();
+  if (apr_ordering_only) {
+    CheckAprPaths(temporary.Path(), true);
+    FileSystem::Shutdown();
+    graphics.reset();
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: APR ordering cases passed\n");
+    return 0;
+  }
+
   CheckMountRoot(temporary.Path());
   CheckUnmappedPaths(temporary.Path());
   CheckArchiveMount(temporary.Path());

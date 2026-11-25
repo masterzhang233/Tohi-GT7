@@ -113,6 +113,7 @@ private:
 		bool                      progressed        = false; // the last slice ran packets
 		uint64_t                  flip_request_id   = 0;
 		uint64_t                  prep_seq          = 0; // draw prep: graphics submission number
+		uint64_t                  diagnostic_id     = 0; // source trace: stable across slices
 	};
 
 	void              Enqueue(Submission submission);
@@ -132,13 +133,12 @@ private:
 	std::atomic<uint64_t>                          m_compute_enqueued {0};
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;
+	uint64_t                                       m_diagnostic_id     = 0; // under m_queue_mutex
 	bool                                           m_processing        = false;
 	bool                                           m_accepting         = true;
 	bool                                           m_stopping          = false;
 	bool                                           m_shutdown_complete = false;
-	// Completion callbacks can outlive GuestGpu during renderer shutdown.
-	std::shared_ptr<std::binary_semaphore> m_suspend_point_ready =
-	    std::make_shared<std::binary_semaphore>(1);
+	std::binary_semaphore                          m_suspend_point_ready {1};
 
 	struct PendingLabel {
 		uint64_t value    = 0;

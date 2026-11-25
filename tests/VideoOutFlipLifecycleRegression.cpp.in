@@ -1,0 +1,694 @@
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <future>
+#include <list>
+#include <memory>
+#include <mutex>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <utility>
+#include <vector>
+
+using namespace std::chrono_literals;
+#define KYTY_CLASS_NO_COPY(name) name(const name&) = delete; name& operator=(const name&) = delete
+#define EXIT_IF(condition) do { if (condition) throw std::runtime_error(#condition); } while (false)
+#define EXIT_NOT_IMPLEMENTED(condition) EXIT_IF(condition)
+#define EXIT(...) throw std::runtime_error("production EXIT")
+#define KYTY_PROFILER_BLOCK(...)
+#define LOGF(...)
+
+namespace Common {
+// This fixture exercises the unmodified lifecycle with opt-in source tracing off.
+// Fail if a production method reaches the diagnostic clock/sink while disabled.
+namespace SourceTrace {
+enum class Kind : uint32_t { FlipSubmit, FlipPrepare, FlipReady, Process, Command, Fault };
+struct Event {
+    Kind kind {};
+    uint32_t flags = 0, tid = 0;
+    uint64_t begin_ns = 0, end_ns = 0, work_end_ns = 0;
+    uint64_t submission_id = 0, request_id = 0, arg0 = 0, arg1 = 0;
+};
+bool Enabled() noexcept { return false; }
+uint64_t NowNs() { throw std::runtime_error("source tracing must stay disabled"); }
+void Record(Event) { throw std::runtime_error("source tracing must stay disabled"); }
+}
+inline std::atomic<unsigned> active_waits {0};
+struct Mutex {
+    std::mutex value;
+    void Lock() { value.lock(); }
+    void Unlock() { value.unlock(); }
+    bool TryLock() { return value.try_lock(); }
+};
+struct LockGuard {
+    Mutex& value;
+    explicit LockGuard(Mutex& mutex): value(mutex) { value.Lock(); }
+    ~LockGuard() { value.Unlock(); }
+};
+struct CondVar {
+    std::condition_variable changed;
+    void Wait(Mutex* mutex) {
+        std::unique_lock lock(mutex->value, std::adopt_lock);
+        ++active_waits;
+        changed.wait(lock);
+        --active_waits;
+        (void)lock.release();
+    }
+    bool WaitFor(Mutex* mutex, uint32_t micros) {
+        std::unique_lock lock(mutex->value, std::adopt_lock);
+        const auto result = changed.wait_for(lock, std::chrono::microseconds(micros));
+        (void)lock.release();
+        return result != std::cv_status::timeout;
+    }
+    void Signal() { changed.notify_one(); }
+    void SignalAll() { changed.notify_all(); }
+};
+struct Thread { static bool IsMainThread() { return true; } };
+}
+namespace Profiler { void MarkFrame() {} }
+namespace Config {
+enum class LogDirection { Silent };
+bool GraphicsDebugDumpEnabled() { return false; }
+LogDirection GetPrintfDirection() { return LogDirection::Silent; }
+bool VrEnabled() { return false; }
+}
+namespace Libs {
+constexpr int OK = 0;
+namespace LibKernel {
+uint64_t KernelGetProcessTime() { return 11; }
+uint64_t KernelGetProcessTimeCounter() { return 22; }
+uint64_t KernelReadTsc() { return 33; }
+}
+namespace Hmd2 { void ClearStereoFrames() {} }
+namespace Graphics {
+struct CommandBuffer {};
+struct RenderContext {};
+namespace Vr {
+struct Bridge { bool Active() const { return false; } };
+Bridge& HostBridge() { static Bridge bridge; return bridge; }
+}
+void RenderDocOnGuestFlip(RenderContext&) {}
+struct Presenter {
+    struct Frame { std::atomic<unsigned> discarded {0}; };
+    struct Layer { Frame* frame; int bus; bool premultiplied_alpha; bool hold; };
+    std::mutex gate_mutex;
+    std::condition_variable gate_changed;
+    bool entered = false, released = false;
+    std::atomic<unsigned> calls {0}, clear_calls {0};
+    std::atomic<unsigned> refresh_calls {0};
+    std::atomic<bool> paused {false};
+    Frame blank;
+    std::array<Frame*, 4> current {};
+    RenderContext renderer;
+    RenderContext& Renderer() { return renderer; }
+    bool IsGuestPaused() const { return paused.load(); }
+    bool NeedsSystemOverlayRefresh() const { return false; }
+    bool PresentLastFrame() { ++refresh_calls; return true; }
+    Frame& PrepareBlankFrame(uint32_t, uint32_t, bool) { return blank; }
+    void Present(Frame& frame) {
+        const Layer layer {&frame, 0, false, false};
+        Present(std::span(&layer, 1));
+    }
+    void Discard(Frame& frame) {
+        if (frame.discarded.fetch_add(1) != 0) throw std::runtime_error("double frame release");
+    }
+    void Present(std::span<const Layer> layers) {
+        bool desktop_changed = false;
+        for (const auto& layer: layers) {
+            if (layer.hold && current[layer.bus] != nullptr && current[layer.bus] != layer.frame) {
+                if (layer.frame) Discard(*layer.frame);
+            } else {
+                if (current[layer.bus] && current[layer.bus] != layer.frame) Discard(*current[layer.bus]);
+                current[layer.bus] = layer.frame;
+                desktop_changed = true;
+            }
+        }
+        ++calls;
+        if (!desktop_changed) return;
+        std::unique_lock lock(gate_mutex);
+        entered = true;
+        gate_changed.notify_all();
+        gate_changed.wait(lock, [this] { return released; });
+    }
+    bool AwaitPresent() {
+        std::unique_lock lock(gate_mutex);
+        return gate_changed.wait_for(lock, 2s, [this] { return entered; });
+    }
+    void ReleasePresent() {
+        std::lock_guard lock(gate_mutex);
+        released = true;
+        gate_changed.notify_all();
+    }
+    void ClearLayer(int bus) {
+        ++clear_calls;
+        if (current[bus]) Discard(*std::exchange(current[bus], nullptr));
+    }
+};
+}
+namespace VideoOut {
+constexpr int VIDEO_OUT_BUS_TYPE_MAIN = 0, VIDEO_OUT_BUS_TYPE_OVERLAY = 1,
+              VIDEO_OUT_BUS_TYPE_SUB = 2, VIDEO_OUT_BUS_TYPE_HMD = 3;
+constexpr int VIDEO_OUT_BUFFER_NUM_MAX = 16, VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX = 4;
+constexpr size_t VIDEO_OUT_FLIP_QUEUE_CAPACITY = 16;
+constexpr uint64_t VIDEO_OUT_OUTPUT_MODE_DEFAULT = 1;
+constexpr int VIDEO_OUT_ERROR_INVALID_HANDLE = -1, VIDEO_OUT_ERROR_UNSUPPORTED_OPERATION = -2,
+              VIDEO_OUT_ERROR_RESOURCE_BUSY = -3, VIDEO_OUT_ERROR_INVALID_VALUE = -4,
+              VIDEO_OUT_ERROR_NO_DEVICE = -5;
+enum class FlipRequestSource { Cpu, GpuEop };
+enum class VideoOutEventKind { Flip, PreVblankStart, Vblank, OutputMode };
+using VideoOutEventQueues = std::vector<int>;
+struct VideoOutEventState {
+    Common::Mutex mutex;
+    VideoOutEventQueues flip, pre_vblank, vblank, output_mode;
+};
+struct BufferAttributeGroup { bool occupied = false; };
+struct ReserveWaitDiagnostic { uint64_t queue_begin_ns = 0, queue_acquired_ns = 0; };
+struct PreparationDiagnostics {};
+struct FlipPacingDiagnostics {
+    void RecordRequest(uint64_t, uint64_t, uint64_t, FlipRequestSource, bool) {
+        throw std::runtime_error("disabled pacing diagnostic recorded a request");
+    }
+    void RecordPresent(uint64_t, uint64_t, uint64_t) {
+        throw std::runtime_error("disabled pacing diagnostic recorded a presentation");
+    }
+};
+bool PerformanceDiagnostics() { return false; }
+uint64_t DiagnosticNowNs() { throw std::runtime_error("diagnostics must stay disabled"); }
+@DECLARATIONS@
+@QUEUE@
+struct VideoOutDriver {
+    struct Impl {
+        static constexpr std::array VIDEO_OUT_BUSES {0, 1, 2, 3};
+        static constexpr int VIDEO_OUT_NUM_MAX = 5;
+        Common::Mutex m_mutex;
+        VideoOutConfig m_video_out_ctx[VIDEO_OUT_NUM_MAX];
+        Graphics::Presenter& m_presenter;
+        FlipQueue m_flip_queue;
+        explicit Impl(Graphics::Presenter& presenter): m_presenter(presenter), m_flip_queue(presenter) {}
+        bool Close(int handle);
+        int Open(int bus, int index);
+        int SetFlipMaster(int slave, int master);
+        void VblankBegin();
+        void VblankEnd();
+        bool AsyncClockTick(bool paused);
+        void AsyncHostThread(std::stop_token token);
+    };
+};
+std::array<std::atomic<unsigned>, 4> events {};
+std::array<std::atomic<unsigned>, 4> vblank_events {}, pre_vblank_events {};
+void TriggerVideoOutEvents(VideoOutConfig& cfg, VideoOutEventKind kind, void*) {
+    if (kind == VideoOutEventKind::Flip) ++events[cfg.bus];
+    if (kind == VideoOutEventKind::Vblank) ++vblank_events[cfg.bus];
+    if (kind == VideoOutEventKind::PreVblankStart) ++pre_vblank_events[cfg.bus];
+}
+void DeleteVideoOutEvents(VideoOutEventQueues&, VideoOutEventKind) {}
+@METHODS@
+}
+}
+
+using namespace Libs;
+using namespace Libs::VideoOut;
+void Require(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
+template<class Predicate> bool Await(Predicate predicate) {
+    const auto deadline = std::chrono::steady_clock::now() + 500ms;
+    while (!predicate()) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::yield();
+    }
+    return true;
+}
+template<class Result> Result Finish(std::future<Result>& task) {
+    if (task.wait_for(2s) != std::future_status::ready) {
+        std::fprintf(stderr, "FATAL lifecycle task deadlocked after gate release\n");
+        std::fflush(stderr);
+        std::_Exit(2);
+    }
+    return task.get();
+}
+struct Scenario {
+    Graphics::Presenter presenter;
+    VideoOutDriver::Impl driver {presenter};
+    Scenario() {
+        for (auto& count: events) count = 0;
+        for (auto& count: vblank_events) count = 0;
+        for (auto& count: pre_vblank_events) count = 0;
+        for (int i = 1; i < VideoOutDriver::Impl::VIDEO_OUT_NUM_MAX; ++i) {
+            auto& cfg = driver.m_video_out_ctx[i];
+            cfg.opened = true;
+            cfg.generation = 1;
+            cfg.async_epoch_generation = cfg.generation;
+            cfg.bus = i - 1;
+        }
+    }
+    VideoOutConfig& Port(int handle = 1) { return driver.m_video_out_ctx[handle]; }
+    FlipQueue& Queue() { return driver.m_flip_queue; }
+    uint64_t Ready(int handle, Graphics::Presenter::Frame& frame, bool hold = false) {
+        auto& cfg = Port(handle);
+        Common::LockGuard port(cfg.mutex);
+        uint64_t id = 0;
+        Require(Queue().Reserve(cfg, 0, 100 + handle, FlipRequestSource::GpuEop, id, nullptr), "reserve ready fixture");
+        Common::LockGuard lock(Queue().m_mutex);
+        auto request = std::find_if(Queue().m_requests.begin(), Queue().m_requests.end(),
+                                   [id](const auto& r) { return r.id == id; });
+        request->frame = &frame;
+        request->state = FlipQueue::RequestState::Ready;
+        request->hold = hold;
+        return id;
+    }
+};
+
+void SubmitDuringPresent() {
+    Graphics::Presenter::Frame frame;
+    Scenario s;
+    s.Ready(1, frame);
+    auto present = std::async(std::launch::async, [&] { return s.Queue().Flip(0); });
+    const bool entered = s.presenter.AwaitPresent();
+    auto reserve = std::async(std::launch::async, [&] {
+        Common::LockGuard lock(s.Port().mutex);
+        uint64_t id = 0;
+        return s.Queue().Reserve(s.Port(), 1, 200, FlipRequestSource::Cpu, id, nullptr);
+    });
+    const bool available = reserve.wait_for(500ms) == std::future_status::ready;
+    s.presenter.ReleasePresent();
+    const bool did_present = Finish(present);
+    const bool reserved = Finish(reserve);
+    Require(entered && did_present && reserved, "normal present or next reservation failed");
+    Require(available, "guest Reserve blocked behind host Present port lock");
+    Require(s.Port().flip_status.count == 1 && s.Port().flip_status.flipPendingNum == 1 &&
+            s.Port().flip_status.gcQueueNum == 0 && events[0] == 1, "next request/status lost at completion");
+    s.Queue().Cancel(s.Port());
+    s.presenter.ClearLayer(0);
+    Require(frame.discarded == 1, "current frame ownership was lost");
+}
+
+void CloseDuringPresent(bool hold) {
+    Graphics::Presenter::Frame previous, frame, overlay;
+    Scenario s;
+    if (hold) {
+        s.presenter.current[0] = &previous;
+        // A held main frame alone returns immediately from the real Presenter. Add a
+        // changed master overlay so host presentation really can outlive that release.
+        Require(s.driver.SetFlipMaster(1, 2) == OK, "held group association failed");
+    }
+    s.Ready(1, frame, hold);
+    if (hold) s.Ready(2, overlay);
+    auto present = std::async(std::launch::async, [&] { return s.Queue().Flip(0); });
+    const bool entered = s.presenter.AwaitPresent();
+    auto close = std::async(std::launch::async, [&] { return s.driver.Close(1); });
+    const bool waiting = Await([] { return Common::active_waits.load() != 0; });
+    const bool premature = close.wait_for(0ms) == std::future_status::ready;
+    const auto clears_before = s.presenter.clear_calls.load();
+    const auto discards_before = frame.discarded.load();
+    s.presenter.ReleasePresent();
+    const bool did_present = Finish(present);
+    const bool closed = Finish(close);
+    Require(entered && did_present && closed && waiting && !premature, "Close did not wait for presenting ownership");
+    Require(clears_before == 0 && discards_before == unsigned(hold), "frame released while host still presents");
+    Require(events[0] == 0 && s.Port().flip_status.count == 0, "closed generation received stale flip completion");
+    Require(s.Port().generation == 2 && !s.Port().opened && s.Port().closing &&
+            s.Port().flip_status.flipPendingNum == 0 && s.Port().flip_status.gcQueueNum == 0,
+            "Close failed to retire old pending counters");
+    Require(s.Queue().m_requests.empty() && frame.discarded == 1 &&
+            (!hold || previous.discarded == 1), "consumed/held frame double-released or retained");
+    if (hold) s.presenter.ClearLayer(1);
+}
+
+void PartialGroupClose() {
+    Graphics::Presenter::Frame master_frame, slave_frame;
+    Scenario s;
+    Require(s.driver.SetFlipMaster(2, 1) == OK, "initial master/slave association failed");
+    s.Ready(2, slave_frame);
+    s.Ready(1, master_frame);
+    auto present = std::async(std::launch::async, [&] { return s.Queue().Flip(0); });
+    const bool entered = s.presenter.AwaitPresent();
+    auto close = std::async(std::launch::async, [&] { return s.driver.Close(2); });
+    const bool waiting = Await([] { return Common::active_waits.load() != 0; });
+    s.presenter.ReleasePresent();
+    const bool did_present = Finish(present);
+    const bool closed = Finish(close);
+    Require(entered && did_present && closed && waiting, "slave Close did not wait for group ownership");
+    Require(events[0] == 1 && events[1] == 0 && s.Port(1).flip_status.count == 1 &&
+            s.Port(2).flip_status.count == 0, "partial Close suppressed master or delivered stale slave event");
+    Require(s.Port(1).slave_count == 0 && s.Port(1).flip_status.flipPendingNum == 0 &&
+            s.Port(2).flip_status.flipPendingNum == 0 && s.Queue().m_requests.empty(),
+            "partial group completion left pending requests/association");
+    Require(slave_frame.discarded == 1 && master_frame.discarded == 0,
+            "slave Close released master image or lost its own");
+    s.presenter.ClearLayer(0);
+}
+
+void NotDueThenCancel() {
+    Graphics::Presenter::Frame frame;
+    Scenario s;
+    s.Port().flip_rate = 1;
+    s.Port().vblank_status.count = 1;
+    s.Ready(1, frame);
+    Require(!s.Queue().Flip(0), "not-due group was presented");
+    Require(s.presenter.calls == 0 && !s.Queue().m_processing &&
+            s.Queue().m_requests.front().state == FlipQueue::RequestState::Ready &&
+            s.Port().flip_status.flipPendingNum == 1 && events[0] == 0,
+            "not-due group did not remain Ready");
+    s.Queue().Cancel(s.Port());
+    Require(frame.discarded == 1 && s.Queue().m_requests.empty() &&
+            s.Port().flip_status.flipPendingNum == 0, "not-due cancellation leaked/double-discarded frame");
+}
+
+void GenerationMismatch() {
+    Graphics::Presenter::Frame frame;
+    Scenario s;
+    s.Ready(1, frame);
+    auto present = std::async(std::launch::async, [&] { return s.Queue().Flip(0); });
+    const bool entered = s.presenter.AwaitPresent();
+    auto invalidate = std::async(std::launch::async, [&] {
+        Common::LockGuard lock(s.Port().mutex);
+        ++s.Port().generation;
+        return true;
+    });
+    const bool changed = invalidate.wait_for(500ms) == std::future_status::ready;
+    s.presenter.ReleasePresent();
+    const bool did_present = Finish(present);
+    (void)Finish(invalidate);
+    Require(entered && did_present && changed, "generation change blocked by host Present");
+    Require(events[0] == 0 && s.Port().flip_status.count == 0 && s.Queue().m_requests.empty(),
+            "mismatched generation published stale status/event");
+    s.Queue().Cancel(s.Port());
+    s.presenter.ClearLayer(0);
+    Require(frame.discarded == 1, "generation retirement double-discarded consumed image");
+}
+
+void MasterChangeWhilePresenting() {
+    Graphics::Presenter::Frame frame;
+    Scenario s;
+    s.Ready(1, frame);
+    auto present = std::async(std::launch::async, [&] { return s.Queue().Flip(0); });
+    const bool entered = s.presenter.AwaitPresent();
+    auto associate = std::async(std::launch::async, [&] { return s.driver.SetFlipMaster(1, 2); });
+    const bool available = associate.wait_for(500ms) == std::future_status::ready;
+    s.presenter.ReleasePresent();
+    const bool did_present = Finish(present);
+    const int result = Finish(associate);
+    Require(entered && did_present && available && result == VIDEO_OUT_ERROR_RESOURCE_BUSY,
+            "presenting port association changed or waited behind host Present");
+    Require(s.Port(1).master == nullptr && s.Port(2).slave_count == 0, "busy association modified config");
+    s.presenter.ClearLayer(0);
+}
+
+void RecordingCompletionAfterClose() {
+    Graphics::Presenter::Frame displayed, recording;
+    Scenario s;
+    s.Ready(1, displayed);
+    const auto pending = s.Ready(1, recording);
+    {
+        Common::LockGuard lock(s.Queue().m_mutex);
+        s.Queue().m_requests.back().state = FlipQueue::RequestState::Recording;
+    }
+    auto present = std::async(std::launch::async, [&] { return s.Queue().Flip(0); });
+    const bool entered = s.presenter.AwaitPresent();
+    auto close = std::async(std::launch::async, [&] { return s.driver.Close(1); });
+    const bool waiting = Await([] { return Common::active_waits.load() != 0; });
+    s.presenter.ReleasePresent();
+    const bool did_present = Finish(present);
+    const bool closed = Finish(close);
+    Require(entered && did_present && closed && waiting, "Close lost presentation ownership while recording next frame");
+    Require(displayed.discarded == 1 && recording.discarded == 0 &&
+            s.Queue().m_requests.empty() && s.Queue().m_cancelled_requests.size() == 1,
+            "Close released a still-recording frame or retained a consumed one");
+    s.Queue().Complete(pending);
+    Require(recording.discarded == 1 && s.Queue().m_cancelled_requests.empty() &&
+            events[0] == 0 && s.Port().flip_status.flipPendingNum == 0,
+            "late GPU completion published stale event or lost cancelled frame");
+}
+
+void AsyncClockDuringPresent() {
+    Graphics::Presenter::Frame frame;
+    Scenario s;
+    s.driver.AsyncClockTick(false);
+    s.Ready(1, frame);
+    auto present = std::async(std::launch::async, [&] { return s.Queue().Flip(0, nullptr, true); });
+    const bool entered = s.presenter.AwaitPresent();
+    auto tick = std::async(std::launch::async, [&] { return s.driver.AsyncClockTick(false); });
+    const bool clock_free = tick.wait_for(500ms) == std::future_status::ready;
+    s.presenter.ReleasePresent();
+    const bool did_present = Finish(present);
+    (void)Finish(tick);
+    Require(entered && did_present && clock_free, "host Present stalled independent guest clock");
+    Require(s.Port().vblank_status.count == 2 && vblank_events[0] == 2 &&
+            pre_vblank_events[0] == 2 && events[0] == 0, "clock delivered an unfinished host flip");
+    Require(s.Queue().m_requests.size() == 1 && s.Queue().m_requests.front().frame == nullptr &&
+            s.Queue().m_requests.front().state == FlipQueue::RequestState::CompletedAwaitVblank,
+            "completed request still owns consumed frame");
+    Require(s.driver.AsyncClockTick(false) && events[0] == 1 && s.Queue().m_requests.empty() &&
+            s.Port().flip_status.flipPendingNum == 0, "next clock did not publish completed metadata");
+    s.presenter.ClearLayer(0);
+    Require(frame.discarded == 1, "async publication released frame ownership twice");
+}
+
+void AsyncReadyWakeAndStop() {
+    Graphics::Presenter::Frame frame;
+    Scenario s;
+    s.driver.AsyncClockTick(false);
+    const auto id = s.Ready(1, frame);
+    {
+        Common::LockGuard lock(s.Queue().m_mutex);
+        s.Queue().m_requests.back().state = FlipQueue::RequestState::Recording;
+    }
+    std::stop_source stop;
+    auto worker = std::async(std::launch::async, [&] { s.driver.AsyncHostThread(stop.get_token()); return true; });
+    const bool asleep = Await([] { return Common::active_waits.load() != 0; });
+    const auto old_revision = s.Queue().AsyncRevision();
+    s.Queue().Complete(id);
+    const bool entered = s.presenter.AwaitPresent();
+    // Ready arrived before this wait: its revision must prevent a lost notification.
+    auto old_wait = std::async(std::launch::async, [&] {
+        s.Queue().WaitAsyncEvent(old_revision, stop.get_token()); return true;
+    });
+    const bool no_lost_wake = old_wait.wait_for(500ms) == std::future_status::ready;
+    stop.request_stop();
+    s.Queue().WakeAsync();
+    s.presenter.ReleasePresent();
+    (void)Finish(worker);
+    (void)Finish(old_wait);
+    const bool retained = s.Queue().m_requests.size() == 1 &&
+        s.Queue().m_requests.front().state == FlipQueue::RequestState::CompletedAwaitVblank &&
+        s.Queue().m_requests.front().frame == nullptr;
+    // Shutdown may stop the clock first; Close must retire metadata without a future tick.
+    auto close = std::async(std::launch::async, [&] { return s.driver.Close(1); });
+    const bool closed = Finish(close);
+    Require(asleep && entered && no_lost_wake && retained && closed,
+            "Ready wake, stop or clock-independent completed cancellation failed");
+    Require(s.presenter.calls == 1 && events[0] == 0 && frame.discarded == 1 &&
+            s.Queue().m_requests.empty(), "stopping worker leaked or republished completed ownership");
+}
+
+void AsyncEpochAndFlipRate() {
+    Graphics::Presenter::Frame a, b, c;
+    Scenario s;
+    s.driver.AsyncClockTick(false);
+    s.presenter.ReleasePresent();
+    s.Ready(1, a);
+    Require(s.Queue().Flip(0, nullptr, true), "first async epoch failed admission");
+    s.Ready(1, b);
+    const bool duplicate = s.Queue().Flip(0, nullptr, true);
+    if (duplicate) {
+        s.Queue().Cancel(s.Port());
+        s.presenter.ClearLayer(0);
+        Require(false, "same port was admitted twice in one epoch");
+    }
+    Require(s.Port().flip_status.flipPendingNum == 2 && events[0] == 0,
+            "admission changed guest completion counters");
+    s.Port().flip_rate = 1;
+    s.driver.AsyncClockTick(false); // count 1 is not publication-due; epoch/count becomes 2.
+    Require(s.Queue().Flip(0, nullptr, true), "completed metadata blocked next due Ready owner");
+    s.driver.AsyncClockTick(false); // publish A at count 2; B must wait for another due epoch.
+    Require(events[0] == 1 && s.Port().flip_status.flipPendingNum == 1,
+            "same port published twice in one epoch");
+    s.Ready(1, c);
+    Require(!s.Queue().Flip(0, nullptr, true), "rate 1 admitted at odd Vblank count");
+    s.driver.AsyncClockTick(false);
+    Require(s.Queue().Flip(0, nullptr, true), "rate 1 failed next even Vblank admission");
+    s.driver.Close(1);
+    Require(a.discarded == 1 && b.discarded == 1 && c.discarded == 1 && events[0] == 1,
+            "completed/queued Close double-released images or published notifications");
+}
+
+void AsyncCompletedOwnersAndRecordingHead(bool cancel_both = false) {
+    Graphics::Presenter::Frame a, b, c;
+    Scenario s;
+    s.driver.AsyncClockTick(false);
+    s.Ready(1, a);
+    auto present = std::async(std::launch::async, [&] { return s.Queue().Flip(0, nullptr, true); });
+    const bool entered = s.presenter.AwaitPresent();
+    s.Ready(1, b);
+    auto tick = std::async(std::launch::async, [&] { return s.driver.AsyncClockTick(false); });
+    const bool clock_free = tick.wait_for(500ms) == std::future_status::ready;
+    s.presenter.ReleasePresent();
+    const bool did_present = Finish(present);
+    (void)Finish(tick);
+    Require(entered && clock_free && did_present && s.Queue().Flip(0, nullptr, true),
+            "completed owner blocked Ready owner after host completion crossed a tick");
+    Require(s.Queue().m_requests.size() == 2 && std::all_of(
+                s.Queue().m_requests.begin(), s.Queue().m_requests.end(), [](const auto& request) {
+                    return request.state == FlipQueue::RequestState::CompletedAwaitVblank && request.frame == nullptr;
+                }), "two completed owners retained GPU frames");
+    if (cancel_both) {
+        s.driver.Close(1);
+        Require(events[0] == 0 && a.discarded == 1 && b.discarded == 1 &&
+                s.Queue().m_requests.empty() && s.Port().flip_status.flipPendingNum == 0,
+                "Close did not retire both completed owners without a clock or double discard");
+        return;
+    }
+    const auto first_id = s.Queue().m_requests.front().id;
+    s.driver.AsyncClockTick(false);
+    Require(events[0] == 1 && s.Queue().m_requests.size() == 1 &&
+            s.Queue().m_requests.front().id != first_id && s.Port().flip_status.flipPendingNum == 1,
+            "publication lost FIFO or emitted both completions in one epoch");
+    s.driver.Close(1);
+    Require(a.discarded == 1 && b.discarded == 1 && s.Queue().m_requests.empty(),
+            "Close did not clear unpublished completion without double discard");
+    const auto old_generation = s.Port().generation;
+    Require(s.driver.Open(VIDEO_OUT_BUS_TYPE_MAIN, 0) == 1 && s.Port().generation > old_generation &&
+            s.Port().async_epoch_generation == s.Port().generation &&
+            s.Port().async_admitted_epoch == 0 && s.Port().async_published_epoch == 0,
+            "reopen did not reset generation-scoped epochs");
+    s.driver.AsyncClockTick(false);
+    Require(events[0] == 1 && s.Port().flip_status.count == 0, "reopened port received old generation event");
+    const auto recording = s.Ready(1, c);
+    Graphics::Presenter::Frame later;
+    s.Ready(1, later);
+    {
+        Common::LockGuard lock(s.Queue().m_mutex);
+        s.Queue().m_requests.front().state = FlipQueue::RequestState::Recording;
+    }
+    Require(!s.Queue().Flip(0, nullptr, true), "async host skipped unfinished Recording owner");
+    s.Queue().Complete(recording);
+    Require(s.Queue().Flip(0, nullptr, true), "Recording head did not recover after Complete");
+    s.driver.Close(1);
+    Require(c.discarded == 1 && later.discarded == 1, "Recording/Ready close lost ownership");
+}
+
+void AsyncSlowHostFlipRatePublication() {
+    Graphics::Presenter::Frame master, slave;
+    Scenario s;
+    Require(s.driver.SetFlipMaster(2, 1) == OK, "async master/slave setup failed");
+    s.Port(1).flip_rate = 1;
+    s.Port(2).flip_rate = 2; // Only the owner controls the group cadence.
+    s.driver.AsyncClockTick(false);
+    s.Ready(2, slave);
+    s.Ready(1, master);
+    Require(!s.Queue().Flip(0, nullptr, true), "rate 1 owner admitted on odd tick");
+    s.driver.AsyncClockTick(false);
+    auto present = std::async(std::launch::async, [&] { return s.Queue().Flip(0, nullptr, true); });
+    const bool entered = s.presenter.AwaitPresent();
+    auto tick = std::async(std::launch::async, [&] { return s.driver.AsyncClockTick(false); });
+    const bool clock_free = tick.wait_for(500ms) == std::future_status::ready;
+    s.presenter.ReleasePresent();
+    const bool did_present = Finish(present);
+    (void)Finish(tick);
+    Require(entered && clock_free && did_present && s.Port(1).vblank_status.count == 3,
+            "slow grouped host presentation did not cross a clock tick");
+    Require(!s.driver.AsyncClockTick(false) && events[0] == 0 && events[1] == 0,
+            "rate 1 published at odd owner count after slow host call");
+    Require(s.driver.AsyncClockTick(false) && events[0] == 1 && events[1] == 1,
+            "slave rate incorrectly blocked owner's even-count publication");
+    s.driver.Close(2);
+    s.driver.Close(1);
+    Require(master.discarded == 1 && slave.discarded == 1, "grouped async close lost image ownership");
+}
+
+void AsyncCloseDuringPresentAndReopen() {
+    Graphics::Presenter::Frame frame;
+    Scenario s;
+    s.driver.AsyncClockTick(false);
+    s.Ready(1, frame);
+    auto present = std::async(std::launch::async, [&] { return s.Queue().Flip(0, nullptr, true); });
+    const bool entered = s.presenter.AwaitPresent();
+    auto close = std::async(std::launch::async, [&] { return s.driver.Close(1); });
+    const bool waiting = Await([] { return Common::active_waits.load() != 0; });
+    auto reopen = std::async(std::launch::async, [&] { return s.driver.Open(VIDEO_OUT_BUS_TYPE_MAIN, 0); });
+    const bool reopened_early = reopen.wait_for(0ms) == std::future_status::ready;
+    s.presenter.ReleasePresent();
+    const bool did_present = Finish(present);
+    const bool closed = Finish(close);
+    const int opened = Finish(reopen);
+    Require(entered && waiting && !reopened_early && did_present && closed && opened == 1,
+            "async Close/reopen did not serialize with presenting ownership");
+    s.driver.AsyncClockTick(false);
+    Require(events[0] == 0 && s.Port().flip_status.count == 0 &&
+            s.Port().flip_status.flipPendingNum == 0 && s.Queue().m_requests.empty() && frame.discarded == 1,
+            "closed/reopened generation received stale async completion or frame");
+}
+
+void AsyncPauseAndWorkerRefresh() {
+    Graphics::Presenter::Frame frame;
+    Scenario s;
+    s.driver.AsyncClockTick(false);
+    s.presenter.paused = true;
+    s.driver.AsyncClockTick(true);
+    s.Ready(1, frame);
+    Require(s.Port().vblank_status.count == 1 && vblank_events[0] == 1 &&
+            s.presenter.refresh_calls == 0 && !s.Queue().Flip(0, nullptr, true),
+            "paused clock advanced guest state, presented or admitted Ready work");
+    std::stop_source stop;
+    auto worker = std::async(std::launch::async, [&] { s.driver.AsyncHostThread(stop.get_token()); return true; });
+    const bool refreshed = Await([&] { return s.presenter.refresh_calls.load() == 1; });
+    stop.request_stop();
+    s.Queue().WakeAsync();
+    s.presenter.ReleasePresent();
+    (void)Finish(worker);
+    Require(refreshed && s.presenter.calls == 0 && events[0] == 0,
+            "pause refresh was lost or Ready work presented while paused");
+    s.presenter.paused = false;
+    s.driver.AsyncClockTick(false);
+    Require(s.Port().vblank_status.count == 2 && s.Queue().Flip(0, nullptr, true),
+            "Ready work did not resume after paused epoch");
+    s.driver.Close(1);
+    Require(frame.discarded == 1, "pause/resume cancellation leaked image");
+}
+
+int main(int argc, char** argv) {
+    if (argc != 1 && (argc != 3 || std::string_view(argv[1]) != "--case")) {
+        std::fprintf(stderr, "Usage: VideoOutFlipLifecycleRegression [--case NAME]\n");
+        return 2;
+    }
+    const std::string_view selected = argc == 3 ? argv[2] : "";
+    unsigned failures = 0;
+    unsigned executed = 0;
+    const auto run = [&failures, &executed, selected](const char* name, auto test) {
+        if (!selected.empty() && selected != name) return;
+        ++executed;
+        try { test(); std::printf("PASS %s\n", name); }
+        catch (const std::exception& error) {
+            ++failures;
+            std::fprintf(stderr, "FAIL %s: %s\n", name, error.what());
+        }
+    };
+    run("submit_during_present", SubmitDuringPresent);
+    run("close_during_present", [] { CloseDuringPresent(false); });
+    run("hold_close_no_double_release", [] { CloseDuringPresent(true); });
+    run("partial_master_slave_close", PartialGroupClose);
+    run("not_due_ready_cancel", NotDueThenCancel);
+    run("generation_mismatch", GenerationMismatch);
+    run("master_change_busy", MasterChangeWhilePresenting);
+    run("recording_completion_after_close", RecordingCompletionAfterClose);
+    run("async_clock_during_present", AsyncClockDuringPresent);
+    run("async_ready_wake_and_stop", AsyncReadyWakeAndStop);
+    run("async_epoch_and_flip_rate", AsyncEpochAndFlipRate);
+    run("async_completed_owners_and_recording_head", [] { AsyncCompletedOwnersAndRecordingHead(); });
+    run("async_cancel_two_completed", [] { AsyncCompletedOwnersAndRecordingHead(true); });
+    run("async_slow_host_flip_rate_publication", AsyncSlowHostFlipRatePublication);
+    run("async_close_present_and_reopen", AsyncCloseDuringPresentAndReopen);
+    run("async_pause_and_worker_refresh", AsyncPauseAndWorkerRefresh);
+    if (executed == 0) {
+        std::fprintf(stderr, "Unknown regression case: %s\n", argv[2]);
+        return 2;
+    }
+    return failures == 0 ? 0 : 1;
+}

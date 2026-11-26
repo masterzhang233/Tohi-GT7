@@ -37,6 +37,8 @@
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/window/gt7DlssFrameGen.h"
+#include "graphics/presentation/window/gt7FrameGen.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
@@ -43307,17 +43309,42 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+  if (argc == 2 && std::strcmp(argv[1], "--framegen-disabled-only") == 0) {
+    // CTest registers this only when both FG runtimes are compiled out. Run
+    // before Config/Vulkan initialization to cover inherited launch settings.
+    for (const char* name : {"KYTY_GT7_DLSS_FG", "KYTY_GT7_FSR_FG",
+                             "KYTY_GT7_NATIVE_ASYNC_PRESENT"}) {
+      const char* value = std::getenv(name);
+      if (value == nullptr || std::strcmp(value, "1") != 0) {
+        std::fprintf(stderr, "[host] framegen-disabled requires %s=1\n", name);
+        return 1;
+      }
+    }
+    const bool dlss_requested = Gt7DlssFrameGen::Requested();
+    const bool fsr_requested = Gt7FrameGen::Requested();
+    if (dlss_requested || fsr_requested) {
+      std::fprintf(stderr,
+                   "[host] compiled-out frame generation was requested (DLSS=%d FSR=%d)\n",
+                   dlss_requested, fsr_requested);
+      return 1;
+    }
+    std::printf("[host]    %-32s ok\n", "FrameGenDisabledBuild");
+    return 0;
+  }
   SetProbeSetting();
   const bool native_pssr_1080_4k = argc == 2 &&
       std::strcmp(argv[1], "--pssr-dlss-1080-4k-integration") == 0;
-  g_native_pssr_integration = native_pssr_1080_4k ||
+  const bool native_pssr_1440_4k = argc == 2 &&
+      std::strcmp(argv[1], "--pssr-dlss-1440-4k-integration") == 0;
+  g_native_pssr_integration = native_pssr_1080_4k || native_pssr_1440_4k ||
       (argc == 2 && std::strcmp(argv[1], "--pssr-dlss-integration") == 0);
   if (g_native_pssr_integration) InitializeNativePssrDriverForTest();
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
   if (g_native_pssr_integration) {
     VulkanHarness vulkan;
-    if (native_pssr_1080_4k) vulkan.CheckPssrNative1080To4K();
+    if (native_pssr_1080_4k) vulkan.CheckPssrNativeTo4K<1920, 1080>();
+    else if (native_pssr_1440_4k) vulkan.CheckPssrNativeTo4K<2560, 1440>();
     else vulkan.CheckPssrNative();
     return 0;
   }

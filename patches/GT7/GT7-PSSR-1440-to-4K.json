@@ -1,0 +1,44 @@
+{
+  "id": "PPSA01317",
+  "version": "01.710.000",
+  "process": "eboot.bin",
+  "mods": [
+    {
+      "name": "Native PSSR 1440p-to-4K scene scale candidate",
+      "enabled": true,
+      "memory": [
+        {
+          "offset": "1173F1",
+          "off": "C4C17B10A4CE10010000",
+          "on": "C4E27918252AED5D0490"
+        }
+      ]
+    }
+  ],
+  "native_pssr_scene_scale": {
+    "status": "Offline-verified candidate; actual main-race PSSR inputs and image quality require game validation",
+    "requires": [
+      "--ps5-pro",
+      "--pssr-dlss",
+      "--gt7-pssr-1440-4k"
+    ],
+    "nominal_input": [
+      2560,
+      1440
+    ],
+    "nominal_output": [
+      3840,
+      2160
+    ],
+    "scale": 0.6666666666666666,
+    "scale_float32": 0.6666666865348816,
+    "read_only_scale_literal_rva": "46F6124",
+    "method": "Override the native scene controller endpoints to the existing float32 2/3 literal; preserve Pro quantization, target sizing, viewport setup and native Psml/PSSR dispatch",
+    "offline_evidence": "686 controller/Pro-quantizer/target-size cases produce 2560x1440 for a standard 3840x2160 Pro scene; 686 VR bypass cases remain unchanged. Descriptor and viewport setters are checked in both native formats. The 1080p preset is separately rechecked over the same cases.",
+    "caveats": "Standard main-scene sizing only. Special viewports, per-scene multipliers and secondary targets may differ. Native color/depth/motion dimensions, jitter and scales remain supplied by the game, never replaced with nominal metadata. Does not force physical allocation size, LOD, shadows or Sony PSSR model execution. DLSS reconstructs the native PSSR inputs. This profile does not enable frame generation or impose an FPS cap."
+  },
+  "strict_main_module": true,
+  "main_module_source_base": 0,
+  "eboot_sha256": "9bef586d199c088b1e558333ba897507235dae2e148a9c6e3de93eedbb5f88bf",
+  "executable_image_sha256": "f2fab719a2f5caab44ed389a87953cefca78905a0b9b081d023ad33bccbe3aaf"
+}

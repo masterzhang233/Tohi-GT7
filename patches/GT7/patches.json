@@ -40,6 +40,10 @@
     {
       "file": "GT7-PSSR-1080-to-4K.json",
       "sha256": "282da91e431164d1c2437bf7071239e2b26ec1cd824bf0a86e938bb6fce32b30"
+    },
+    {
+      "file": "GT7-PSSR-1440-to-4K.json",
+      "sha256": "5b05b13d0c9732fb84781b3e20b3cac2865a090ad73d49b0b1c0eb4602b94a1d"
     }
   ],
   "executable_image_sha256": "f2fab719a2f5caab44ed389a87953cefca78905a0b9b081d023ad33bccbe3aaf"

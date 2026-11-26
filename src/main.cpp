@@ -112,6 +112,7 @@ static void PrintUsage() {
 	::printf("  --game-patch <json>                  ETAHen cheat file.\n");
 	::printf("  --gt7-desktop-height <value>         Internal GT7 3D height: native, 1080, 1440, 2160.\n");
 	::printf("  --gt7-pssr-1080-4k                   Request GT7 Native PSSR 1080p-to-4K preset; requires --ps5-pro --pssr-dlss.\n");
+	::printf("  --gt7-pssr-1440-4k                   Request GT7 Native PSSR 1440p-to-4K preset; requires --ps5-pro --pssr-dlss.\n");
 	::printf("  --gt7-vr-scale <value>               GT7 eye render scale: 100, 110, 120, 125; requires --vr.\n");
 	::printf("  --gt7-check-only                     Validate the selected GT7 profile without starting the game.\n");
 	::printf("  --graphics-check-only               Initialize the real Vulkan graphics path, then exit without loading guest code.\n");
@@ -294,12 +295,13 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			gt7.check_only = true;
 			continue;
 		}
-		if (arg == "--gt7-pssr-1080-4k") {
-			if (gt7.native_pssr_1080_4k) {
-				::printf("--gt7-pssr-1080-4k can only be specified once\n");
+		if (arg == "--gt7-pssr-1080-4k" || arg == "--gt7-pssr-1440-4k") {
+			auto& requested = arg == "--gt7-pssr-1440-4k" ? gt7.native_pssr_1440_4k : gt7.native_pssr_1080_4k;
+			if (requested) {
+				::printf("%s can only be specified once\n", arg.c_str());
 				return false;
 			}
-			gt7.native_pssr_1080_4k = true;
+			requested = true;
 			continue;
 		}
 		if (arg == "--graphics-check-only") {
@@ -620,9 +622,10 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		::printf("--gt7-check-only and --graphics-check-only are mutually exclusive\n");
 		return false;
 	}
-	if (!show_help && gt7.native_pssr_1080_4k &&
+	if (!show_help && gt7.NativePssrRequested() &&
 	    (!options.config.pro_enabled || !options.config.pssr_dlss_enabled)) {
-		::printf("--gt7-pssr-1080-4k requires both --ps5-pro and --pssr-dlss\n");
+		::printf("%s requires both --ps5-pro and --pssr-dlss\n",
+		         gt7.native_pssr_1440_4k ? "--gt7-pssr-1440-4k" : "--gt7-pssr-1080-4k");
 		return false;
 	}
 	if (!show_help && options.config.pssr_dlss_enabled && !options.config.pro_enabled) {
@@ -762,9 +765,9 @@ static bool PrepareGt7Profile(const Loader::Gt7Profile::Request& request,
 	}
 	::printf("GT7 profile: verified executable image and original patch bytes; %s; disk game unchanged\n",
 	         options.game_patch.filename().string().c_str());
-	if (request.native_pssr_1080_4k) {
-		::printf("GT7 profile: requested Native PSSR preset=1080p-to-4K; window output=%ux%u; actual PSSR input/output dimensions require runtime verification\n",
-		         options.config.screen_width, options.config.screen_height);
+	if (request.NativePssrRequested()) {
+		::printf("GT7 profile: requested Native PSSR preset=%up-to-4K; window output=%ux%u; actual PSSR input/output dimensions require runtime verification\n",
+		         request.native_pssr_1440_4k ? 1440u : 1080u, options.config.screen_width, options.config.screen_height);
 	} else {
 		::printf("GT7 profile: internal height=%d VR scale=%d; output=%ux%u (independent window size)\n",
 		         request.desktop_height, request.vr_scale, options.config.screen_width, options.config.screen_height);

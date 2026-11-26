@@ -827,8 +827,8 @@ To use your own sound, replace the emulator&apos;s assets/sounds/trophy-unlock.w
         <translation>GT7 画面预设</translation>
     </message>
     <message>
-        <source>Enable 4K + NVIDIA 2X on the launcher for 1920 x 1080 to 3840 x 2160 using native PSSR inputs and DLSS. Supports NVIDIA GeForce RTX 40/50 series only.</source>
-        <translation>在启动器中启用“4K + NVIDIA 2X”，通过原生 PSSR 输入与 DLSS 将 1920 × 1080 重建至 3840 × 2160。仅支持 NVIDIA GeForce RTX 40/50 系列。</translation>
+        <source>Enable PSSR 4K on the launcher for 2560 x 1440 to 3840 x 2160 using native PSSR inputs and DLSS. Frame generation is disabled. Supports NVIDIA GeForce RTX 40/50 series only.</source>
+        <translation>在启动器中启用“PSSR 4K”，通过原生 PSSR 输入与 DLSS 将 2560 × 1440 重建至 3840 × 2160。帧生成已关闭，仅支持 NVIDIA GeForce RTX 40/50 系列。</translation>
     </message>
 </context>
 <context>
@@ -1491,32 +1491,32 @@ Log folder:
 %2</translation>
     </message>
     <message>
-        <source>Tohi-GT7 1.0.3</source>
-        <translation>Tohi-GT7 1.0.3</translation>
+        <source>Tohi-GT7 1.0.4</source>
+        <translation>Tohi-GT7 1.0.4</translation>
     </message>
     <message>
         <source>Tohi-GT7</source>
         <translation>Tohi-GT7</translation>
     </message>
     <message>
-        <source>1.0.3  /  RELEASE</source>
-        <translation>1.0.3  /  正式版</translation>
+        <source>1.0.4  /  RELEASE</source>
+        <translation>1.0.4  /  正式版</translation>
     </message>
     <message>
         <source>Ready for your next drive.</source>
         <translation>下一程，即刻出发。</translation>
     </message>
     <message>
-        <source>4K + NVIDIA 2X</source>
-        <translation>4K + NVIDIA 2X</translation>
+        <source>PSSR 4K</source>
+        <translation>PSSR 4K</translation>
     </message>
     <message>
-        <source>Uses native PSSR inputs with the PC DLSS backend at 1920 x 1080 to 3840 x 2160. NVIDIA fixed 2X adds one generated frame per rendered frame. Supports NVIDIA GeForce RTX 40/50 series only. Changes apply on the next launch.</source>
-        <translation>使用原生 PSSR 输入，通过 PC 端 DLSS 将 1920 × 1080 重建至 3840 × 2160。NVIDIA 固定 2X 为每个实际渲染帧生成一个额外帧。仅支持 NVIDIA GeForce RTX 40/50 系列，下次启动游戏时生效。</translation>
+        <source>Reconstructs 2560 x 1440 native PSSR inputs to 3840 x 2160 with the PC DLSS backend. Frame generation and extra frame caps are disabled. Supports NVIDIA GeForce RTX 40/50 series only. Changes apply on the next launch.</source>
+        <translation>使用原生 PSSR 输入，通过 PC 端 DLSS 将 2560 × 1440 重建至 3840 × 2160。帧生成与额外限帧已关闭。仅支持 NVIDIA GeForce RTX 40/50 系列，下次启动游戏时生效。</translation>
     </message>
     <message>
-        <source>1080p → 4K · Native PSSR inputs + DLSS · Fixed 2X frame generation</source>
-        <translation>1080p → 4K · 原生 PSSR 输入 + DLSS · 固定 2X 帧生成</translation>
+        <source>1440p → 4K · Native PSSR inputs + DLSS · Frame generation off</source>
+        <translation>1440p → 4K · 原生 PSSR 输入 + DLSS · 帧生成关闭</translation>
     </message>
     <message>
         <source>Start game</source>
@@ -1531,11 +1531,11 @@ Log folder:
         <translation>使用 GT7 画面预设前，请禁用自定义游戏补丁。这些预设需要使用各自经过验证的补丁方案。</translation>
     </message>
     <message>
-        <source>The 4K + NVIDIA 2X preset needs the complete Tohi-GT7 release package.
+        <source>The PSSR 4K preset needs the complete Tohi-GT7 release package.
 Missing files: %1
 
 Extract the full package, or turn off the graphics preset.</source>
-        <translation>4K + NVIDIA 2X 预设需要完整的 Tohi-GT7 发布包。
+        <translation>PSSR 4K 预设需要完整的 Tohi-GT7 发布包。
 缺少文件：%1
 
 请完整解压发布包，或关闭画质预设。</translation>
@@ -1551,8 +1551,8 @@ Extract the full package, or turn off the graphics preset.</source>
     </message>
 
     <message>
-        <source>NVIDIA DLSS Super Resolution + Frame Generation</source>
-        <translation>NVIDIA DLSS 超分辨率 + 帧生成</translation>
+        <source>NVIDIA DLSS Super Resolution</source>
+        <translation>NVIDIA DLSS 超分辨率</translation>
     </message>
     <message><source>RELEASE</source><translation>正式版</translation></message>
 </context>
@@ -1733,12 +1733,12 @@ Open this run&apos;s log folder or export a diagnostic ZIP for analysis.</source
         <translation>游戏运行中…</translation>
     </message>
     <message>
-        <source>1080p → 4K · Native PSSR inputs + DLSS · Fixed 2X frame generation</source>
-        <translation>1080p → 4K · 原生 PSSR 输入 + DLSS · 固定 2X 帧生成</translation>
+        <source>1440p → 4K · Native PSSR inputs + DLSS · Frame generation off</source>
+        <translation>1440p → 4K · 原生 PSSR 输入 + DLSS · 帧生成关闭</translation>
     </message>
     <message>
-        <source>4K upscaling and frame generation off · Desktop rendering</source>
-        <translation>4K 超分辨率与帧生成已关闭 · 桌面渲染</translation>
+        <source>4K upscaling off · Desktop rendering · Frame generation off</source>
+        <translation>4K 超分辨率关闭 · 桌面渲染 · 帧生成关闭</translation>
     </message>
     <message>
         <source>Select Gran Turismo 7 in the game library to start.</source>
@@ -1761,11 +1761,11 @@ Open this run&apos;s log folder or export a diagnostic ZIP for analysis.</source
     </message>
 
     <message>
-        <source>The 4K + NVIDIA 2X preset needs the complete Tohi-GT7 release package.
+        <source>The PSSR 4K preset needs the complete Tohi-GT7 release package.
 Missing files: %1
 
 Extract the full package, or turn off the graphics preset.</source>
-        <translation>4K + NVIDIA 2X 预设需要完整的 Tohi-GT7 发布包。
+        <translation>PSSR 4K 预设需要完整的 Tohi-GT7 发布包。
 缺少文件：%1
 
 请完整解压发布包，或关闭画质预设。</translation>

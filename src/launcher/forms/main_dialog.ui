@@ -40,12 +40,12 @@
       <item><layout class="QVBoxLayout" name="graphicsDetailsLayout">
        <property name="spacing"><number>7</number></property>
        <item><widget class="QCheckBox" name="gt7_dlss_checkbox">
-        <property name="text"><string>4K + NVIDIA 2X</string></property>
+        <property name="text"><string>PSSR 4K</string></property>
         <property name="checked"><bool>true</bool></property>
-        <property name="toolTip"><string>Uses native PSSR inputs with the PC DLSS backend at 1920 x 1080 to 3840 x 2160. NVIDIA fixed 2X adds one generated frame per rendered frame. Supports NVIDIA GeForce RTX 40/50 series only. Changes apply on the next launch.</string></property>
+        <property name="toolTip"><string>Reconstructs 2560 x 1440 native PSSR inputs to 3840 x 2160 with the PC DLSS backend. Frame generation and extra frame caps are disabled. Supports NVIDIA GeForce RTX 40/50 series only. Changes apply on the next launch.</string></property>
        </widget></item>
        <item><widget class="QLabel" name="gt7_feature_summary">
-        <property name="text"><string>1080p → 4K · Native PSSR inputs + DLSS · Fixed 2X frame generation</string></property>
+        <property name="text"><string>1440p → 4K · Native PSSR inputs + DLSS · Frame generation off</string></property>
         <property name="wordWrap"><bool>true</bool></property>
         <property name="sizePolicy"><sizepolicy hsizetype="Expanding" vsizetype="Preferred"><horstretch>1</horstretch><verstretch>0</verstretch></sizepolicy></property>
        </widget></item>
@@ -80,7 +80,7 @@
       <property name="leftMargin"><number>16</number></property><property name="topMargin"><number>12</number></property><property name="rightMargin"><number>16</number></property><property name="bottomMargin"><number>12</number></property>
       <item><widget class="QLabel" name="label_settings_file"><property name="text"><string notr="true">Settings</string></property></widget></item>
       <item><widget class="QLabel" name="label_Interpreter"><property name="text"><string notr="true">Runtime</string></property></widget></item>
-      <item><widget class="QLabel" name="graphics_credit"><property name="wordWrap"><bool>true</bool></property><property name="text"><string>NVIDIA DLSS Super Resolution + Frame Generation</string></property></widget></item>
+      <item><widget class="QLabel" name="graphics_credit"><property name="wordWrap"><bool>true</bool></property><property name="text"><string>NVIDIA DLSS Super Resolution</string></property></widget></item>
       <item><layout class="QHBoxLayout" name="versionLayout">
        <item><widget class="QLabel" name="label_Version"><property name="text"><string>Tohi-GT7</string></property></widget></item>
        <item><spacer name="versionSpacer"><property name="orientation"><enum>Qt::Horizontal</enum></property><property name="sizeHint" stdset="0"><size><width>40</width><height>20</height></size></property></spacer></item>

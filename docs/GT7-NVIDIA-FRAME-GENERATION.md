@@ -1,5 +1,10 @@
 # GT7 DLSS SR and native Vulkan frame generation
 
+> **Historical 1.0.3 and development documentation.** Tohi-GT7 1.0.4 uses
+> [native 1440p-to-4K DLSS SR](NATIVE-PSSR-DLSS.md), without NVIDIA or FSR frame
+> generation, their runtime DLLs, or the experimental 30 FPS cap. The activation
+> instructions below do not apply to the 1.0.4 binary package.
+
 **Tohi-GT7 1.0.3 defaults to native 1920×1080 → 3840×2160 DLSS reconstruction and
 NVIDIA 2X frame generation. The release supports only NVIDIA GeForce RTX 40 / 50
 series GPUs; live validation used an RTX 5080.** Other GPU families are outside

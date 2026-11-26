@@ -18,9 +18,7 @@ try {
     if (-not (Test-Path -LiteralPath $install -PathType Container)) {
         throw 'InstallDirectory must be the extracted Tohi-GT7 release folder.'
     }
-    $required = @('launcher.exe', 'kyty_emulator.exe', 'kyty_dlss_backend.dll',
-        'nvngx_dlss.dll', 'sl.interposer.dll', 'sl.common.dll', 'sl.dlss_g.dll',
-        'sl.reflex.dll', 'sl.pcl.dll', 'nvngx_dlssg.dll', 'NvLowLatencyVk.dll')
+    $required = @('launcher.exe', 'kyty_emulator.exe', 'kyty_dlss_backend.dll', 'nvngx_dlss.dll')
     $missing = @($required | Where-Object {
         -not (Test-Path -LiteralPath (Join-Path $install $_) -PathType Leaf)
     })
@@ -35,7 +33,7 @@ try {
             executable = $launcher
             working_directory = $install
             required_files_present = $true
-            graphics_preset = 'Use the saved graphics checkbox: native PSSR inputs, DLSS 1920x1080 to 3840x2160, NVIDIA fixed 2X (one generated frame per rendered frame). Supported GPUs: GeForce RTX 40/50 series.'
+            graphics_preset = 'Use the saved graphics checkbox: native PSSR inputs, DLSS 2560x1440 to 3840x2160 reconstruction, preset M, fullscreen Mailbox at the desktop display size, frame generation disabled, no extra FPS cap. Supported GPUs: GeForce RTX 40/50 series.'
             started = $false
             save_files_modified = $false
         } | ConvertTo-Json

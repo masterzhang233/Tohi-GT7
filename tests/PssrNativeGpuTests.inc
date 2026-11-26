@@ -1,11 +1,15 @@
   // Explicit opt-in only: production PM4 -> texture cache -> PSSR renderer ->
   // real native NGX. No game files, window, save data or shader captures.
-  void CheckPssrNative1080To4K() {
-    constexpr const char *name = "PssrNative1080To4K";
+  template <u32 input_width, u32 input_height>
+  void CheckPssrNativeTo4K() {
+    static_assert((input_width == 1920 && input_height == 1080) ||
+                  (input_width == 2560 && input_height == 1440));
+    constexpr const char *name = input_height == 1440 ? "PssrNative1440To4K" : "PssrNative1080To4K";
     constexpr uintptr_t base = 0x000000020b000000ull;
-    constexpr uint64_t allocation_size = 0x8000000;
-    constexpr uint64_t input_slot_size = 0x1000000;
-    constexpr u32 input_width = 1920, input_height = 1080;
+    // RG32 motion is almost 29 MiB at 1440p; keep independent, non-overlapping
+    // guest slots and retain the existing 1080p fixture layout.
+    constexpr uint64_t input_slot_size = input_height == 1440 ? 0x2000000 : 0x1000000;
+    constexpr uint64_t allocation_size = 8 * input_slot_size;
     constexpr u32 output_width = 3840, output_height = 2160;
     constexpr u32 frames = 8;
     constexpr auto linear = Prospero::TileMode::kLinear;
@@ -43,11 +47,11 @@
     int64_t physical = -1;
     Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
         0, LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size, 0x10000, 0, &physical) == 0,
-        "1080p fixture allocation failed");
+        "native 4K fixture allocation failed");
     void *mapped = reinterpret_cast<void *>(base);
     Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(
         &mapped, allocation_size, 0x3, 0x10, physical, 0x10000) == 0 &&
-        mapped == reinterpret_cast<void *>(base), "1080p fixture mapping failed");
+        mapped == reinterpret_cast<void *>(base), "native 4K fixture mapping failed");
     std::memset(mapped, 0, allocation_size);
     RenderContext context(m_runtime_context);
     context.InitializeGpu(nullptr);
@@ -75,7 +79,7 @@
         TileGetTextureSize(texture.Format(), input_width, input_height, 1,
                            linear, nullptr, offsets, padded);
         Require(name, "fixture bounds", total.size != 0 && total.size <= input_slot_size,
-                "1080p input exceeds its independent guest allocation slot");
+                "native input exceeds its independent guest allocation slot");
         std::vector<uint8_t> bytes(total.size);
         const auto bytes_per_texel = Prospero::NumBytesPerElement(texture.Format());
         for (u32 y = 0; y < input_height; ++y) for (u32 x = 0; x < input_width; ++x)
@@ -136,13 +140,13 @@
       observed_api.record_evaluate = +[](KytyDlssPssrFeature *feature,
                                        const KytyDlssPssrEvaluateInfo *evaluate,
                                        KytyDlssRecordResult *result, KytyDlssError *error) {
-        constexpr const char *label = "PssrNative1080To4K";
+        constexpr const char *label = input_height == 1440 ? "PssrNative1440To4K" : "PssrNative1080To4K";
         const auto &r = *expected_request;
         Require(label, "actual NGX extent", evaluate && evaluate->x == 0 && evaluate->y == 0 &&
-                    evaluate->width == 1920 && evaluate->height == 1080 &&
-                    evaluate->color.width == 1920 && evaluate->color.height == 1080 &&
-                    evaluate->depth.width == 1920 && evaluate->depth.height == 1080 &&
-                    evaluate->motion.width == 1920 && evaluate->motion.height == 1080 &&
+                    evaluate->width == input_width && evaluate->height == input_height &&
+                    evaluate->color.width == input_width && evaluate->color.height == input_height &&
+                    evaluate->depth.width == input_width && evaluate->depth.height == input_height &&
+                    evaluate->motion.width == input_width && evaluate->motion.height == input_height &&
                     evaluate->output.width == 3840 && evaluate->output.height == 2160,
                 "NGX received a cropped larger backing or an incorrect upscaling ratio");
         Require(label, "actual NGX temporal inputs",
@@ -160,7 +164,7 @@
                 "native color, depth or motion format differs from the generated fixture");
         const auto status = backend_api->record_evaluate(feature, evaluate, result, error);
         Require(label, "actual NGX record", status == KYTY_DLSS_OK,
-                "real backend rejected 1080p-to-4K evaluation");
+                "real backend rejected native-to-4K evaluation");
         Require(label, "actual NGX reset", result->reset_used ==
                     (checked_evaluations == 0 || (r.flags & Pssr::kReset) != 0) &&
                     result->feature_created == (checked_evaluations == 0) &&
@@ -192,7 +196,7 @@
           std::memcpy(target, value.data(), sizeof(value));
         });
         write_linear(input, [&](uint8_t *target, u32 x, u32 y) {
-          // Produce the full scene at 1920x1080. There is no 4K input image,
+          // Produce the full scene at the selected input size. There is no 4K input image,
           // crop, active-subrect reduction or hidden downsample in this fixture.
           const float u = (float(x) + .5f - request.jitter[0] - displacement) / input_width;
           const float v = (float(y) + .5f - request.jitter[1]) / input_height;
@@ -205,12 +209,12 @@
         std::memcpy(packet.data() + 1, &request, sizeof(request));
         Pm4Execution execution;
         Require(name, "native packet", processor.Process(execution, packet) == Pm4ProcessResult::Complete,
-                "1080p native PM4 packet did not complete");
+                "native 4K PM4 packet did not complete");
         const uint64_t count = frame + 1;
         Require(name, "real NGX count", checked_evaluations == count &&
                     RenderExecutorTestAccess::PssrCounts(executor) ==
                         std::array<uint64_t, 3>{count, count, 0},
-                "1080p request did not execute native DLSS or used linear fallback");
+                "native request did not execute DLSS or used linear fallback");
         if (!history) {
           history = RenderExecutorTestAccess::PssrFeature(executor);
           creation = RenderExecutorTestAccess::PssrCreation(executor);
@@ -220,13 +224,14 @@
                       output_width, output_height, creation.mode, &optimal, &error) == KYTY_DLSS_OK &&
                       optimal.min_width <= input_width && optimal.max_width >= input_width &&
                       optimal.min_height <= input_height && optimal.max_height >= input_height,
-                  "chosen feature does not support the real 1080p input");
+                  "chosen feature does not support the real input size");
           Require(name, "native creation", creation.output_width == output_width &&
                       creation.output_height == output_height && creation.flags == Pssr::kReverseDepth,
                   "4K output or reversed low-resolution depth contract changed");
-          std::printf("[native4k] runtime mode=%d optimal=%ux%u range=%ux%u..%ux%u actual=1920x1080 output=3840x2160\n",
+          std::printf("[native4k] runtime mode=%d optimal=%ux%u range=%ux%u..%ux%u actual=%ux%u output=3840x2160\n",
                       creation.mode, optimal.optimal_width, optimal.optimal_height,
-                      optimal.min_width, optimal.min_height, optimal.max_width, optimal.max_height);
+                      optimal.min_width, optimal.min_height, optimal.max_width, optimal.max_height,
+                      input_width, input_height);
           for (const auto *texture : {&input, &depth, &motion, &output}) {
             const auto binding = resolve(*texture);
             const auto &image = cache.GetImage(binding.image_id);
@@ -270,10 +275,10 @@
                     frame == 0 || frame == 4, request.jitter[0], request.jitter[1],
                     frame > 4 ? -1.f : 0.f, mean_error, max_error);
         Require(name, "4K HDR ramp", mean_error < .05 && max_error < .2f,
-                "native 1080p-to-4K output does not reproduce the known scene brightness");
+                "native-to-4K output does not reproduce the known scene brightness");
       }
       Require(name, "final count", checked_evaluations == frames,
-              "missing real 1080p-to-4K evaluations");
+              "missing real native-to-4K evaluations");
       context.UnmapMemory(base, allocation_size);
       scheduler.Finish();
       expected_request = nullptr;
@@ -281,8 +286,9 @@
     LibKernel::Memory::InstallGpuResources(nullptr);
     context.ShutdownGpu();
     Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(
-        physical, allocation_size) == 0, "1080p fixture allocation release failed");
-    std::printf("[gpu]     %-32s ok (8 native 1920x1080 -> 3840x2160 evaluations, no crop/fallback, jitter/motion/reset/HDR)\n", name);
+        physical, allocation_size) == 0, "native 4K fixture allocation release failed");
+    std::printf("[gpu]     %-32s ok (8 native %ux%u -> 3840x2160 evaluations, no crop/fallback, jitter/motion/reset/HDR)\n",
+                name, input_width, input_height);
   }
 
   void CheckPssrNative() {

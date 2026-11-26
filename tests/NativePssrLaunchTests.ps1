@@ -32,7 +32,7 @@ public class NativePssrArgumentProbe {
             using (var writer = new StreamWriter(Environment.GetEnvironmentVariable("NATIVE_PSSR_TEST_ENVIRONMENT_LOG"))) {
                 foreach (string key in new [] {"KYTY_GT7_DLSS", "KYTY_GT7_DLSS_FG", "KYTY_GT7_FSR_FG",
                     "KYTY_GT7_DLSS_FG_RUNTIME", "KYTY_GT7_DLSS_PRESET", "KYTY_PSSR_DIAGNOSTICS",
-                    "KYTY_GT7_NATIVE_ASYNC_PRESENT", "DISABLE_RTSS_LAYER"}) {
+                    "KYTY_GT7_NATIVE_ASYNC_PRESENT", "KYTY_GT7_DLSS_FG_BASE_FPS", "KYTY_FG_MANUAL_ONLY", "DISABLE_RTSS_LAYER"}) {
                     writer.WriteLine(key + "=" + Convert.ToBase64String(Encoding.UTF8.GetBytes(Environment.GetEnvironmentVariable(key) ?? "")));
                 }
             }
@@ -80,6 +80,9 @@ public class NativePssrArgumentProbe {
     $cases = @(
         @{Name='native-original'; Args=@('-NativePssr'); Width='2560'; Height='1440'; Preset=$false; Valid=$true},
         @{Name='native-1080-to-4k'; Args=@('-NativePssr','-NativePssr1080To4K'); Width='3840'; Height='2160'; Preset=$true; Valid=$true},
+        @{Name='native-1440-to-4k'; Args=@('-NativePssr','-NativePssr1440To4K','-Fullscreen'); Width='3840'; Height='2160'; Preset=$false; Preset1440=$true; Fullscreen=$true; Valid=$true},
+        @{Name='native-1440-missing-native'; Args=@('-NativePssr1440To4K'); Error='requires -NativePssr'; Valid=$false},
+        @{Name='native-fixed-presets-conflict'; Args=@('-NativePssr','-NativePssr1080To4K','-NativePssr1440To4K'); Error='mutually exclusive'; Valid=$false},
         @{Name='missing-native'; Args=@('-NativePssr1080To4K'); Valid=$false},
         @{Name='baseline-conflict'; Args=@('-NativePssr','-NativePssr1080To4K','-Baseline'); Valid=$false},
         @{Name='fsr-fg-conflict'; Args=@('-NativePssr','-NativePssr1080To4K','-FrameGeneration'); Valid=$false},
@@ -95,8 +98,10 @@ public class NativePssrArgumentProbe {
         @{Name='native-fg-output-capture-conflict'; Args=@('-NativePssr','-NativeFrameGeneration','-CaptureGeneratedFrames','-StreamlineRuntimeDirectory',$streamline); Valid=$false},
         @{Name='native-fg-occlusion-guard-conflict'; Args=@('-NativePssr','-NativeFrameGeneration','-OcclusionGuard','-StreamlineRuntimeDirectory',$streamline); Valid=$false},
         @{Name='native-async-requires-fg'; Args=@('-NativePssr','-AsyncNativePresentation'); Valid=$false},
+        @{Name='native-present-mode-unsupported'; Args=@('-NativePssr','-PresentMode','Fifo'); Valid=$false},
         @{Name='native-sr-manifest'; Args=@('-NativePssr','-NativePssr1080To4K','-DlssPreset','M'); Width='3840'; Height='2160'; Preset=$true; StubRun=$true; Valid=$true},
-        @{Name='native-fg-2x-manifest'; Args=@('-NativePssr','-NativePssr1080To4K','-NativeFrameGeneration','-StreamlineRuntimeDirectory',$streamline,'-DlssPreset','M'); Width='3840'; Height='2160'; Preset=$true; NativeFG=$true; StubRun=$true; Valid=$true}
+        @{Name='native-fg-2x-manifest'; Args=@('-NativePssr','-NativePssr1080To4K','-NativeFrameGeneration','-StreamlineRuntimeDirectory',$streamline,'-DlssPreset','M'); Width='3840'; Height='2160'; Preset=$true; NativeFG=$true; StubRun=$true; Valid=$true},
+        @{Name='native-1440-sr-only-manifest'; Args=@('-NativePssr','-NativePssr1440To4K','-DlssPreset','M','-PresentMode','Mailbox','-Fullscreen'); Width='3840'; Height='2160'; Preset=$false; Preset1440=$true; Fullscreen=$true; StubRun=$true; Valid=$true}
     )
     foreach ($missing in $streamlineFiles) {
         $incomplete = Join-Path $root ('missing-' + $missing)
@@ -114,6 +119,9 @@ public class NativePssrArgumentProbe {
         $stubRun = $case.ContainsKey('StubRun') -and $case.StubRun
         $nativeFg = $case.ContainsKey('NativeFG') -and $case.NativeFG
         $isNative = -not $case.ContainsKey('Native') -or $case.Native
+        $preset1440 = $case.ContainsKey('Preset1440') -and $case.Preset1440
+        $presentMode = $(if ($case.ContainsKey('PresentMode')) { $case.PresentMode } else { 'Mailbox' })
+        $fullscreen = $case.ContainsKey('Fullscreen') -and $case.Fullscreen
         $caseRuntime = $(if ($case.ContainsKey('Runtime')) { $case.Runtime } else { $fixture })
         $arguments = @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $scripts 'GT7-Test-DLSS.ps1'),
             '-GamePath',$fixture,'-EmulatorPath',$probe,'-BackendPath',(Join-Path $fixture 'backend.dll'),
@@ -129,6 +137,8 @@ public class NativePssrArgumentProbe {
             $child.StartInfo.EnvironmentVariables['KYTY_GT7_DLSS_FG'] = '9'
             $child.StartInfo.EnvironmentVariables['KYTY_GT7_FSR_FG'] = '1'
             $child.StartInfo.EnvironmentVariables['KYTY_GT7_DLSS_FG_RUNTIME'] = 'must-not-inherit'
+            $child.StartInfo.EnvironmentVariables['KYTY_GT7_DLSS_FG_BASE_FPS'] = '120'
+            $child.StartInfo.EnvironmentVariables['KYTY_FG_MANUAL_ONLY'] = '9'
             [void]$child.Start()
             $stdout = $child.StandardOutput.ReadToEndAsync()
             $stderr = $child.StandardError.ReadToEndAsync()
@@ -154,18 +164,21 @@ public class NativePssrArgumentProbe {
                     if (@($argv | Where-Object { $_ -ceq $flag }).Count -ne $expectedFlagCount) { throw ($case.Name + ': missing/duplicate ' + $flag) }
                 }
                 $desktopHeight = $(if ($isNative) { 'native' } else { '1080' })
-                foreach ($pair in @(@('--screen-width',$case.Width),@('--screen-height',$case.Height),@('--gt7-desktop-height',$desktopHeight))) {
+                foreach ($pair in @(@('--screen-width',$case.Width),@('--screen-height',$case.Height),@('--gt7-desktop-height',$desktopHeight),@('--present-mode',$presentMode),@('--printf-direction','Silent'))) {
                     $index = [Array]::IndexOf($argv, $pair[0])
                     if ($index -lt 0 -or $index + 1 -ge $argv.Count -or $argv[$index + 1] -cne $pair[1]) { throw ($case.Name + ': wrong ' + $pair[0]) }
                 }
                 if (($argv -ccontains '--gt7-pssr-1080-4k') -ne $case.Preset -or $argv -contains '--graphics-check-only') { throw ($case.Name + ': wrong preset/check flag') }
+                if (($argv -ccontains '--gt7-pssr-1440-4k') -ne $preset1440) { throw ($case.Name + ': wrong 1440p preset flag') }
+                if (@($argv | Where-Object { $_ -ceq '--fullscreen' }).Count -ne $(if ($fullscreen) { $expectedCalls } else { 0 })) { throw ($case.Name + ': wrong fullscreen flag') }
                 if (-not $stubRun -and $text -notmatch 'Playtest preflight passed') { throw ($case.Name + ': missing preflight success') }
                 if ($stubRun) {
                     $manifests = @(Get-ChildItem -LiteralPath $outputRoot -Filter 'playtest-manifest.json' -Recurse -File)
                     if ($manifests.Count -ne 1) { throw ($case.Name + ': expected one fixture manifest') }
                     $manifest = Get-Content -LiteralPath $manifests[0].FullName -Raw | ConvertFrom-Json
                     if ($manifest.status -cne 'finished' -or $manifest.exit_code -ne 0 -or
-                        -not $manifest.pssr_dlss_requested -or -not $manifest.native_pssr_1080_to_4k_requested -or
+                        -not $manifest.pssr_dlss_requested -or $manifest.native_pssr_1080_to_4k_requested -ne $case.Preset -or
+                        $manifest.native_pssr_1440_to_4k_requested -ne $preset1440 -or
                         $manifest.frame_generation_requested -ne $nativeFg -or $manifest.frame_generation_verified -or
                         $manifest.dlss_preset_requested -cne 'M' -or $manifest.super_resolution_input_source -cne 'native-psml-pssr') {
                         throw ($case.Name + ': wrong native PSSR/FG manifest contract')
@@ -173,10 +186,13 @@ public class NativePssrArgumentProbe {
                     $expectedMultiplier = $(if ($nativeFg) { 2 } else { 1 })
                     $expectedGenerated = $(if ($nativeFg) { 1 } else { 0 })
                     $expectedProvider = $(if ($nativeFg) { 'nvidia-streamline-vulkan' } else { 'none' })
+                    $expectedInputWidth = $(if ($preset1440) { 2560 } else { 1920 })
+                    $expectedInputHeight = $(if ($preset1440) { 1440 } else { 1080 })
                     if ($manifest.frame_generation_requested_multiplier -ne $expectedMultiplier -or
                         $manifest.frame_generation_requested_generated_frames_per_real -ne $expectedGenerated -or
                         $manifest.frame_generation_provider -cne $expectedProvider -or
-                        $manifest.native_pssr_target.verified -or $manifest.native_pssr_target.input_width -ne 1920 -or
+                        $manifest.native_pssr_target.verified -or $manifest.native_pssr_target.input_width -ne $expectedInputWidth -or
+                        $manifest.native_pssr_target.input_height -ne $expectedInputHeight -or
                         $manifest.native_pssr_target.output_width -ne 3840 -or $manifest.window_requested.height -ne 2160) {
                         throw ($case.Name + ': wrong fixed-2X or resolution request')
                     }
@@ -188,6 +204,17 @@ public class NativePssrArgumentProbe {
                     $expectedFg = $(if ($nativeFg) { '1' } else { '0' })
                     foreach ($pair in @(@('KYTY_GT7_DLSS','0'),@('KYTY_GT7_FSR_FG','0'),@('KYTY_GT7_DLSS_FG',$expectedFg),@('KYTY_GT7_DLSS_PRESET','M'),@('KYTY_PSSR_DIAGNOSTICS','0'),@('KYTY_GT7_NATIVE_ASYNC_PRESENT','0'))) {
                         if ($environment[$pair[0]] -cne $pair[1] -or $manifest.environment.($pair[0]) -cne $pair[1]) { throw ($case.Name + ': wrong environment ' + $pair[0]) }
+                    }
+                    if ($manifest.native_base_fps_requested -ne 0 -or
+                        $manifest.window_requested.present_mode -cne $presentMode -or $manifest.window_requested.fullscreen -ne $fullscreen -or
+                        $manifest.diagnostic_logging_requested -or $manifest.performance_diagnostics_requested -or
+                        $manifest.temporal_input_capture_requested -or $manifest.generated_frame_capture_requested -or $manifest.detailed_trace_enabled) {
+                        throw ($case.Name + ': pacing/presentation changed diagnostics or manifest request')
+                    }
+                    if ($environment['KYTY_GT7_DLSS_FG_BASE_FPS'] -cne '' -or
+                        $environment['KYTY_FG_MANUAL_ONLY'] -cne $(if ($preset1440) { '1' } else { '' }) -or
+                        $null -ne $manifest.frame_rate_target) {
+                        throw ($case.Name + ': default launch inherited or enabled pacing/capture controls')
                     }
                     if ($nativeFg) {
                         if ($environment['KYTY_GT7_DLSS_FG_RUNTIME'] -cne $streamline -or

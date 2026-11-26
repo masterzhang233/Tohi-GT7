@@ -1,8 +1,9 @@
 # Tohi-GT7 desktop DLSS integration
 
-An independent, opt-in [native PSSR input path](NATIVE-PSSR-DLSS.md) is also
-available for development. It does not replace the launcher preset described
-below and currently provides SR only.
+> **Historical legacy TAA-hook documentation.** Tohi-GT7 1.0.4 defaults to the
+> [native PSSR input path](NATIVE-PSSR-DLSS.md) at 2560x1440 to 3840x2160, with
+> no frame generation or added 30 FPS cap. The older preset and instructions
+> below are retained for development history, not current release setup.
 
 This is an experimental integration for the verified GT7 1.71 desktop render path.
 The Tohi-GT7 launcher exposes one **DLSS** checkbox, enabled by default for desktop

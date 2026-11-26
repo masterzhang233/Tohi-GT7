@@ -22,10 +22,14 @@ inline void ApplyGt7DesktopPreset(Configuration& info) {
 	if (!info.gt7_dlss_enabled) {
 		return;
 	}
-	// Native PSSR has its own verified 1080p -> 4K patch, not the legacy desktop patch.
+	// Keep the persisted switch compatible with 1.0.3, but select this release's
+	// verified 1440p -> 4K reconstruction profile. It no longer enables FG.
 	info.gt7_desktop_height = 0;
 	info.screen_resolution = Configuration::Resolution::R3840X2160;
 	info.present_mode = Configuration::PresentMode::Mailbox;
+	info.fullscreen_enabled = true;
+	// This is the title's normal virtual refresh rate, not an extra host FPS cap.
+	info.vblank_frequency = 60;
 	info.tessellation_enabled = true;
 	info.bindless_images_enabled = true;
 	info.reflections_half_rate = false;
@@ -56,18 +60,15 @@ inline QStringList Gt7ProfileArguments(const Configuration& info) {
 	if (info.gt7_dlss_enabled) {
 		return {QStringLiteral("--gt7-desktop-height"), QStringLiteral("native"),
 		        QStringLiteral("--ps5-pro"), QStringLiteral("--pssr-dlss"),
-		        QStringLiteral("--gt7-pssr-1080-4k")};
+		        QStringLiteral("--gt7-pssr-1440-4k")};
 	}
 	return {QStringLiteral("--gt7-desktop-height"), QString::number(info.gt7_desktop_height)};
 }
 
-// SR and FG share one NGX runtime directory. Missing any plugin must fail before launch.
+// The release preset uses only SR. Optional frame-generation libraries must
+// neither be loaded nor become a prerequisite for this launch path.
 inline QStringList Gt7GraphicsRuntimeFiles() {
-	return {QStringLiteral("kyty_dlss_backend.dll"), QStringLiteral("nvngx_dlss.dll"),
-	        QStringLiteral("sl.interposer.dll"), QStringLiteral("sl.common.dll"),
-	        QStringLiteral("sl.dlss_g.dll"), QStringLiteral("sl.reflex.dll"),
-	        QStringLiteral("sl.pcl.dll"), QStringLiteral("nvngx_dlssg.dll"),
-	        QStringLiteral("NvLowLatencyVk.dll")};
+	return {QStringLiteral("kyty_dlss_backend.dll"), QStringLiteral("nvngx_dlss.dll")};
 }
 
 inline QStringList MissingGt7GraphicsRuntimeFiles(const QString& runtime_directory) {
@@ -92,13 +93,14 @@ inline QProcessEnvironment Gt7LaunchEnvironment(const Configuration& info,
 			environment.remove(key);
 		}
 	}
-	const auto enabled = info.gt7_dlss_enabled ? QStringLiteral("1") : QStringLiteral("0");
 	environment.insert(QStringLiteral("KYTY_FG_MANUAL_ONLY"), QStringLiteral("1"));
-	// The old TAA/DLSS hook and FSR FG must never run beside native PSSR + NVIDIA FG.
+	// Neither switch position may inherit the old TAA hook, either FG provider,
+	// the 30 FPS experiment, or asynchronous presentation from a testing shell.
 	environment.insert(QStringLiteral("KYTY_GT7_DLSS"), QStringLiteral("0"));
 	environment.insert(QStringLiteral("KYTY_GT7_FSR_FG"), QStringLiteral("0"));
 	environment.insert(QStringLiteral("KYTY_GT7_FSR_FG_OCCLUSION_GUARD"), QStringLiteral("0"));
-	environment.insert(QStringLiteral("KYTY_GT7_DLSS_FG"), enabled);
+	environment.insert(QStringLiteral("KYTY_GT7_DLSS_FG"), QStringLiteral("0"));
+	environment.insert(QStringLiteral("KYTY_GT7_DLSS_FG_BASE_FPS"), QStringLiteral("0"));
 	environment.insert(QStringLiteral("KYTY_PSSR_DIAGNOSTICS"), QStringLiteral("0"));
 	environment.insert(QStringLiteral("KYTY_GT7_NATIVE_ASYNC_PRESENT"), QStringLiteral("0"));
 	environment.insert(QStringLiteral("KYTY_SAMPLE"), QStringLiteral("0"));
@@ -107,9 +109,8 @@ inline QProcessEnvironment Gt7LaunchEnvironment(const Configuration& info,
 		environment.insert(QStringLiteral("KYTY_GT7_DLSS_BACKEND"),
 		                   runtime.absoluteFilePath(QStringLiteral("kyty_dlss_backend.dll")));
 		environment.insert(QStringLiteral("KYTY_GT7_DLSS_RUNTIME"), runtime.absolutePath());
-		environment.insert(QStringLiteral("KYTY_GT7_DLSS_FG_RUNTIME"), runtime.absolutePath());
 		environment.insert(QStringLiteral("KYTY_GT7_DLSS_PRESET"), QStringLiteral("M"));
-		// Per-process opt-out, matching the tested Streamline Vulkan profile.
+		// Per-process opt-out, matching the tested Vulkan profile.
 		environment.insert(QStringLiteral("DISABLE_RTSS_LAYER"), QStringLiteral("1"));
 	}
 	return environment;

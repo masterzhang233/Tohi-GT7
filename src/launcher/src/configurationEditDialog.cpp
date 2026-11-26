@@ -348,10 +348,15 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	    info.gt7_dlss_enabled;
 	if (fixed_gt7_preset) {
 		ListInit(m_ui->comboBox_screen_resolution, Configuration::Resolution::R3840X2160);
+		ListInit(m_ui->comboBox_present_mode, Configuration::PresentMode::Mailbox);
+		m_ui->checkBox_fullscreen->setChecked(true);
 	}
 	m_ui->comboBox_screen_resolution->setEnabled(!fixed_gt7_preset);
+	m_ui->comboBox_present_mode->setEnabled(!fixed_gt7_preset);
+	m_ui->checkBox_fullscreen->setEnabled(!fixed_gt7_preset);
 	m_ui->lineEdit_skip_shaders->setText(info.skip_shader_hashes);
-	m_ui->spinBox_vblank_frequency->setValue(info.vblank_frequency);
+	m_ui->spinBox_vblank_frequency->setValue(fixed_gt7_preset ? 60 : info.vblank_frequency);
+	m_ui->spinBox_vblank_frequency->setEnabled(!fixed_gt7_preset);
 	m_ui->comboBox_console_language->clear();
 	for (const auto* language: CONSOLE_LANGUAGE_NAMES) {
 		m_ui->comboBox_console_language->addItem(

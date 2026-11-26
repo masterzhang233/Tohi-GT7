@@ -400,6 +400,11 @@ void QueryState() {
 } // namespace
 
 bool Requested() {
+#ifndef GT7_HAS_DLSSG_RUNTIME
+    // Unsupported builds must not select FG capture or presentation paths,
+    // even when an inherited environment requests them.
+    return false;
+#else
     // Capture and RecordPrepare validate each frame's actual inputs, including
     // NativePSSR. The opt-in alone never marks interpolation as active.
     static const bool requested = [] {
@@ -407,6 +412,7 @@ bool Requested() {
         return value && std::string_view(value) == "1";
     }();
     return requested;
+#endif
 }
 
 PFN_vkGetInstanceProcAddr Initialize(PFN_vkGetInstanceProcAddr real_proc_addr) {

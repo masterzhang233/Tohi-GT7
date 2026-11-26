@@ -219,6 +219,30 @@ int main(int argc, char* argv[]) {
 		        "Native PSSR with VR scale accepted");
 	}
 	native_pssr.vr_scale = 0;
+	Request native_1440{.native_pssr_1440_4k = true};
+	Require(native_1440.Active() && native_1440.NativePssrRequested() &&
+	        ValidateRequest(native_1440, false, false, error), "Native 1440p PSSR request rejected");
+	Require(!ValidateRequest(native_1440, true, false, error), "Native 1440p PSSR/VR conflict accepted");
+	Require(!ValidateRequest(native_1440, false, true, error), "Native 1440p PSSR/custom patch conflict accepted");
+	native_1440.check_only = true;
+	Require(ValidateRequest(native_1440, false, false, error), "Native 1440p PSSR preflight rejected");
+	native_1440.desktop_height = 0;
+	Require(ValidateRequest(native_1440, false, false, error), "Native 1440p PSSR with native desktop height rejected");
+	for (const int height : {1080, 1440, 2160, 720}) {
+		native_1440.desktop_height = height;
+		Require(!ValidateRequest(native_1440, false, false, error),
+		        "Native 1440p PSSR accepted a legacy or invalid desktop height");
+	}
+	native_1440.desktop_height = -1;
+	for (const int scale : {100, 110, 120, 125}) {
+		native_1440.vr_scale = scale;
+		Require(!ValidateRequest(native_1440, false, false, error) &&
+		        !ValidateRequest(native_1440, true, false, error), "Native 1440p PSSR accepted a VR scale");
+	}
+	native_1440.vr_scale = 0;
+	Request conflicting_native{.native_pssr_1080_4k = true, .native_pssr_1440_4k = true};
+	Require(!ValidateRequest(conflicting_native, false, false, error),
+	        "simultaneous Native PSSR 1080p and 1440p presets accepted");
 
 	const auto sample = std::filesystem::temp_directory_path() / "kyty_gt7_profile_sha256_test.bin";
 	{
@@ -235,6 +259,8 @@ int main(int argc, char* argv[]) {
 	        "unsupported eboot was accepted or output patch changed");
 	Require(!Prepare(native_pssr, sample, {}, patch, error) && patch == "untouched",
 	        "Native PSSR accepted an unsupported eboot or changed the output patch");
+	Require(!Prepare(native_1440, sample, {}, patch, error) && patch == "untouched",
+	        "Native 1440p PSSR accepted an unsupported eboot or changed the output patch");
 	std::filesystem::remove(sample);
 
 	const auto plain = std::filesystem::temp_directory_path() / "kyty_gt7_profile_plain_elf_test.bin";
@@ -296,7 +322,7 @@ int main(int argc, char* argv[]) {
 		Request request;
 		const char* file_name;
 	};
-	const std::array<ProfileCase, 10> profiles {{
+	const std::array<ProfileCase, 12> profiles {{
 	    {{.desktop_height = 0}, "GT7-Desktop-Internal-Native.json"},
 	    {{.desktop_height = 1080}, "GT7-Desktop-Internal-1080.json"},
 	    {{.desktop_height = 1440}, "GT7-Desktop-Internal-1440.json"},
@@ -307,6 +333,8 @@ int main(int argc, char* argv[]) {
 	    {{.vr_scale = 125}, "GT7-SteamVR-EyeScale-125.json"},
 	    {{.native_pssr_1080_4k = true}, "GT7-PSSR-1080-to-4K.json"},
 	    {{.desktop_height = 0, .native_pssr_1080_4k = true}, "GT7-PSSR-1080-to-4K.json"},
+	    {{.native_pssr_1440_4k = true}, "GT7-PSSR-1440-to-4K.json"},
+	    {{.desktop_height = 0, .native_pssr_1440_4k = true}, "GT7-PSSR-1440-to-4K.json"},
 	}};
 	for (const auto& executable : executables) {
 		Require(ExecutableImageSha256(executable, digest, error),

@@ -235,7 +235,7 @@ To use your own sound, replace the emulator's assets/sounds/trophy-unlock.wav wi
        <property name="title"><string>GT7 graphics preset</string></property>
        <layout class="QVBoxLayout" name="gt7Layout">
         <item><widget class="QLabel" name="label_gt7_preset">
-         <property name="text"><string>Enable 4K + NVIDIA 2X on the launcher for 1920 x 1080 to 3840 x 2160 using native PSSR inputs and DLSS. Supports NVIDIA GeForce RTX 40/50 series only.</string></property>
+         <property name="text"><string>Enable PSSR 4K on the launcher for 2560 x 1440 to 3840 x 2160 using native PSSR inputs and DLSS. Frame generation is disabled. Supports NVIDIA GeForce RTX 40/50 series only.</string></property>
          <property name="wordWrap"><bool>true</bool></property>
         </widget></item>
         <item><widget class="QLabel" name="label_gt7_compatibility">

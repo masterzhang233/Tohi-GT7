@@ -611,7 +611,7 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& requeste
 	if (gt7_title && info.gt7_dlss_enabled) {
 		const auto missing = MissingGt7GraphicsRuntimeFiles(dir.absolutePath());
 		if (!missing.isEmpty()) {
-			const auto detail = tr("The 4K + NVIDIA 2X preset needs the complete Tohi-GT7 release package.\n"
+			const auto detail = tr("The PSSR 4K preset needs the complete Tohi-GT7 release package.\n"
 			                       "Missing files: %1\n\nExtract the full package, or turn off the graphics preset.")
 			                        .arg(missing.join(QStringLiteral(", ")));
 			if (diagnostics != nullptr) {
@@ -865,7 +865,7 @@ void MainDialogPrivate::Run() {
 		details.title_id          = info->title_id;
 		details.game_version      = info->gameVersion;
 		details.output_resolution = EnumToText(info->screen_resolution);
-		details.mode = info->gt7_dlss_enabled ? QStringLiteral("Native PSSR inputs / DLSS 1080p to 4K + NVIDIA fixed 2X")
+		details.mode = info->gt7_dlss_enabled ? QStringLiteral("Native PSSR inputs / DLSS 1440p to 4K; frame generation off; no extra FPS cap")
 		                                      : QStringLiteral("Desktop");
 		details.desktop_height = info->gt7_desktop_height;
 		details.vr_scale       = info->gt7_vr_scale;
@@ -923,8 +923,8 @@ void MainDialogPrivate::Update() {
 	m_export_logs_button->setEnabled(has_logs);
 	m_ui->gt7_feature_summary->setText(
 	    m_ui->widget->Gt7DlssEnabled()
-	        ? tr("1080p → 4K · Native PSSR inputs + DLSS · Fixed 2X frame generation")
-	        : tr("4K upscaling and frame generation off · Desktop rendering"));
+	        ? tr("1440p → 4K · Native PSSR inputs + DLSS · Frame generation off")
+	        : tr("4K upscaling off · Desktop rendering · Frame generation off"));
 	m_ui->gt7_start_button->setToolTip(
 	    gt7_selected ? QString {} : tr("Select Gran Turismo 7 in the game library to start."));
 	if (m_process.state() != QProcess::NotRunning) {

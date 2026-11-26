@@ -10,9 +10,12 @@ param(
     [switch]$Baseline,
     [switch]$NativePssr,
     [switch]$NativePssr1080To4K,
+    [switch]$NativePssr1440To4K,
     [switch]$NativePssrDiagnostics,
     [switch]$FrameGeneration,
     [switch]$NativeFrameGeneration,
+    [ValidateSet('Mailbox','Immediate')][string]$PresentMode = 'Mailbox',
+    [switch]$Fullscreen,
     [switch]$AsyncNativePresentation,
     [string]$StreamlineRuntimeDirectory,
     [ValidateSet('K','L','M')][string]$DlssPreset = 'K',
@@ -47,6 +50,12 @@ try {
     }
     if ($NativePssr1080To4K -and -not $NativePssr) {
         throw '-NativePssr1080To4K requires -NativePssr.'
+    }
+    if ($NativePssr1440To4K -and -not $NativePssr) {
+        throw '-NativePssr1440To4K requires -NativePssr.'
+    }
+    if ($NativePssr1080To4K -and $NativePssr1440To4K) {
+        throw '-NativePssr1080To4K and -NativePssr1440To4K are mutually exclusive.'
     }
     if ($NativePssr -and ($Baseline -or $FrameGeneration -or $CaptureTemporalInputs -or $CaptureGeneratedFrames)) {
         throw '-NativePssr cannot be combined with Baseline, FSR frame generation, or legacy input/output capture. Use -NativeFrameGeneration explicitly for fixed 2X NVIDIA FG.'
@@ -141,6 +150,9 @@ try {
     if ($NativePssr1080To4K) {
         Write-Host "Requested graphics: GT7 Pro 1920x1080 scene -> native PSSR -> DLSS 3840x2160, preset=$DlssPreset; window=3840x2160. $nativeFgNote"
         Write-Host 'The scene-resolution patch is requested; confirm actual input/depth/motion and output dimensions in the native PSSR diagnostics.'
+    } elseif ($NativePssr1440To4K) {
+        Write-Host "Requested graphics: GT7 Pro 2560x1440 scene -> native PSSR -> DLSS 3840x2160, preset=$DlssPreset; window=3840x2160. $nativeFgNote"
+        Write-Host 'The scene-resolution patch is requested; actual native PSSR dimensions require runtime verification.'
     } elseif ($NativePssr) {
         Write-Host "Requested graphics: native PSSR -> DLSS, preset=$DlssPreset; render/output sizes come from the game, window=2560x1440. $nativeFgNote"
     } else {
@@ -149,15 +161,17 @@ try {
     if ($NativePssrDiagnostics) { Write-Host 'Native PSSR automatic input/output diagnostics enabled; no F9/F10 capture is required. This session is for image diagnosis, not performance measurement.' }
     Write-Host "Source diagnostics: timing=$([bool]$SourceDiagnostics), condition chain=$([bool]$SourceWaitChain), timed thread sampling=$([bool]$SampleSourceThreads), notifier-only sampling=$([bool]$SampleSourceNotifier)."
     if ($SourceEventBridge) { Write-Host 'Event bridge diagnostics: manually create the run _source-trace.arm marker after race entry; trace budgets remain idle until armed.' }
-    $windowWidth = $(if ($NativePssr1080To4K) { '3840' } else { '2560' })
-    $windowHeight = $(if ($NativePssr1080To4K) { '2160' } else { '1440' })
+    $windowWidth = $(if ($NativePssr1080To4K -or $NativePssr1440To4K) { '3840' } else { '2560' })
+    $windowHeight = $(if ($NativePssr1080To4K -or $NativePssr1440To4K) { '2160' } else { '1440' })
     $arguments = @('--game', $game, '--screen-width', $windowWidth, '--screen-height', $windowHeight,
-        '--present-mode', 'Mailbox', '--tessellation', '--bindless', '--redzone',
+        '--present-mode', $PresentMode, '--tessellation', '--bindless', '--redzone',
         '--shader-optimization-type', 'Performance', '--console-language', '11',
         '--readback-linear-images', 'false', '--printf-direction', $logDirection,
         '--printf-output-file', '_kyty.txt', '--gt7-desktop-height', $(if ($NativePssr) { 'native' } else { '1080' }), '--user-id', '1000')
     if ($NativePssr) { $arguments += @('--ps5-pro', '--pssr-dlss') }
     if ($NativePssr1080To4K) { $arguments += '--gt7-pssr-1080-4k' }
+    if ($NativePssr1440To4K) { $arguments += '--gt7-pssr-1440-4k' }
+    if ($Fullscreen) { $arguments += '--fullscreen' }
     $check = Invoke-GT7CompatibilityCheck -Executable $exe -ArgumentList $arguments `
         -WorkingDirectory (Split-Path -Parent $exe)
     if ($check.ExitCode -ne 0) { throw "GT7 preflight failed: $($check.StandardOutput) $($check.StandardError)" }
@@ -196,6 +210,10 @@ try {
         # Streamline proxy on the development driver. This is the layer's
         # documented per-process opt-out; it does not change global RTSS settings.
         $settings['DISABLE_RTSS_LAYER'] = '1'
+    }
+    if ($NativePssr1440To4K) {
+        # Ordinary 1440p play must not trigger automatic FrameGraph capture.
+        $settings['KYTY_FG_MANUAL_ONLY'] = '1'
     }
     if ($DiagnosticLogging) { $settings['KYTY_GT7_DLSS_NGX_LOG'] = '1' }
     if ($PerformanceDiagnostics) {
@@ -304,10 +322,15 @@ try {
         dlss_preset_requested = $DlssPreset
         pssr_dlss_requested = [bool]$NativePssr
         native_pssr_1080_to_4k_requested = [bool]$NativePssr1080To4K
+        native_pssr_1440_to_4k_requested = [bool]$NativePssr1440To4K
         native_pssr_target = $(if ($NativePssr1080To4K) {
             [ordered]@{input_width=1920; input_height=1080; output_width=3840; output_height=2160; verified=$false}
+        } elseif ($NativePssr1440To4K) {
+            [ordered]@{input_width=2560; input_height=1440; output_width=3840; output_height=2160; verified=$false}
         } else { $null })
-        window_requested = [ordered]@{width=[int]$windowWidth; height=[int]$windowHeight}
+        window_requested = [ordered]@{width=[int]$windowWidth; height=[int]$windowHeight; fullscreen=[bool]$Fullscreen; present_mode=$PresentMode}
+        native_base_fps_requested = 0
+        frame_rate_target = $null
         super_resolution_input_source = $(if ($NativePssr) { 'native-psml-pssr' } else { 'gt7-taa' })
         streamline_runtime_directory = $streamlineRuntime
         occlusion_guard_requested = [bool]$OcclusionGuard
@@ -336,6 +359,8 @@ try {
             'Initializes the real emulator window and Vulkan device, then exits before guest ELF loading or execution. No game state copied. This does not validate DLSS evaluation or rendering.'
         } elseif ($NativePssr1080To4K) {
             "Experimental GT7 Pro scene-resolution preset requests 1920x1080 rendering and 3840x2160 native PSSR/DLSS reconstruction. The game supplies the actual color/depth/motion rectangles, jitter and motion scales; the renderer does not relabel or crop higher-resolution input to claim 1080p. Window is 3840x2160. Verify actual native request dimensions and DLSS/fallback counters; the requested preset alone does not establish in-game correctness or performance. $nativeFgNote"
+        } elseif ($NativePssr1440To4K) {
+            "Experimental GT7 Pro scene-resolution preset requests 2560x1440 rendering and 3840x2160 native PSSR/DLSS reconstruction. The game supplies the actual color/depth/motion rectangles, jitter and motion scales. Window is 3840x2160. Verify actual native request dimensions and DLSS/fallback counters; the requested preset alone does not establish in-game correctness or performance. $nativeFgNote"
         } elseif ($NativePssr) {
             "Experimental native Psml/PSSR input to the existing DLSS backend. Pro must be advertised by the title and native PSSR dispatch must occur. Render/output sizes follow the game; only the window is fixed at 2560x1440. Native mode does not use the old 1080p scene patch or TAA hook. $nativeFgNote Inspect PSSR request, DLSS evaluation and spatial fallback counters; enabling the switch is not evidence of DLSS execution."
         } else {

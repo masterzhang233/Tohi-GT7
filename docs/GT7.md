@@ -1,6 +1,6 @@
 # Gran Turismo 7 in Tohi-GT7
 
-## Tohi-GT7 1.0.3 desktop release
+## Tohi-GT7 1.0.4 desktop release
 
 > [!IMPORTANT]
 > **本版本仅支持 NVIDIA GeForce RTX 40／50 系列显卡。**
@@ -12,20 +12,21 @@ It is the package's user entry point: add your own compatible GT7 directory, sel
 the game and launch. Developer capture scripts and standalone probes are source-tree
 tools and are not included in the binary package.
 
-The launcher's **4K + NVIDIA 2X** checkbox is enabled by default and can be turned
-off. It selects **1920×1080 → 3840×2160** reconstruction through
-GT7's native PSSR interface and the **NVIDIA DLSS backend**, followed by **NVIDIA 2X
-frame generation**. The PC reconstruction does not use Sony's PSSR neural model.
-Fixed 2X requests one generated frame per original frame; 3X, 4X and dynamic
-multi-frame generation are not offered. The live test used GT7 **PPSA01317, version
-01.710.000**. Other game versions have not received equivalent validation.
+The default graphics option selects **2560×1440 → 3840×2160** reconstruction
+through GT7's native PSSR interface and the **NVIDIA DLSS backend**, using preset M.
+The PC reconstruction does not use Sony's PSSR neural model. 4K is the reconstruction
+target; fullscreen display follows the desktop's physical size with Mailbox presentation.
+The live tests used GT7 **PPSA01317, version 01.710.000**. Other game versions have
+not received equivalent validation.
 
-The game's FPS counter continues to report original game frames, not generated
-presentations. The RTX 5080 driving test recorded real frame-generation activity,
-and the player reported substantially reduced or absent interruptions in the
-requested comparison. Missing or unverified camera, depth, motion or HUD-less
-inputs still pause generation. This does not promise continuous 2X in every menu,
-track or view, or a particular display FPS.
+**This package has no NVIDIA FG/MFG or FSR frame generation and no added 30 FPS cap.**
+Each presented game frame comes from an actual rendered frame after DLSS reconstruction;
+this does not mean native 4K rendering. It avoids inserting interpolated frames and
+their extra latency, without claiming a measured end-to-end latency improvement.
+Two RTX 5080 driving runs of the preceding 1440p SR-only test baseline recorded
+consistent native DLSS evaluations and no logged spatial fallback; these are not
+repeat driving tests of the final FG-disabled release artifact. The player reported no slow motion and substantially
+less stutter, with some minor stutter remaining. These are not FPS or frame-time benchmarks.
 
 Existing save/configuration locations remain compatible. The normal profile
 uses silent API logging; automatic developer captures are
@@ -33,16 +34,15 @@ disabled. Ordinary play requires neither F9/F10 nor manually set environment var
 The launcher no longer exposes the earlier VR launch controls.
 
 Use the game's **performance (frame rate) mode**. Ray tracing (RT) is not recommended
-for this release. See the [1.0.3 release notes](RELEASE-1.0.3.zh-CN.md),
-[native PSSR/DLSS implementation notes](NATIVE-PSSR-DLSS.md) and
-[NVIDIA frame-generation validation and limits](GT7-NVIDIA-FRAME-GENERATION.md).
+for this release. See the [1.0.4 release notes](RELEASE-1.0.4.zh-CN.md) and
+[native PSSR/DLSS implementation notes](NATIVE-PSSR-DLSS.md).
 
 ## Upstream development context
 
 The following settings, hardware measurements and dated change log record the
 upstream work before Tohi-GT7 1.0.0. They provide historical context for ordinary
 rendering with **DLSS off**; they are not instructions for the current native
-1080p-to-4K preset. In particular, historical debug and `File` logging settings
+1440p-to-4K preset. In particular, historical debug and `File` logging settings
 below do not replace the release launcher's defaults. Keep normal play logging silent.
 
 The upstream branch (`gt7-eqaa`) carries work on getting Gran Turismo 7 playable. It builds on the

@@ -142,7 +142,7 @@ if (KYTY_LINKER STREQUAL LD AND NOT LINUX)
 	set(KYTY_LD_OPTIONS "-Wl,--image-base=0x100000000000")
 endif()
 
-project(Kyty${KYTY_PROJECT_NAME}${CMAKE_BUILD_TYPE}${KYTY_COMPILER} VERSION 1.0.3)
+project(Kyty${KYTY_PROJECT_NAME}${CMAKE_BUILD_TYPE}${KYTY_COMPILER} VERSION 1.0.4)
 
 include_directories(
 	${KYTY_THIRD_PARTY_DIR}/gtest/include
@@ -1155,6 +1155,13 @@ if(BUILD_TESTING)
 	add_test(NAME pssr COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --pssr-only)
 	set_tests_properties(pssr PROPERTIES TIMEOUT 90)
 	add_test(NAME pssr_contract COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --pssr-contract-only)
+	if(NOT KYTY_ENABLE_GT7_DLSS_FG AND NOT KYTY_ENABLE_GT7_FSR_FG)
+		add_test(NAME gt7_framegen_disabled
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --framegen-disabled-only)
+		set_tests_properties(gt7_framegen_disabled PROPERTIES
+			ENVIRONMENT "KYTY_GT7_DLSS_FG=1;KYTY_GT7_FSR_FG=1;KYTY_GT7_NATIVE_ASYNC_PRESENT=1"
+			LABELS "cpu;gt7")
+	endif()
 	add_test(NAME guest_red_zone_patcher
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --red-zone-patcher-only)
 	add_test(NAME command_scheduler_timeline
@@ -1447,23 +1454,22 @@ if(KYTY_PACKAGE_DLSS)
 	install(FILES "${KYTY_NGX_SDK_ROOT}/LICENSE.txt" DESTINATION licenses/nvidia)
 	install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/LICENSES/NVIDIA-DLSS-NOTICE.md" DESTINATION licenses/nvidia)
 
-	# Native SR and Streamline must resolve the same production NGX runtime.
-	# This release was validated with this exact independently built PSSR backend;
-	# stale install caches must not silently select the earlier legacy-only DLL.
+	# Pin native SR independently of optional development frame-generation builds.
+	# A stale install cache must not select the earlier legacy-only backend.
+	function(kyty_require_release_sha256 path expected)
+		if(NOT EXISTS "${path}")
+			message(FATAL_ERROR "Missing native DLSS release dependency: ${path}")
+		endif()
+		file(SHA256 "${path}" actual)
+		if(NOT actual STREQUAL expected)
+			message(FATAL_ERROR "Unvalidated native DLSS release dependency: ${path}")
+		endif()
+	endfunction()
+	kyty_require_release_sha256("${KYTY_DLSS_BACKEND_FILE}"
+		"60cfdbbc405a641570e30c330638e5e662a271f977638bdd2df36f1d80f06ecf")
+	kyty_require_release_sha256("${KYTY_NGX_SDK_ROOT}/lib/Windows_x86_64/rel/nvngx_dlss.dll"
+		"d00b5b0ab29c3ca101b70c3a5ecb3a01b7ef33766a3383a28a18623083e6123e")
 	if(KYTY_ENABLE_GT7_DLSS_FG)
-		function(kyty_require_release_sha256 path expected)
-			if(NOT EXISTS "${path}")
-				message(FATAL_ERROR "Missing native DLSS release dependency: ${path}")
-			endif()
-			file(SHA256 "${path}" actual)
-			if(NOT actual STREQUAL expected)
-				message(FATAL_ERROR "Unvalidated native DLSS release dependency: ${path}")
-			endif()
-		endfunction()
-		kyty_require_release_sha256("${KYTY_DLSS_BACKEND_FILE}"
-			"60cfdbbc405a641570e30c330638e5e662a271f977638bdd2df36f1d80f06ecf")
-		kyty_require_release_sha256("${KYTY_NGX_SDK_ROOT}/lib/Windows_x86_64/rel/nvngx_dlss.dll"
-			"d00b5b0ab29c3ca101b70c3a5ecb3a01b7ef33766a3383a28a18623083e6123e")
 		set(kyty_streamline_release_pins
 			"sl.interposer.dll|b1d7395aebd7b9722841d64dcf7433680020b6a8e421f851c16d5ba0c2182edf"
 			"sl.common.dll|38eea3b4209afc455636ea372b5933d65fcc13becec6c84d101dcfc4d8648f75"
@@ -1538,6 +1544,7 @@ if(WIN32)
 	install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/docs/RELEASE-1.0.1.zh-CN.md" DESTINATION docs)
 	install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/docs/RELEASE-1.0.2.zh-CN.md" DESTINATION docs)
 	install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/docs/RELEASE-1.0.3.zh-CN.md"
+		"${CMAKE_CURRENT_SOURCE_DIR}/docs/RELEASE-1.0.4.zh-CN.md"
 		"${CMAKE_CURRENT_SOURCE_DIR}/docs/NATIVE-PSSR-DLSS.md"
 		"${CMAKE_CURRENT_SOURCE_DIR}/docs/GT7-NVIDIA-FRAME-GENERATION.md" DESTINATION docs)
 	install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/scripts/Start-GT7-Desktop.ps1"

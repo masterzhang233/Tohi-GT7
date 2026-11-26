@@ -1,27 +1,35 @@
 # Native PSSR to DLSS SR
 
 The native path forwards a supported game's Psml/PsmlMfsr2 temporal request through
-the guest command stream to the external NVIDIA DLSS backend. **Tohi-GT7 1.0.3 uses
-this path by default for fixed 1920×1080 → 3840×2160 reconstruction, with NVIDIA
-2X frame generation.** This consumes the game's native PSSR interface; it does
+the guest command stream to the external NVIDIA DLSS backend. **Tohi-GT7 1.0.4 uses
+this path by default for 2560×1440 → 3840×2160 reconstruction, preset M, without
+frame generation.** This consumes the game's native PSSR interface; it does
 not execute Sony's PSSR neural model. It depends on the title declaring PS5 Pro
 support and actually issuing native PSSR requests. Enabling the option alone does
 not prove DLSS is running in GT7.
 
-The 1.0.3 release supports **NVIDIA GeForce RTX 40 / 50 series GPUs only**. Its live
+The 1.0.4 release supports **NVIDIA GeForce RTX 40 / 50 series GPUs only**. Its live
 validation used **RTX 5080** and GT7 PPSA01317 01.710.000. Other GPU families are
 outside the release's support scope; not every model in these two series was tested.
 
-## Release 1.0.3 status
+## Release 1.0.4 status
 
-The November 25 candidate completed a real Nürburgring driving run with native
-1920×1080 inputs, 3840×2160 DLSS output and NVIDIA frame-generation activity. The
-player reported that interruptions were substantially reduced or absent during
-the requested comparison. The run ended normally. Camera/input and HUD checks
-remain active; unverified scenes can still suspend frame generation. These results
-do not establish continuous 2X, a display-FPS gain, or image-quality acceptance for
-every car, track and view. See the [release notes](RELEASE-1.0.3.zh-CN.md) and
-[frame-generation contract](GT7-NVIDIA-FRAME-GENERATION.md).
+The 1440p SR-only test baseline underlying this release completed two November 26
+driving runs with native 2560×1440 inputs and 3840×2160 DLSS output. These runs
+used the earlier test candidate, not the final 1.0.4 artifact built with both FG
+providers compiled out. Their last logged counters were respectively **38,400 / 38,400** and
+**9,600 / 9,600** requests / DLSS evaluations, both with **zero linear fallbacks**.
+All 67 and 19 bounded PSSR summary samples kept those dimensions. Both sessions
+ended normally with exit code 0. The player reported that slow motion disappeared
+and stutter was substantially reduced, with some minor stutter remaining.
+These counters verify the sampled SR path, not display FPS, frame-time consistency,
+latency, or image-quality acceptance for every car, track and view.
+
+The package contains neither NVIDIA nor FSR frame-generation runtimes and adds no
+30 FPS limit. Each presented game frame comes from an actual rendered frame after
+reconstruction; this is not native 4K rendering. Fullscreen Mailbox presentation uses
+the desktop's physical display size, independently of the 4K reconstruction target.
+See the [release notes](RELEASE-1.0.4.zh-CN.md).
 
 ## Selecting the path in developer tools
 
@@ -32,18 +40,23 @@ Build the emulator and `tools/dlss_backend` together. The optional backend must
 export both the original `KytyDlssGetApi` and the new `KytyDlssGetPssrApi` entry
 points. Keep the NVIDIA SDK and runtime external to the repository.
 
-The emulator flags are `--ps5-pro --pssr-dlss`. Provide absolute paths through
+The release flags are `--gt7-desktop-height native --ps5-pro --pssr-dlss
+--gt7-pssr-1440-4k`. Provide absolute paths through
 `KYTY_GT7_DLSS_BACKEND` and `KYTY_GT7_DLSS_RUNTIME`, as with the existing path.
 For native mode keep `KYTY_GT7_DLSS=0`, which disables the separate legacy TAA
-hook; `--pssr-dlss` enables native SR. When NVIDIA frame generation is enabled,
-`KYTY_GT7_DLSS_RUNTIME` and `KYTY_GT7_DLSS_FG_RUNTIME` must resolve to the **same
-directory**, containing the SR and Streamline/DLSS-G runtime DLLs supplied together.
-Separate SR and FG SDK directories are not the supported release layout. The
-launcher configures and checks this automatically; the complete native developer
-example is in [the frame-generation notes](GT7-NVIDIA-FRAME-GENERATION.md#build-and-activation).
+hook; `--pssr-dlss` enables native SR. The release sets `KYTY_GT7_DLSS_FG=0`,
+`KYTY_GT7_FSR_FG=0` and `KYTY_FG_MANUAL_ONLY=1`, clears inherited capture/FG
+settings, and applies no extra base-frame limiter. Both frame-generation providers
+are disabled at build time. Only `kyty_dlss_backend.dll` and `nvngx_dlss.dll` are
+required for this SR path; Streamline, DLSS-G and Reflex DLLs are not required.
 `KYTY_GT7_DLSS_PRESET=K`, `L`, or `M` retains the backend's existing model request.
 The requested preset is logged; this does not independently verify which model
 the NVIDIA runtime selects.
+
+For the 1.0.4 Windows package, configure `KYTY_PACKAGE_DLSS=ON`,
+`KYTY_ENABLE_GT7_DLSS_FG=OFF` and `KYTY_ENABLE_GT7_FSR_FG=OFF`. Use a clean install
+directory: the package tools reject stale FG DLLs and licenses. CMake and the
+package tools verify the pinned backend and SR runtime even when FG is disabled.
 
 The developer script `scripts/GT7-Test-DLSS.ps1` accepts `-NativePssr` alongside
 its existing required game, emulator, backend, runtime, save-source and output
@@ -53,33 +66,36 @@ request; the base `-NativePssr` mode's desktop window remains 2560 x 1440. The s
 retains its isolated save-copy workflow.
 
 Native mode rejects VR, FSR frame generation and legacy F9/F10 capture options.
-In the developer script, NVIDIA frame generation is opt-in with
-`-NativeFrameGeneration` and an explicit `-StreamlineRuntimeDirectory`. The native
-bridge supports the verified full-frame
-1920 x 1080 to 3840 x 2160 path and requests exactly one generated frame per real
-frame (fixed 2X). Other dimensions or unverified scenes retain ordinary presentation.
-The release launcher explicitly selects the native 1080p-to-4K and frame-generation
-options; inherited FG settings alone are not a substitute for the required inputs.
+For an isolated 1440p-to-4K test, add `-NativePssr1440To4K` without
+`-NativeFrameGeneration`; diagnostics remain off unless explicitly requested.
+Earlier opt-in FG development modes are documented in the
+[historical NVIDIA integration notes](GT7-NVIDIA-FRAME-GENERATION.md). They are
+not available in the 1.0.4 release build.
 
-The bridge copies the actual native depth and backward motion inputs after a
-successful DLSS evaluation, applying the request's pixel scale once. It matches
-a verified producer's camera and projection jitter to those exact image identities,
-then freezes the 4K display color after the verified tone-map and before HUD draws.
-Writes to inputs still needed by the current scene, multiple requests, missing camera
-data or a mismatched flip invalidate the candidate. Once verified tone-map and
-HUD-less capture complete, legitimate reuse of the retired SR source no longer
-invalidates the frozen display image. The native path does not execute the legacy
-TAA-hook SR feature. CPU tests and compilation alone do not prove live FG activity
-or performance; runtime presentation counters and user observation provide separate
-evidence, and neither is a display-FPS benchmark by itself.
+## GT7 Pro 1440p-to-4K release profile
 
-## GT7 Pro 1080p-to-4K profile
+For PPSA01317 01.710.000, add `--gt7-pssr-1440-4k` to `--ps5-pro --pssr-dlss`.
+The dedicated `GT7-PSSR-1440-to-4K.json` profile changes the game's native scene
+resolution controller. The native requests in both driving runs confirmed actual
+2560 x 1440 color/depth/motion inputs with 3840 x 2160 output in the test baseline. The bridge preserves
+their real resources, rectangles, jitter and motion scales; it does not relabel a
+larger input as 1440p. Special viewports or unobserved scenes still require runtime
+verification; a launch flag alone is not evidence of the input size.
+
+The 1440p and historical 1080p fixed profiles are mutually exclusive. Profile
+activation checks executable-image identity, profile digest and original patch
+bytes; game files on disk are not rewritten. `--gt7-check-only` validates the
+selection before GPU initialization or guest execution. The developer script
+selects a 4K window for isolated testing; the release launcher presents fullscreen
+at the desktop display size while keeping the 4K reconstruction target.
+
+## Historical GT7 Pro 1080p-to-4K profile
 
 For PPSA01317 01.710.000, add `--gt7-pssr-1080-4k` to `--ps5-pro --pssr-dlss`.
 The playtest script selects it with `-NativePssr -NativePssr1080To4K`, requests a
 3840 x 2160 window, and keeps frame generation off unless explicitly requested.
-The original developer script's `-NativePssr` default is unchanged; the release
-launcher selects the dedicated fixed profile. That option rejects legacy
+The original developer script's `-NativePssr` default is unchanged; the 1.0.3
+launcher selected this dedicated fixed profile. That option rejects legacy
 desktop-height patches, VR and custom patches. `--gt7-check-only` validates it before GPU initialization
 or guest execution. Executable-image identity, profile digest and original patch
 bytes are checked by the existing profile loader; no game file is rewritten.
@@ -150,8 +166,8 @@ validate GT7's Pro branch, in-game image quality, frame rate or frame generation
 
 ## Historical SR-only image-quality investigation (2026-11-25)
 
-The following records describe earlier candidates from the same day, before the
-fixed 1080p-to-4K frame-generation candidate summarized above. Their acceptance
+The following records describe November 25 candidates before the 1.0.3 fixed
+1080p-to-4K frame-generation candidate. Their acceptance
 status and dynamic-resolution settings apply to those candidates, not the current
 release preset.
 

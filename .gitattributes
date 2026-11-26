@@ -1,0 +1,2 @@
+# Patch manifests pin exact bytes; Windows checkouts must preserve their LF hashes.
+patches/GT7/*.json text eol=lf

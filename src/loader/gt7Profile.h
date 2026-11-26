@@ -26,7 +26,9 @@ struct Request {
     int vr_scale = 0;        // 0: not requested
     bool check_only = false;
     bool native_pssr_1080_4k = false;
-    [[nodiscard]] bool Active() const { return desktop_height >= 0 || vr_scale != 0 || native_pssr_1080_4k; }
+    bool native_pssr_1440_4k = false;
+    [[nodiscard]] bool NativePssrRequested() const { return native_pssr_1080_4k || native_pssr_1440_4k; }
+    [[nodiscard]] bool Active() const { return desktop_height >= 0 || vr_scale != 0 || NativePssrRequested(); }
 };
 
 // No guest initialization, writes, cache access, runtime loading, or GPU calls.

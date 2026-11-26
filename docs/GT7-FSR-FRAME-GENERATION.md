@@ -1,5 +1,10 @@
 # Tohi-GT7 desktop DLSS SR + Vulkan FSR 3.1 frame generation
 
+> **Historical development documentation.** Tohi-GT7 1.0.4 ships
+> [native 1440p-to-4K DLSS SR](NATIVE-PSSR-DLSS.md) only. It includes no NVIDIA
+> or FSR frame-generation runtime and no added 30 FPS cap. These experimental
+> activation instructions do not apply to the 1.0.4 binary package.
+
 This experimental desktop path preserves the existing fixed 1920x1080 to
 2560x1440 DLSS Super Resolution configuration (Quality hint, preset K). AMD
 FidelityFX supplies only 2x frame generation and its Vulkan presentation timing.

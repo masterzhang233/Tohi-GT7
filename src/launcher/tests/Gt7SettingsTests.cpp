@@ -37,12 +37,12 @@ int main(int argc, char** argv) {
 	      "wheel dialog uses its own translation context instead of QDialog");
 	app.removeTranslator(&probe);
 	const QStringList native_arguments {"--gt7-desktop-height", "native", "--ps5-pro",
-	                                    "--pssr-dlss", "--gt7-pssr-1080-4k"};
+	                                    "--pssr-dlss", "--gt7-pssr-1440-4k"};
 	Configuration original;
 	original.title_id = "PPSA01317";
 	Check(!original.controller.wheel_enabled, "racing wheel is disabled for new configurations");
 	Check(original.console_language == 11, "new configurations default to Simplified Chinese");
-	Check(original.gt7_dlss_enabled && Gt7ProfileArguments(original) == native_arguments, "fresh launcher requests native PSSR 1080p to 4K without the legacy desktop patch");
+	Check(original.gt7_dlss_enabled && Gt7ProfileArguments(original) == native_arguments, "fresh launcher requests native PSSR 1440p to 4K without the legacy desktop patch");
 	original.gt7_dlss_enabled = false;
 	original.gt7_desktop_height = 1440;
 	original.gt7_vr_scale = 120;
@@ -98,6 +98,17 @@ int main(int argc, char** argv) {
 	      "older settings receive safe native/VR-off defaults");
 	Check(old.gt7_dlss_enabled, "missing DLSS settings default to enabled");
 	Check(!loaded.gt7_dlss_enabled, "disabled DLSS preference survives settings and per-game copy");
+	QSettings previous_release(temporary.filePath("previous-release.ini"), QSettings::IniFormat);
+	previous_release.setValue("gt7_dlss_enabled", true);
+	previous_release.setValue("gt7_desktop_height", 1080);
+	previous_release.setValue("vblank_frequency", 30);
+	Configuration migrated;
+	migrated.ReadSettings(&previous_release);
+	migrated.title_id = "PPSA01317";
+	ApplyGt7DesktopPreset(migrated);
+	Check(migrated.gt7_dlss_enabled && migrated.gt7_desktop_height == 0 &&
+	          migrated.vblank_frequency == 60 && Gt7ProfileArguments(migrated) == native_arguments,
+	      "the old enabled switch migrates to 1440p SR and the title's normal virtual refresh");
 	Check(!old.controller.wheel_enabled, "older settings leave racing-wheel emulation disabled");
 	QSettings explicit_settings(temporary.filePath("explicit-language.ini"), QSettings::IniFormat);
 	explicit_settings.setValue(QStringLiteral("console_language"), 1);
@@ -138,12 +149,15 @@ int main(int argc, char** argv) {
 	preset.user_id = 1000;
 	preset.reflections_half_rate = true;
 	preset.skip_shader_hashes = "1234";
+	preset.vblank_frequency = 30;
+	preset.fullscreen_enabled = false;
 	ApplyGt7DesktopPreset(preset);
 	Check(preset.screen_resolution == Configuration::Resolution::R3840X2160 &&
 	          preset.gt7_desktop_height == 0 && !preset.gt7_vr_enabled,
 	      "preset selects 4K and native input without legacy desktop or VR arguments");
 	Check(Gt7ProfileArguments(preset) == native_arguments &&
 	          preset.present_mode == Configuration::PresentMode::Mailbox &&
+	          preset.vblank_frequency == 60 && preset.fullscreen_enabled &&
 	          !preset.readback_linear_images && preset.tessellation_enabled && preset.bindless_images_enabled &&
 	          preset.shader_optimization_type == Configuration::ShaderOptimizationType::Performance,
 	      "native preset retains the tested presentation and rendering settings");
@@ -162,6 +176,10 @@ int main(int argc, char** argv) {
 	inherited.insert("KYTY_PSSR_DIAGNOSTICS", "1");
 	inherited.insert("KYTY_GT7_NATIVE_ASYNC_PRESENT", "1");
 	inherited.insert("KYTY_GT7_DLSS_FG_RUNTIME", "old-split-runtime");
+	inherited.insert("KYTY_GT7_DLSS_FG", "1");
+	inherited.insert("KYTY_GT7_FSR_FG", "1");
+	inherited.insert("KYTY_GT7_DLSS_FG_BASE_FPS", "30");
+	inherited.insert("kyty_gt7_experimental_cap", "30");
 	inherited.insert("KYTY_GT7_DLSS_PRESET", "K");
 	inherited.insert("kyty_old_override", "1");
 	inherited.insert("DISABLE_RTSS_LAYER", "0");
@@ -169,8 +187,9 @@ int main(int argc, char** argv) {
 	Check(enabled_env.value("KYTY_GT7_DLSS") == "0" &&
 	          enabled_env.value("KYTY_GT7_FSR_FG") == "0" &&
 	          enabled_env.value("KYTY_GT7_FSR_FG_OCCLUSION_GUARD") == "0" &&
-	          enabled_env.value("KYTY_GT7_DLSS_FG") == "1",
-	      "native profile enables NVIDIA FG while disabling the old TAA hook and FSR FG");
+	          enabled_env.value("KYTY_GT7_DLSS_FG") == "0" &&
+	          enabled_env.value("KYTY_GT7_DLSS_FG_BASE_FPS") == "0",
+	      "native SR disables both FG providers, the old TAA hook and the extra base-frame cap");
 	Check(enabled_env.value("KYTY_GT7_DLSS_PRESET") == "M" &&
 	          enabled_env.value("KYTY_PSSR_DIAGNOSTICS") == "0" &&
 	          enabled_env.value("KYTY_GT7_NATIVE_ASYNC_PRESENT") == "0" &&
@@ -182,33 +201,40 @@ int main(int argc, char** argv) {
 	          !enabled_env.contains("KYTY_FG_FRAMES") &&
 	          !enabled_env.contains("KYTY_GT7_DLSS_TRACE") &&
 	          !enabled_env.contains("GT7_OLD_OVERRIDE") && !enabled_env.contains("kyty_old_override") &&
+	          !enabled_env.contains("kyty_gt7_experimental_cap") &&
 	          !enabled_env.contains("KYTY_PSSR_DLSS") && enabled_env.value("PATH") == "keep",
 	      "ordinary play removes inherited debug flags and suppresses automatic captures");
 	Check(enabled_env.value("KYTY_GT7_DLSS_BACKEND") == temporary.filePath("kyty_dlss_backend.dll") &&
 	          enabled_env.value("KYTY_GT7_DLSS_RUNTIME") == temporary.path() &&
-	          enabled_env.value("KYTY_GT7_DLSS_FG_RUNTIME") == temporary.path(),
-	      "SR and FG use the identical portable runtime directory beside the selected emulator");
+	          !enabled_env.contains("KYTY_GT7_DLSS_FG_RUNTIME"),
+	      "SR uses the portable runtime beside the selected emulator without loading FG dependencies");
 	preset.gt7_dlss_enabled = false;
 	preset.screen_resolution = Configuration::Resolution::R1920X1080;
 	preset.printf_direction = Configuration::LogDirection::File;
+	preset.vblank_frequency = 75;
+	preset.fullscreen_enabled = false;
+	preset.present_mode = Configuration::PresentMode::Fifo;
 	ApplyGt7DesktopPreset(preset);
 	const auto disabled_env = Gt7LaunchEnvironment(preset, temporary.path(), enabled_env);
 	Check(disabled_env.value("KYTY_GT7_DLSS") == "0" &&
 	          disabled_env.value("KYTY_GT7_FSR_FG") == "0" &&
 	          disabled_env.value("KYTY_GT7_FSR_FG_OCCLUSION_GUARD") == "0" &&
 	          disabled_env.value("KYTY_GT7_DLSS_FG") == "0" &&
+	          disabled_env.value("KYTY_GT7_DLSS_FG_BASE_FPS") == "0" &&
+	          disabled_env.value("KYTY_GT7_NATIVE_ASYNC_PRESENT") == "0" &&
 	          !disabled_env.contains("KYTY_GT7_DLSS_BACKEND") &&
 	          !disabled_env.contains("KYTY_GT7_DLSS_RUNTIME") &&
 	          !disabled_env.contains("KYTY_GT7_DLSS_FG_RUNTIME") &&
 	          !disabled_env.contains("KYTY_GT7_DLSS_PRESET") && Gt7ProfileArguments(preset).isEmpty(),
 	      "turning off the switch really disables the entire preset despite inherited settings");
 	Check(preset.screen_resolution == Configuration::Resolution::R1920X1080 &&
+	          preset.vblank_frequency == 75 && !preset.fullscreen_enabled &&
+	          preset.present_mode == Configuration::PresentMode::Fifo &&
 	          preset.printf_direction == Configuration::LogDirection::Silent,
-	      "unchecked preset preserves desktop output but still disables high-volume API logs");
-	const QStringList expected_runtime {"kyty_dlss_backend.dll", "nvngx_dlss.dll", "sl.interposer.dll",
-	    "sl.common.dll", "sl.dlss_g.dll", "sl.reflex.dll", "sl.pcl.dll", "nvngx_dlssg.dll", "NvLowLatencyVk.dll"};
+	      "unchecked preset preserves desktop output and virtual refresh but disables high-volume API logs");
+	const QStringList expected_runtime {"kyty_dlss_backend.dll", "nvngx_dlss.dll"};
 	Check(Gt7GraphicsRuntimeFiles() == expected_runtime,
-	      "required runtime includes SR, interposer, common, FG, Reflex, PCL and low-latency dependencies");
+	      "SR-only runtime requires the backend and SR DLL without frame-generation dependencies");
 	QTemporaryDir runtime;
 	Check(runtime.isValid() && MissingGt7GraphicsRuntimeFiles(runtime.path()) == expected_runtime,
 	      "an empty release reports every required graphics runtime");

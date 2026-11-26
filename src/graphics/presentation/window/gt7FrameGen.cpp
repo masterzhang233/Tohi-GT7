@@ -46,8 +46,10 @@
 namespace Libs::Graphics::Gt7FrameGen {
 namespace {
 
+#ifdef GT7_HAS_FSR_RUNTIME
 std::once_flag g_initialize;
 bool g_requested = false;
+#endif
 std::atomic<bool> g_discontinuity {true};
 StatusTracker g_status;
 
@@ -854,6 +856,10 @@ const char* InputProblem(const FrameInputs* inputs, vk::Rect2D region, const Vul
 } // namespace
 
 bool Requested() {
+#ifndef GT7_HAS_FSR_RUNTIME
+    // An environment opt-in cannot enable paths omitted from this build.
+    return false;
+#else
     if (Config::PssrDlssEnabled()) return false;
     std::call_once(g_initialize, [] {
         // Both runtimes replace presentation. Never nest their swapchain hooks,
@@ -869,7 +875,6 @@ bool Requested() {
             return;
         }
         g_status.Set(StatusReason::Loading);
-#ifdef GT7_HAS_FSR_RUNTIME
         wchar_t executable[32768] {};
         const DWORD length = GetModuleFileNameW(nullptr, executable, 32768);
         if (length == 0 || length >= 32768) {
@@ -906,13 +911,10 @@ bool Requested() {
         g_requested = true;
         g_status.Set(StatusReason::WaitingSwapchain);
         std::printf("GT7 FSR FG: Vulkan runtime loaded, desktop 2x requested; verified HUD-less scene required. Counts below are dispatches, not displayed frames.\n");
-#else
-        g_status.Set(StatusReason::BuildUnsupported);
-        std::printf("GT7 FSR FG: this build has no FidelityFX Vulkan runtime support; DLSS SR unaffected\n");
-#endif
         std::fflush(stdout);
     });
     return g_requested;
+#endif
 }
 
 bool InputsRequested(const GraphicContext& graphics) {

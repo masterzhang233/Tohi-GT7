@@ -9,10 +9,7 @@ import subprocess
 import tempfile
 
 
-RUNTIME = (
-    "kyty_dlss_backend.dll", "nvngx_dlss.dll", "sl.interposer.dll", "sl.common.dll",
-    "sl.dlss_g.dll", "sl.reflex.dll", "sl.pcl.dll", "nvngx_dlssg.dll", "NvLowLatencyVk.dll",
-)
+RUNTIME = ("kyty_dlss_backend.dll", "nvngx_dlss.dll")
 REQUIRED = ("launcher.exe", "kyty_emulator.exe", *RUNTIME)
 
 
@@ -44,8 +41,8 @@ def main() -> int:
         assert report["required_files_present"] is True
         assert Path(report["executable"]) == install / "launcher.exe"
         assert all(text in report["graphics_preset"] for text in (
-            "1920x1080", "3840x2160", "NVIDIA fixed 2X", "one generated frame", "RTX 40/50"))
-        assert "FSR" not in report["graphics_preset"]
+            "2560x1440", "3840x2160", "frame generation disabled", "no extra FPS cap", "RTX 40/50"))
+        assert "NVIDIA fixed 2X" not in report["graphics_preset"]
         checks += 1
         for name in REQUIRED:
             path = install / name

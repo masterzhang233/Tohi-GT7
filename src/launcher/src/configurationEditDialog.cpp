@@ -12,6 +12,7 @@
 #include <QComboBox>
 #include <QCoreApplication>
 #include <QDir>
+#include <QEvent>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QGroupBox>
@@ -24,6 +25,7 @@
 #include <QMessageBox>
 #include <QPushButton>
 #include <QResizeEvent>
+#include <QScrollArea>
 #include <QSettings>
 #include <QSlider>
 #include <QSpinBox>
@@ -129,8 +131,15 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
     : QDialog(parent, Qt::WindowCloseButtonHint), m_ui(new Ui::ConfigurationEditDialog),
       m_info(info) {
 	m_ui->setupUi(this);
-	setMinimumWidth(width());
+	// The form can grow inside the viewport without forcing the dialog off screen.
+	setMinimumSize(680, 480);
+	m_ui->settings_scroll->setMinimumSize(0, 0);
+	m_ui->settings_scroll->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+	m_ui->settings_scroll->setSizeAdjustPolicy(QAbstractScrollArea::AdjustIgnored);
+	m_ui->gridLayout->setSizeConstraint(QLayout::SetMinAndMaxSize);
 	InitGameDirectories();
+	m_ui->settings_scroll->viewport()->installEventFilter(this);
+	UpdateSettingsLayout();
 	m_ui->controller_group->setVisible(false);
 	m_ui->settings_button->setVisible(false);
 	m_ui->label_launcher_language->setVisible(false);
@@ -437,6 +446,51 @@ void ConfigurationEditDialog::InitGameDirectories() {
 	update_game_directory_buttons();
 }
 
+void ConfigurationEditDialog::UpdateSettingsLayout() {
+	if (m_game_dirs_group == nullptr) return;
+	// Keep long translated labels readable: compact dialogs use one vertical column.
+	const int left_width = qMax(m_ui->user_profile_group->minimumSizeHint().width(),
+	                           m_ui->compatibility_group->minimumSizeHint().width());
+	const int two_column_width = qMax(1000, left_width + m_ui->graphics_group->minimumSizeHint().width() + 16);
+	const bool compact = m_ui->settings_scroll->viewport()->width() < two_column_width;
+	const int columns = compact ? 1 : 2;
+	if (m_section_columns == columns) return;
+	m_section_columns = columns;
+	const QList<QWidget*> sections {m_ui->user_profile_group, m_ui->graphics_group,
+	    m_ui->compatibility_group, m_ui->audio_group, m_ui->notifications_group,
+	    m_ui->gt7_group, m_ui->debug_group};
+	for (auto* section : sections) m_ui->sectionsLayout->removeWidget(section);
+	m_ui->sectionsLayout->setColumnStretch(0, 1);
+	m_ui->sectionsLayout->setColumnStretch(1, compact ? 0 : 1);
+	if (compact) {
+		for (int row = 0; row < sections.size(); ++row) {
+			m_ui->sectionsLayout->addWidget(sections.at(row), row, 0);
+		}
+	} else {
+		m_ui->sectionsLayout->addWidget(m_ui->user_profile_group, 0, 0);
+		m_ui->sectionsLayout->addWidget(m_ui->compatibility_group, 1, 0);
+		m_ui->sectionsLayout->addWidget(m_ui->audio_group, 2, 0);
+		m_ui->sectionsLayout->addWidget(m_ui->graphics_group, 0, 1, 3, 1);
+		m_ui->sectionsLayout->addWidget(m_ui->notifications_group, 3, 0);
+		m_ui->sectionsLayout->addWidget(m_ui->gt7_group, 4, 0, 1, 2);
+		m_ui->sectionsLayout->addWidget(m_ui->debug_group, 5, 0, 1, 2);
+	}
+	m_ui->gridLayout->removeWidget(m_game_dirs_group);
+	m_ui->gridLayout->removeWidget(m_ui->controller_group);
+	m_ui->gridLayout->setColumnStretch(0, 1);
+	m_ui->gridLayout->setColumnStretch(1, compact ? 0 : 1);
+	m_ui->gridLayout->addWidget(m_game_dirs_group, 1, 0);
+	m_ui->gridLayout->addWidget(m_ui->controller_group, compact ? 2 : 1, compact ? 0 : 1);
+	m_ui->settings_scroll_content->adjustSize();
+}
+
+bool ConfigurationEditDialog::eventFilter(QObject* object, QEvent* event) {
+	if (object == m_ui->settings_scroll->viewport() && event->type() == QEvent::Resize) {
+		UpdateSettingsLayout();
+	}
+	return QDialog::eventFilter(object, event);
+}
+
 void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs) {
 	m_global_settings = true;
 	m_ui->label_launcher_language->setVisible(true);
@@ -463,8 +517,8 @@ void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs) {
 	m_game_dirs_group->setVisible(true);
 	m_ui->controller_group->setVisible(true);
 	update_game_directory_buttons();
+	m_ui->settings_scroll_content->adjustSize();
 	layout()->activate();
-	resize(size().expandedTo(minimumSizeHint()));
 }
 
 QStringList ConfigurationEditDialog::GetGameDirectories() const {

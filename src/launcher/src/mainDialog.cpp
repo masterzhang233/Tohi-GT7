@@ -6,6 +6,7 @@
 #include "configurationListWidget.h"
 #include "controllerLightbar.h"
 #include "gameContent.h"
+#include "frameGenerationController.h"
 #include "gt7Settings.h"
 #include "launcherDiagnostics.h"
 #include "patchesDialog.h"
@@ -13,8 +14,10 @@
 
 #include <QApplication>
 #include <QByteArray>
+#include <QButtonGroup>
 #include <QCheckBox>
 #include <QClipboard>
+#include <QCloseEvent>
 #include <QDialog>
 #include <QDesktopServices>
 #include <QDir>
@@ -27,8 +30,6 @@
 #include <QMessageBox>
 #include <QObject>
 #include <QPointer>
-#include <QPainter>
-#include <QPaintEvent>
 #include <QPixmap>
 #include <QSignalBlocker>
 #include <QProcess>
@@ -38,6 +39,7 @@
 #include <QRegularExpression>
 #include <QSettings>
 #include <QStandardPaths>
+#include <QStackedWidget>
 #include <QStringList>
 #include <QTextStream>
 #include <QUrl>
@@ -77,6 +79,7 @@ constexpr DWORD CMD_Y_CHARS = 1000;
 constexpr char SETTINGS_MAIN_DIALOG[]        = "MainDialog";
 constexpr char SETTINGS_MAIN_LAST_GEOMETRY[] = "geometry";
 constexpr char SETTINGS_CHECK_UPDATES[]       = "check_updates_on_startup";
+constexpr char SETTINGS_EXTERNAL_FG[]         = "external_frame_generation_enabled";
 
 class MainDialogPrivate: public QObject {
 	Q_OBJECT
@@ -97,6 +100,7 @@ public:
 	                      const QString& run_directory);
 
 	[[nodiscard]] const QString& GetInterpreter() const { return m_interpreter; }
+	[[nodiscard]] bool IsGameRunning() const { return m_process.state() != QProcess::NotRunning; }
 
 	static void WriteSettings(QSettings& s);
 	static void ReadSettings(QSettings& s);
@@ -104,10 +108,13 @@ public:
 private:
 	static QByteArray g_last_geometry;
 	static bool       g_check_updates_on_startup;
+	static bool       g_external_fg_enabled;
 
 	Ui::MainDialog* m_ui             = {nullptr};
 	MainDialog*     m_main_dialog    = nullptr;
 	UpdateChecker*  m_update_checker = nullptr;
+	FrameGenerationController* m_frame_generation = nullptr;
+	bool m_running_gt7 = false;
 	ControllerLightbar m_lightbar;
 	QString         m_interpreter;
 
@@ -123,12 +130,14 @@ private:
 
 QByteArray MainDialogPrivate::g_last_geometry;
 bool       MainDialogPrivate::g_check_updates_on_startup = true;
+bool       MainDialogPrivate::g_external_fg_enabled = true;
 
 MainDialog::MainDialog(QWidget* parent): QDialog(parent), m_p(new MainDialogPrivate(this)) {
 	m_p->Setup(this);
 }
 
 MainDialogPrivate::~MainDialogPrivate() {
+	if (m_frame_generation != nullptr) m_frame_generation->Stop();
 	m_process.disconnect(this);
 	delete m_ui;
 }
@@ -199,16 +208,53 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	m_ui = new Ui::MainDialog;
 	m_ui->setupUi(main_dialog);
 	main_dialog->setWindowTitle(QStringLiteral("Tohi-GT7 " KYTY_VERSION));
-	m_ui->label_Version->setText(main_dialog->windowTitle());
-	m_ui->gt7_release_badge->setText(tr("%1 / RELEASE").arg(QStringLiteral(KYTY_VERSION)));
+	m_ui->gt7_release_badge->setText(QStringLiteral(KYTY_VERSION));
+	m_ui->gt7_feature_panel->SetArtwork(QStringLiteral(":/images/gt7-super-gt.jpg"), 0.66);
+	m_ui->graphics_brand_panel->SetArtwork(QStringLiteral(":/images/gt7-official-hero.jpg"), 0.6);
+	const auto set_wordmark = [](QLabel* label, double logical_width) {
+		QPixmap logo(QStringLiteral(":/images/gt7-official-logo.png"));
+		if (!logo.isNull()) logo.setDevicePixelRatio(logo.width() / logical_width);
+		label->setPixmap(logo);
+	};
+	set_wordmark(m_ui->gt7_brand_logo, 300);
+	set_wordmark(m_ui->graphics_brand_logo, 216);
+	m_ui->gt7_feature_panel->setToolTip(tr("Official Gran Turismo 7 promotional artwork"));
+	m_ui->graphics_brand_panel->setToolTip(tr("Official Gran Turismo 7 promotional artwork"));
 
 	m_main_dialog = main_dialog;
 	m_update_checker = new UpdateChecker(main_dialog);
-	m_ui->check_updates_on_startup->setChecked(g_check_updates_on_startup);
-	m_ui->check_updates_link->setVisible(UpdateChecker::IsSupported());
-	m_ui->check_updates_on_startup->setVisible(UpdateChecker::IsSupported());
 
-	main_dialog->setWindowFlags(Qt::Dialog /*| Qt::MSWindowsFixedSizeDialogHint*/);
+	main_dialog->setWindowFlags(Qt::Window | Qt::WindowMinMaxButtonsHint | Qt::WindowCloseButtonHint);
+	auto* navigation = new QButtonGroup(main_dialog);
+	const QList<QPushButton*> buttons {m_ui->nav_games, m_ui->nav_graphics,
+	                                  m_ui->nav_settings, m_ui->nav_help};
+	for (int index = 0; index < buttons.size(); ++index) {
+		navigation->addButton(buttons.at(index), index);
+	}
+	m_ui->nav_games->setChecked(true);
+	connect(navigation, &QButtonGroup::idClicked, m_ui->pages, &QStackedWidget::setCurrentIndex);
+	connect(m_ui->settings_global_button, &QPushButton::clicked, m_ui->widget,
+	        &ConfigurationListWidget::edit_global_settings);
+	connect(m_ui->settings_game_button, &QPushButton::clicked, m_ui->widget,
+	        &ConfigurationListWidget::edit_configuration);
+	connect(m_ui->settings_input_button, &QPushButton::clicked, m_ui->widget,
+	        &ConfigurationListWidget::edit_input_mapping);
+	connect(m_ui->settings_wheel_button, &QPushButton::clicked, m_ui->widget,
+	        &ConfigurationListWidget::edit_wheel);
+	m_frame_generation = new FrameGenerationController(this);
+	connect(m_frame_generation, &FrameGenerationController::StatusChanged, this,
+	        [this](const QString& text, bool active) {
+		        m_ui->game_fg_status->setText(text);
+		        m_ui->game_fg_status->setProperty("frameGenerationActive", active);
+	        });
+	m_frame_generation->setEnabled(g_external_fg_enabled);
+	m_ui->external_fg_checkbox->setChecked(g_external_fg_enabled);
+	connect(m_ui->external_fg_checkbox, &QCheckBox::toggled, this, [this](bool enabled) {
+		g_external_fg_enabled = enabled;
+		m_frame_generation->setEnabled(enabled);
+		m_ui->widget->WriteSettings();
+		Update();
+	});
 
 	connect(main_dialog, &MainDialog::Start, this, &MainDialogPrivate::FindInterpreter,
 	        Qt::QueuedConnection);
@@ -224,16 +270,16 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	m_ui->gt7_dlss_checkbox->setChecked(m_ui->widget->Gt7DlssEnabled());
 	connect(m_ui->gt7_dlss_checkbox, &QCheckBox::toggled, m_ui->widget,
 	        &ConfigurationListWidget::SetGt7DlssEnabled);
-	QDir().mkpath(LauncherDiagnostics::LogsRoot());
+	if (!qEnvironmentVariableIsSet("KYTY_LAUNCHER_UI_SMOKE")) {
+		QDir().mkpath(LauncherDiagnostics::LogsRoot());
+	}
 	m_logs_path_label = new QLabel(
 	    tr("Diagnostic logs: %1").arg(QDir::toNativeSeparators(LauncherDiagnostics::LogsRoot())),
 	    main_dialog);
 	m_logs_path_label->setTextInteractionFlags(Qt::TextSelectableByMouse);
 	m_logs_path_label->setWordWrap(true);
 	m_ui->verticalLayout_4->insertWidget(0, m_logs_path_label);
-	m_logs_path_label->hide();
-	m_ui->label_settings_file->hide();
-	m_ui->label_Interpreter->hide();
+	m_ui->label_settings_file->setTextInteractionFlags(Qt::TextSelectableByMouse);
 	auto* support_layout = new QHBoxLayout;
 	m_open_logs_button   = new QPushButton(tr("Open log folder"), main_dialog);
 	m_copy_log_button    = new QPushButton(tr("Copy latest log path"), main_dialog);
@@ -268,15 +314,8 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	connect(m_export_logs_button, &QPushButton::clicked, this, [this]() {
 		ExportDiagnostics(LauncherDiagnostics::LatestRunDirectory());
 	});
-	connect(m_ui->check_updates_link, &QLabel::linkActivated, this,
-	        [this](const QString&) { m_update_checker->Check(true); });
-	connect(m_update_checker, &UpdateChecker::CheckingChanged, m_ui->check_updates_link,
-	        &QLabel::setDisabled);
-	connect(m_ui->check_updates_on_startup, &QCheckBox::toggled, this, [this](bool checked) {
-		g_check_updates_on_startup = checked;
-		m_ui->widget->WriteSettings();
-	});
 	connect(main_dialog, &MainDialog::Resize, [this]() {
+		m_ui->gt7_feature_panel->setFixedHeight(m_main_dialog->height() < 700 ? 200 : 220);
 		g_last_geometry = m_main_dialog->saveGeometry();
 		m_ui->widget->WriteSettings();
 	});
@@ -293,6 +332,10 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 		if (m_diagnostic_run != nullptr) {
 			m_diagnostic_run->RecordStarted(m_process.processId());
 		}
+		if (m_running_gt7) {
+			m_frame_generation->Start(m_process.processId(),
+			    m_diagnostic_run != nullptr ? m_diagnostic_run->Directory() : QString {});
+		}
 	});
 	connect(&m_process, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
 		if (m_diagnostic_run != nullptr) {
@@ -301,6 +344,8 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	});
 	connect(&m_process, qOverload<int, QProcess::ExitStatus>(&QProcess::finished), this,
 	        [this](int exit_code, QProcess::ExitStatus exit_status) {
+		        m_frame_generation->Stop();
+		        m_running_gt7 = false;
 		        QString run_directory;
 		        if (m_diagnostic_run != nullptr) {
 			        m_diagnostic_run->RecordFinished(exit_code,
@@ -332,7 +377,6 @@ void MainDialogPrivate::FindInterpreter() {
 	m_ui->widget->SetRuntimeDirectory(QFileInfo(m_interpreter).absolutePath());
 
 	if (found) {
-		m_ui->label_Interpreter->setText(tr("Emulator: ") + m_interpreter);
 
 		QProcess test;
 		test.setProgram(m_interpreter);
@@ -342,12 +386,7 @@ void MainDialogPrivate::FindInterpreter() {
 		auto output = QString(test.readAllStandardOutput());
 		auto lines  = output.split(QRegularExpression("[\r\n]"), Qt::SkipEmptyParts);
 
-		if (lines.count() >= 2) {
-			m_ui->label_Version->setText(m_main_dialog->windowTitle());
-			m_ui->label_Version->setToolTip(
-			    tr("Version: ") + (lines.at(0).startsWith("exe_name") ? lines.at(1) : lines.at(0)) +
-			    QStringLiteral("\n") + m_interpreter);
-		} else {
+		if (lines.count() < 2) {
 			found = false;
 		}
 	}
@@ -366,7 +405,7 @@ void MainDialogPrivate::FindInterpreter() {
 	m_ui->label_settings_file->setText(tr("Settings file: ") + m_ui->widget->GetSettingsFile());
 
 	Update();
-	if (m_ui->check_updates_on_startup->isChecked()) {
+	if (g_check_updates_on_startup) {
 		m_update_checker->Check(false);
 	}
 }
@@ -803,25 +842,28 @@ void MainDialog::ReadSettings(QSettings& s) {
 	MainDialogPrivate::ReadSettings(s);
 }
 
-void MainDialog::paintEvent(QPaintEvent* event) {
-	QDialog::paintEvent(event);
-	static const QPixmap wallpaper(QStringLiteral(":/images/gt7-wallpaper.jpg"));
-	QPainter painter(this);
-	painter.setRenderHint(QPainter::SmoothPixmapTransform);
-	if (!wallpaper.isNull()) {
-		const auto scale = qMax(double(width()) / wallpaper.width(),
-		                        double(height()) / wallpaper.height());
-		const QSizeF scaled(wallpaper.width() * scale, wallpaper.height() * scale);
-		const QRectF target((width() - scaled.width()) / 2, (height() - scaled.height()) / 2,
-		                    scaled.width(), scaled.height());
-		painter.drawPixmap(target, wallpaper, QRectF(wallpaper.rect()));
-	}
-	painter.fillRect(rect(), QColor(5, 8, 14, 145));
-}
-
 void MainDialog::resizeEvent(QResizeEvent* event) {
 	emit Resize();
 	QDialog::resizeEvent(event);
+}
+
+void MainDialog::closeEvent(QCloseEvent* event) {
+	if (m_p->IsGameRunning()) {
+		// Keep tracking the game: destroying its QProcess would terminate it.
+		event->ignore();
+		showMinimized();
+		return;
+	}
+	QDialog::closeEvent(event);
+}
+
+void MainDialog::reject() {
+	// Escape calls reject directly, so it needs the same protection as the title-bar close button.
+	if (m_p->IsGameRunning()) {
+		showMinimized();
+		return;
+	}
+	QDialog::reject();
 }
 
 void MainDialogPrivate::WriteSettings(QSettings& s) {
@@ -831,6 +873,7 @@ void MainDialogPrivate::WriteSettings(QSettings& s) {
 		s.setValue(SETTINGS_MAIN_LAST_GEOMETRY, g_last_geometry);
 	}
 	s.setValue(SETTINGS_CHECK_UPDATES, g_check_updates_on_startup);
+	s.setValue(SETTINGS_EXTERNAL_FG, g_external_fg_enabled);
 
 	s.endGroup();
 }
@@ -840,12 +883,14 @@ void MainDialogPrivate::ReadSettings(QSettings& s) {
 
 	g_last_geometry = s.value(SETTINGS_MAIN_LAST_GEOMETRY, g_last_geometry).toByteArray();
 	g_check_updates_on_startup = s.value(SETTINGS_CHECK_UPDATES, true).toBool();
+	g_external_fg_enabled = s.value(SETTINGS_EXTERNAL_FG, true).toBool();
 
 	s.endGroup();
 }
 
 void MainDialogPrivate::Run() {
-	if (m_process.state() != QProcess::NotRunning) {
+	if (qEnvironmentVariableIsSet("KYTY_LAUNCHER_UI_SMOKE") ||
+	    m_process.state() != QProcess::NotRunning) {
 		return;
 	}
 	m_running_item = m_ui->widget->GetSelectedItem();
@@ -860,13 +905,18 @@ void MainDialogPrivate::Run() {
 	ApplyGt7DesktopPreset(*info);
 	const bool gt7_title =
 	    info->title_id.compare(QStringLiteral("PPSA01317"), Qt::CaseInsensitive) == 0;
+	m_running_gt7 = gt7_title;
 	if (gt7_title) {
 		LauncherDiagnostics::RunDetails details;
 		details.title_id          = info->title_id;
 		details.game_version      = info->gameVersion;
 		details.output_resolution = EnumToText(info->screen_resolution);
-		details.mode = info->gt7_dlss_enabled ? QStringLiteral("Native PSSR inputs / DLSS 1440p to 4K; frame generation off; no extra FPS cap")
+		details.mode = info->gt7_dlss_enabled ? QStringLiteral("Native PSSR inputs / DLSS 1440p to 4K")
 		                                      : QStringLiteral("Desktop");
+		details.mode += g_external_fg_enabled
+		                    ? QStringLiteral("; external capture FG 2X requested")
+		                    : QStringLiteral("; external FG off");
+		details.mode += QStringLiteral("; built-in FG off; no extra FPS cap");
 		details.desktop_height = info->gt7_desktop_height;
 		details.vr_scale       = info->gt7_vr_scale;
 		details.gpu_index      = info->gpu_index;
@@ -909,11 +959,8 @@ void MainDialogPrivate::Update() {
 	m_ui->gt7_start_button->setEnabled(run_enabled && gt7_selected);
 	m_ui->gt7_start_button->setText(m_process.state() == QProcess::Starting ? tr("Starting...") :
 	    m_process.state() == QProcess::Running ? tr("Running...") : tr("Start game"));
-	m_ui->gt7_feature_hint->setText(m_process.state() == QProcess::Starting ? tr("Preparing the game...") :
-	    m_process.state() == QProcess::Running ? tr("Game running. Graphics settings are locked until it closes.")
-	    : gt7_selected ? tr("Ready to start Gran Turismo 7.")
-	                   : tr("Select Gran Turismo 7 in the game library to start."));
 	m_ui->gt7_dlss_checkbox->setEnabled(m_process.state() == QProcess::NotRunning);
+	m_ui->settings_game_button->setEnabled(item != nullptr);
 	{
 		const QSignalBlocker blocker(m_ui->gt7_dlss_checkbox);
 		m_ui->gt7_dlss_checkbox->setChecked(m_ui->widget->Gt7DlssEnabled());
@@ -921,17 +968,15 @@ void MainDialogPrivate::Update() {
 	const bool has_logs = !LauncherDiagnostics::LatestRunDirectory().isEmpty();
 	m_copy_log_button->setEnabled(has_logs);
 	m_export_logs_button->setEnabled(has_logs);
-	m_ui->gt7_feature_summary->setText(
-	    m_ui->widget->Gt7DlssEnabled()
-	        ? tr("1440p → 4K · Native PSSR inputs + DLSS · Frame generation off")
-	        : tr("4K upscaling off · Desktop rendering · Frame generation off"));
 	m_ui->gt7_start_button->setToolTip(
 	    gt7_selected ? QString {} : tr("Select Gran Turismo 7 in the game library to start."));
 	if (m_process.state() != QProcess::NotRunning) {
 		m_lightbar.Stop();
 		return;
 	}
-	m_lightbar.SetColor(m_ui->widget->GetGlobalControllerColor());
+	if (!qEnvironmentVariableIsSet("KYTY_LAUNCHER_UI_SMOKE")) {
+		m_lightbar.SetColor(m_ui->widget->GetGlobalControllerColor());
+	}
 }
 
 #include "mainDialog.moc"

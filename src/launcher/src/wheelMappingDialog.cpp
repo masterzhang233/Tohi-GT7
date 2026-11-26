@@ -14,6 +14,7 @@
 #include <QMessageBox>
 #include <QPushButton>
 #include <QSlider>
+#include <QScrollArea>
 #include <QSpinBox>
 #include <QTreeWidget>
 #include <QVBoxLayout>
@@ -95,7 +96,8 @@ bool HatHas(uint8_t hat, HatDirection dir) {
 WheelMappingDialog::WheelMappingDialog(const QString& config_path, bool enabled, QWidget* parent)
     : QDialog(parent), m_path(config_path) {
 	setWindowTitle(tr("Racing wheel"));
-	m_sdl_ready = SDL_InitSubSystem(SDL_INIT_JOYSTICK | SDL_INIT_HAPTIC);
+	const bool preview = qEnvironmentVariableIsSet("KYTY_LAUNCHER_UI_SMOKE");
+	m_sdl_ready = !preview && SDL_InitSubSystem(SDL_INIT_JOYSTICK | SDL_INIT_HAPTIC);
 	if (QFile::exists(m_path)) {
 		std::string error;
 		if (auto loaded = Config::Wheel::Load(m_path.toStdWString(), &error)) {
@@ -107,14 +109,14 @@ WheelMappingDialog::WheelMappingDialog(const QString& config_path, bool enabled,
 		}
 	}
 	BuildUi(enabled);
-	RefreshDevices();
+	if (!preview) RefreshDevices();
 	LoadToUi();
 	m_refresh_clock.start();
 	m_timer.setInterval(25);
 	connect(&m_timer, &QTimer::timeout, this, &WheelMappingDialog::Tick);
 	if (m_sdl_ready) {
 		m_timer.start();
-	} else {
+	} else if (!preview) {
 		m_status->setText(tr("SDL joystick support could not start: %1").arg(SDL_GetError()));
 	}
 }
@@ -134,7 +136,22 @@ bool WheelMappingDialog::Enabled() const {
 }
 
 void WheelMappingDialog::BuildUi(bool enabled) {
-	auto* layout = new QVBoxLayout(this);
+	resize(900, 660);
+	setMinimumSize(680, 520);
+	auto* outer_layout = new QVBoxLayout(this);
+	outer_layout->setContentsMargins(20, 20, 20, 20);
+	outer_layout->setSpacing(16);
+	auto* scroll = new QScrollArea(this);
+	scroll->setObjectName(QStringLiteral("wheel_scroll"));
+	scroll->setWidgetResizable(true);
+	scroll->setFrameShape(QFrame::NoFrame);
+	auto* content = new QWidget(scroll);
+	content->setObjectName(QStringLiteral("wheel_scroll_content"));
+	auto* layout = new QVBoxLayout(content);
+	layout->setContentsMargins(0, 0, 0, 0);
+	layout->setSpacing(12);
+	scroll->setWidget(content);
+	outer_layout->addWidget(scroll, 1);
 
 	// The wheel the game is shown; Off leaves it the pad alone.
 	auto* emulated_row = new QHBoxLayout;
@@ -162,7 +179,7 @@ void WheelMappingDialog::BuildUi(bool enabled) {
 	m_table->setRootIsDecorated(false);
 	m_table->header()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
 	m_table->header()->setSectionResizeMode(1, QHeaderView::Stretch);
-	m_table->setMinimumSize(620, 360);
+	m_table->setMinimumSize(620, 240);
 	for (int i = 0; i < Config::Wheel::CONTROL_COUNT; i++) {
 		auto* item = new QTreeWidgetItem(m_table);
 		item->setText(0, ControlLabel(static_cast<Control>(i)));
@@ -248,7 +265,7 @@ void WheelMappingDialog::BuildUi(bool enabled) {
 	auto* import =
 	    buttons->addButton(tr("Import RPCS3 G27 mapping..."), QDialogButtonBox::ActionRole);
 	auto* test_button = buttons->addButton(tr("Test force feedback"), QDialogButtonBox::ActionRole);
-	layout->addWidget(buttons);
+	outer_layout->addWidget(buttons);
 
 	connect(buttons, &QDialogButtonBox::accepted, this, [this] {
 		if (Enabled() && !m_config.Get(Control::Steering).IsBound() &&

@@ -33,7 +33,8 @@ try {
             executable = $launcher
             working_directory = $install
             required_files_present = $true
-            graphics_preset = 'Use the saved graphics checkbox: native PSSR inputs, DLSS 2560x1440 to 3840x2160 reconstruction, preset M, fullscreen Mailbox at the desktop display size, frame generation disabled, no extra FPS cap. Supported GPUs: GeForce RTX 40/50 series.'
+            graphics_preset = 'Use the saved graphics settings: native PSSR inputs, DLSS 2560x1440 to 3840x2160 reconstruction, preset M, fullscreen Mailbox at the desktop display size. External capture DLSS frame generation 2X Auto is enabled by default and can be disabled in the launcher. Internal FG/MFG and extra FPS caps are disabled. Supported GPUs: GeForce RTX 40/50 series.'
+            external_frame_generation_component_present = Test-Path -LiteralPath (Join-Path $install 'framegen\TohiFrameGen.exe') -PathType Leaf
             started = $false
             save_files_modified = $false
         } | ConvertTo-Json

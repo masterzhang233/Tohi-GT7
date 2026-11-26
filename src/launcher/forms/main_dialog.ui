@@ -2,98 +2,711 @@
 <ui version="4.0">
  <class>MainDialog</class>
  <widget class="QDialog" name="MainDialog">
-  <property name="geometry"><rect><x>0</x><y>0</y><width>1120</width><height>760</height></rect></property>
-  <property name="minimumSize"><size><width>900</width><height>660</height></size></property>
-  <property name="windowTitle"><string>Tohi-GT7</string></property>
-  <layout class="QVBoxLayout" name="mainLayout">
-   <property name="spacing"><number>12</number></property>
-   <property name="leftMargin"><number>26</number></property>
-   <property name="topMargin"><number>22</number></property>
-   <property name="rightMargin"><number>26</number></property>
-   <property name="bottomMargin"><number>20</number></property>
+  <property name="minimumSize">
+   <size>
+    <width>900</width>
+    <height>660</height>
+   </size>
+  </property>
+  <property name="windowTitle">
+   <string>Tohi-GT7</string>
+  </property>
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>1120</width>
+    <height>760</height>
+   </rect>
+  </property>
+  <layout class="QHBoxLayout" name="mainLayout" stretch="0,1">
+   <property name="spacing">
+    <number>0</number>
+   </property>
+   <property name="leftMargin">
+    <number>0</number>
+   </property>
+   <property name="topMargin">
+    <number>0</number>
+   </property>
+   <property name="rightMargin">
+    <number>0</number>
+   </property>
+   <property name="bottomMargin">
+    <number>0</number>
+   </property>
    <item>
-    <widget class="QFrame" name="gt7_feature_panel">
-     <layout class="QVBoxLayout" name="gt7FeatureLayout">
-      <property name="spacing"><number>12</number></property>
-      <property name="leftMargin"><number>22</number></property>
-      <property name="topMargin"><number>18</number></property>
-      <property name="rightMargin"><number>22</number></property>
-      <property name="bottomMargin"><number>18</number></property>
-      <item><layout class="QHBoxLayout" name="gt7TitleLayout">
-       <item><widget class="QLabel" name="gt7_feature_title"><property name="text"><string>Tohi-GT7</string></property></widget></item>
-       <item><spacer name="titleSpacer"><property name="orientation"><enum>Qt::Horizontal</enum></property><property name="sizeHint" stdset="0"><size><width>40</width><height>20</height></size></property></spacer></item>
-       <item><widget class="QLabel" name="gt7_release_badge"><property name="text"><string>RELEASE</string></property></widget></item>
-      </layout></item>
-      <item><widget class="QLabel" name="gt7_feature_hint"><property name="text"><string>Ready for your next drive.</string></property><property name="wordWrap"><bool>true</bool></property></widget></item>
-      <item><widget class="QLabel" name="gt7_feature_credit"><property name="text"><string>masterzhang233 · based on KytyPS5-GT7</string></property></widget></item>
+    <widget class="QFrame" name="navigation_panel">
+     <property name="minimumSize">
+      <size>
+       <width>176</width>
+       <height>0</height>
+      </size>
+     </property>
+     <property name="maximumSize">
+      <size>
+       <width>176</width>
+       <height>16777215</height>
+      </size>
+     </property>
+     <layout class="QVBoxLayout" name="navigationLayout">
+      <property name="spacing">
+       <number>8</number>
+      </property>
+      <property name="leftMargin">
+       <number>12</number>
+      </property>
+      <property name="topMargin">
+       <number>20</number>
+      </property>
+      <property name="rightMargin">
+       <number>12</number>
+      </property>
+      <property name="bottomMargin">
+       <number>12</number>
+      </property>
+      <item>
+       <widget class="QLabel" name="gt7_feature_title">
+        <property name="text">
+         <string>Tohi-GT7</string>
+        </property>
+        <property name="wordWrap">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QLabel" name="gt7_release_badge">
+        <property name="text">
+         <string>RELEASE</string>
+        </property>
+        <property name="wordWrap">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="nav_games">
+        <property name="text">
+         <string>Games</string>
+        </property>
+        <property name="autoDefault">
+         <bool>false</bool>
+        </property>
+        <property name="checkable">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="nav_graphics">
+        <property name="text">
+         <string>Graphics</string>
+        </property>
+        <property name="autoDefault">
+         <bool>false</bool>
+        </property>
+        <property name="checkable">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="nav_settings">
+        <property name="text">
+         <string>Settings</string>
+        </property>
+        <property name="autoDefault">
+         <bool>false</bool>
+        </property>
+        <property name="checkable">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="nav_help">
+        <property name="text">
+         <string>Logs</string>
+        </property>
+        <property name="autoDefault">
+         <bool>false</bool>
+        </property>
+        <property name="checkable">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <spacer name="navSpacer">
+        <property name="orientation">
+         <enum>Qt::Vertical</enum>
+        </property>
+        <property name="sizeHint" stdset="0">
+         <size>
+          <width>20</width>
+          <height>24</height>
+         </size>
+        </property>
+       </spacer>
+      </item>
+      <item>
+       <widget class="QLabel" name="sidebar_caption">
+        <property name="text">
+         <string>Gran Turismo 7</string>
+        </property>
+        <property name="wordWrap">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
      </layout>
     </widget>
    </item>
    <item>
-    <widget class="QFrame" name="gt7_graphics_panel">
-     <layout class="QHBoxLayout" name="gt7ActionLayout" stretch="1,0">
-      <property name="leftMargin"><number>20</number></property>
-      <property name="topMargin"><number>16</number></property>
-      <property name="rightMargin"><number>18</number></property>
-      <property name="bottomMargin"><number>16</number></property>
-      <property name="spacing"><number>22</number></property>
-      <item><layout class="QVBoxLayout" name="graphicsDetailsLayout">
-       <property name="spacing"><number>7</number></property>
-       <item><widget class="QCheckBox" name="gt7_dlss_checkbox">
-        <property name="text"><string>PSSR 4K</string></property>
-        <property name="checked"><bool>true</bool></property>
-        <property name="toolTip"><string>Reconstructs 2560 x 1440 native PSSR inputs to 3840 x 2160 with the PC DLSS backend. Frame generation and extra frame caps are disabled. Supports NVIDIA GeForce RTX 40/50 series only. Changes apply on the next launch.</string></property>
-       </widget></item>
-       <item><widget class="QLabel" name="gt7_feature_summary">
-        <property name="text"><string>1440p → 4K · Native PSSR inputs + DLSS · Frame generation off</string></property>
-        <property name="wordWrap"><bool>true</bool></property>
-        <property name="sizePolicy"><sizepolicy hsizetype="Expanding" vsizetype="Preferred"><horstretch>1</horstretch><verstretch>0</verstretch></sizepolicy></property>
-       </widget></item>
-       <item><widget class="QLabel" name="gt7_graphics_support">
-        <property name="text"><string>GeForce RTX 40/50 series only · Applies on next launch</string></property>
-        <property name="wordWrap"><bool>true</bool></property>
-       </widget></item>
-      </layout></item>
-      <item><widget class="QPushButton" name="gt7_start_button">
-       <property name="minimumSize"><size><width>180</width><height>52</height></size></property>
-       <property name="text"><string>Start game</string></property>
-       <property name="autoDefault"><bool>false</bool></property>
-      </widget></item>
-     </layout>
-    </widget>
-   </item>
-   <item>
-    <widget class="QFrame" name="game_library_panel">
-     <property name="sizePolicy"><sizepolicy hsizetype="Expanding" vsizetype="Expanding"><horstretch>0</horstretch><verstretch>1</verstretch></sizepolicy></property>
-     <layout class="QVBoxLayout" name="libraryLayout">
-      <property name="leftMargin"><number>16</number></property><property name="topMargin"><number>14</number></property><property name="rightMargin"><number>16</number></property><property name="bottomMargin"><number>12</number></property>
-      <item><widget class="QLabel" name="game_library_title"><property name="text"><string>GAME LIBRARY</string></property></widget></item>
-      <item><widget class="ConfigurationListWidget" name="widget" native="true">
-       <property name="minimumSize"><size><width>400</width><height>160</height></size></property>
-      </widget></item>
-     </layout>
-    </widget>
-   </item>
-   <item>
-    <widget class="QFrame" name="support_panel">
-     <layout class="QVBoxLayout" name="verticalLayout_4">
-      <property name="leftMargin"><number>16</number></property><property name="topMargin"><number>12</number></property><property name="rightMargin"><number>16</number></property><property name="bottomMargin"><number>12</number></property>
-      <item><widget class="QLabel" name="label_settings_file"><property name="text"><string notr="true">Settings</string></property></widget></item>
-      <item><widget class="QLabel" name="label_Interpreter"><property name="text"><string notr="true">Runtime</string></property></widget></item>
-      <item><widget class="QLabel" name="graphics_credit"><property name="wordWrap"><bool>true</bool></property><property name="text"><string>NVIDIA DLSS Super Resolution</string></property></widget></item>
-      <item><layout class="QHBoxLayout" name="versionLayout">
-       <item><widget class="QLabel" name="label_Version"><property name="text"><string>Tohi-GT7</string></property></widget></item>
-       <item><spacer name="versionSpacer"><property name="orientation"><enum>Qt::Horizontal</enum></property><property name="sizeHint" stdset="0"><size><width>40</width><height>20</height></size></property></spacer></item>
-       <item><widget class="QLabel" name="check_updates_link"><property name="text"><string>&lt;a href=&quot;check&quot;&gt;Check for updates&lt;/a&gt;</string></property><property name="textFormat"><enum>Qt::RichText</enum></property></widget></item>
-       <item><widget class="QCheckBox" name="check_updates_on_startup"><property name="text"><string>Check for updates on startup</string></property></widget></item>
-      </layout></item>
-     </layout>
+    <widget class="QStackedWidget" name="pages">
+     <property name="currentIndex">
+      <number>0</number>
+     </property>
+     <widget class="QWidget" name="games_page">
+      <layout class="QVBoxLayout" name="gamesLayout" stretch="0,0,1,0">
+       <property name="leftMargin">
+        <number>24</number>
+       </property>
+       <property name="topMargin">
+        <number>24</number>
+       </property>
+       <property name="rightMargin">
+        <number>24</number>
+       </property>
+       <property name="bottomMargin">
+        <number>24</number>
+       </property>
+       <item>
+        <widget class="Gt7BrandBanner" name="gt7_feature_panel">
+         <property name="minimumSize">
+          <size>
+           <width>0</width>
+           <height>200</height>
+          </size>
+         </property>
+         <property name="maximumSize">
+          <size>
+           <width>16777215</width>
+           <height>220</height>
+          </size>
+         </property>
+         <layout class="QHBoxLayout" name="brandLayout" stretch="0,1">
+          <property name="spacing">
+           <number>0</number>
+          </property>
+          <property name="leftMargin">
+           <number>20</number>
+          </property>
+          <property name="rightMargin">
+           <number>20</number>
+          </property>
+          <property name="topMargin">
+           <number>16</number>
+          </property>
+          <property name="bottomMargin">
+           <number>16</number>
+          </property>
+          <item>
+           <layout class="QVBoxLayout" name="brandTextLayout">
+            <property name="spacing">
+             <number>6</number>
+            </property>
+            <property name="leftMargin">
+             <number>0</number>
+            </property>
+            <property name="rightMargin">
+             <number>0</number>
+            </property>
+            <property name="topMargin">
+             <number>0</number>
+            </property>
+            <property name="bottomMargin">
+             <number>0</number>
+            </property>
+            <item>
+             <widget class="QLabel" name="gt7_brand_logo">
+              <property name="wordWrap">
+               <bool>true</bool>
+              </property>
+              <property name="minimumSize">
+               <size>
+                <width>300</width>
+                <height>100</height>
+               </size>
+              </property>
+              <property name="maximumSize">
+               <size>
+                <width>300</width>
+                <height>100</height>
+               </size>
+              </property>
+             </widget>
+            </item>
+           </layout>
+          </item>
+          <item>
+           <spacer name="brandSceneSpacer">
+            <property name="orientation">
+             <enum>Qt::Horizontal</enum>
+            </property>
+           </spacer>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="game_library_title">
+         <property name="text">
+          <string>Game library</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="ConfigurationListWidget" name="widget" native="true">
+         <property name="minimumSize">
+          <size>
+           <width>400</width>
+           <height>180</height>
+          </size>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="launchLayout">
+         <property name="spacing">
+          <number>12</number>
+         </property>
+         <property name="leftMargin">
+          <number>0</number>
+         </property>
+         <property name="topMargin">
+          <number>0</number>
+         </property>
+         <property name="rightMargin">
+          <number>0</number>
+         </property>
+         <property name="bottomMargin">
+          <number>0</number>
+         </property>
+         <item>
+          <widget class="QLabel" name="game_fg_status">
+           <property name="text">
+            <string>Ready</string>
+           </property>
+           <property name="wordWrap">
+            <bool>true</bool>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <spacer name="launchSpacer">
+           <property name="orientation">
+            <enum>Qt::Horizontal</enum>
+           </property>
+           <property name="sizeHint" stdset="0">
+            <size>
+             <width>20</width>
+             <height>24</height>
+            </size>
+           </property>
+          </spacer>
+         </item>
+         <item>
+          <widget class="QPushButton" name="gt7_start_button">
+           <property name="text">
+            <string>Start game</string>
+           </property>
+           <property name="autoDefault">
+            <bool>false</bool>
+           </property>
+           <property name="minimumSize">
+            <size>
+             <width>144</width>
+             <height>36</height>
+            </size>
+           </property>
+           <property name="default">
+            <bool>true</bool>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <property name="spacing">
+        <number>12</number>
+       </property>
+      </layout>
+     </widget>
+     <widget class="QWidget" name="graphics_page">
+      <layout class="QVBoxLayout" name="graphicsPageLayout">
+       <property name="spacing">
+        <number>0</number>
+       </property>
+       <property name="leftMargin">
+        <number>0</number>
+       </property>
+       <property name="rightMargin">
+        <number>0</number>
+       </property>
+       <property name="topMargin">
+        <number>0</number>
+       </property>
+       <property name="bottomMargin">
+        <number>0</number>
+       </property>
+       <item>
+        <widget class="QScrollArea" name="graphics_scroll">
+         <property name="widgetResizable">
+          <bool>true</bool>
+         </property>
+         <property name="frameShape">
+          <enum>QFrame::NoFrame</enum>
+         </property>
+         <property name="horizontalScrollBarPolicy">
+          <enum>Qt::ScrollBarAlwaysOff</enum>
+         </property>
+         <widget class="QWidget" name="graphics_scroll_content">
+          <layout class="QVBoxLayout" name="graphicsLayout">
+           <property name="leftMargin">
+            <number>24</number>
+           </property>
+           <property name="topMargin">
+            <number>24</number>
+           </property>
+           <property name="rightMargin">
+            <number>24</number>
+           </property>
+           <property name="bottomMargin">
+            <number>24</number>
+           </property>
+           <item>
+            <widget class="QLabel" name="graphics_heading">
+             <property name="text">
+              <string>Graphics</string>
+             </property>
+             <property name="wordWrap">
+              <bool>true</bool>
+             </property>
+             <property name="class" stdset="0">
+              <string notr="true">pageHeading</string>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="Gt7BrandBanner" name="graphics_brand_panel">
+             <property name="minimumSize">
+              <size>
+               <width>0</width>
+               <height>168</height>
+              </size>
+             </property>
+             <property name="maximumSize">
+              <size>
+               <width>16777215</width>
+               <height>168</height>
+              </size>
+             </property>
+             <layout class="QVBoxLayout" name="graphicsBrandLayout">
+              <property name="spacing">
+               <number>4</number>
+              </property>
+              <property name="leftMargin">
+               <number>20</number>
+              </property>
+              <property name="rightMargin">
+               <number>20</number>
+              </property>
+              <property name="topMargin">
+               <number>20</number>
+              </property>
+              <property name="bottomMargin">
+               <number>20</number>
+              </property>
+              <item>
+               <widget class="QLabel" name="graphics_brand_logo">
+                <property name="wordWrap">
+                 <bool>true</bool>
+                </property>
+                <property name="minimumSize">
+                 <size>
+                  <width>216</width>
+                  <height>72</height>
+                 </size>
+                </property>
+                <property name="maximumSize">
+                 <size>
+                  <width>216</width>
+                  <height>72</height>
+                 </size>
+                </property>
+               </widget>
+              </item>
+             </layout>
+            </widget>
+           </item>
+           <item>
+            <widget class="QCheckBox" name="gt7_dlss_checkbox">
+             <property name="text">
+              <string>PSSR 4K</string>
+             </property>
+             <property name="checked">
+              <bool>true</bool>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QCheckBox" name="external_fg_checkbox">
+             <property name="text">
+              <string>FG2X</string>
+             </property>
+             <property name="checked">
+              <bool>true</bool>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <spacer name="graphicsSpacer">
+             <property name="orientation">
+              <enum>Qt::Vertical</enum>
+             </property>
+             <property name="sizeHint" stdset="0">
+              <size>
+               <width>20</width>
+               <height>24</height>
+              </size>
+             </property>
+            </spacer>
+           </item>
+           <property name="spacing">
+            <number>16</number>
+           </property>
+          </layout>
+         </widget>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+     <widget class="QWidget" name="settings_page">
+      <layout class="QVBoxLayout" name="settingsLayout">
+       <property name="spacing">
+        <number>16</number>
+       </property>
+       <property name="leftMargin">
+        <number>24</number>
+       </property>
+       <property name="topMargin">
+        <number>24</number>
+       </property>
+       <property name="rightMargin">
+        <number>24</number>
+       </property>
+       <property name="bottomMargin">
+        <number>24</number>
+       </property>
+       <item>
+        <widget class="QLabel" name="settings_heading">
+         <property name="text">
+          <string>Settings</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+         <property name="class" stdset="0">
+          <string notr="true">pageHeading</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="settings_description">
+         <property name="text">
+          <string>Manage game folders, launcher and console language, user ID, and controller settings.</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item alignment="Qt::AlignLeft">
+        <widget class="QPushButton" name="settings_global_button">
+         <property name="text">
+          <string>General settings...</string>
+         </property>
+         <property name="autoDefault">
+          <bool>false</bool>
+         </property>
+         <property name="maximumSize">
+          <size>
+           <width>360</width>
+           <height>16777215</height>
+          </size>
+         </property>
+        </widget>
+       </item>
+       <item alignment="Qt::AlignLeft">
+        <widget class="QPushButton" name="settings_game_button">
+         <property name="text">
+          <string>Selected game settings...</string>
+         </property>
+         <property name="autoDefault">
+          <bool>false</bool>
+         </property>
+         <property name="maximumSize">
+          <size>
+           <width>360</width>
+           <height>16777215</height>
+          </size>
+         </property>
+        </widget>
+       </item>
+       <item alignment="Qt::AlignLeft">
+        <widget class="QPushButton" name="settings_input_button">
+         <property name="text">
+          <string>Controller and keyboard...</string>
+         </property>
+         <property name="autoDefault">
+          <bool>false</bool>
+         </property>
+         <property name="maximumSize">
+          <size>
+           <width>360</width>
+           <height>16777215</height>
+          </size>
+         </property>
+        </widget>
+       </item>
+       <item alignment="Qt::AlignLeft">
+        <widget class="QPushButton" name="settings_wheel_button">
+         <property name="text">
+          <string>Racing wheel...</string>
+         </property>
+         <property name="autoDefault">
+          <bool>false</bool>
+         </property>
+         <property name="maximumSize">
+          <size>
+           <width>360</width>
+           <height>16777215</height>
+          </size>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <spacer name="settingsSpacer">
+         <property name="orientation">
+          <enum>Qt::Vertical</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size>
+           <width>20</width>
+           <height>24</height>
+          </size>
+         </property>
+        </spacer>
+       </item>
+       <item>
+        <widget class="QLabel" name="label_settings_file">
+         <property name="text">
+          <string>Settings</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+     <widget class="QWidget" name="help_page">
+      <layout class="QVBoxLayout" name="helpLayout">
+       <property name="spacing">
+        <number>16</number>
+       </property>
+       <property name="leftMargin">
+        <number>24</number>
+       </property>
+       <property name="topMargin">
+        <number>24</number>
+       </property>
+       <property name="rightMargin">
+        <number>24</number>
+       </property>
+       <property name="bottomMargin">
+        <number>24</number>
+       </property>
+       <item>
+        <widget class="QLabel" name="help_heading">
+         <property name="text">
+          <string>Logs</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+         <property name="class" stdset="0">
+          <string notr="true">pageHeading</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <layout class="QVBoxLayout" name="verticalLayout_4">
+         <property name="spacing">
+          <number>12</number>
+         </property>
+         <property name="leftMargin">
+          <number>0</number>
+         </property>
+         <property name="topMargin">
+          <number>0</number>
+         </property>
+         <property name="rightMargin">
+          <number>0</number>
+         </property>
+         <property name="bottomMargin">
+          <number>0</number>
+         </property>
+        </layout>
+       </item>
+       <item>
+        <spacer name="helpSpacer">
+         <property name="orientation">
+          <enum>Qt::Vertical</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size>
+           <width>20</width>
+           <height>24</height>
+          </size>
+         </property>
+        </spacer>
+       </item>
+      </layout>
+     </widget>
     </widget>
    </item>
   </layout>
  </widget>
- <layoutdefault spacing="8" margin="11"/>
- <customwidgets><customwidget><class>ConfigurationListWidget</class><extends>QWidget</extends><header>configurationListWidget.h</header><container>1</container></customwidget></customwidgets>
- <resources/>
- <connections/>
+ <layoutdefault spacing="8" margin="11" />
+ <customwidgets>
+  <customwidget>
+   <class>ConfigurationListWidget</class>
+   <extends>QWidget</extends>
+   <header>configurationListWidget.h</header>
+   <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>Gt7BrandBanner</class>
+   <extends>QFrame</extends>
+   <header>gt7BrandBanner.h</header>
+   <container>1</container>
+  </customwidget>
+ </customwidgets>
+ <resources />
+ <connections />
 </ui>

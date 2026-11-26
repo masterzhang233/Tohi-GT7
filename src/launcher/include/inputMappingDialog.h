@@ -1,6 +1,7 @@
 #ifndef LAUNCHER_INCLUDE_INPUT_MAPPING_DIALOG_H_
 #define LAUNCHER_INCLUDE_INPUT_MAPPING_DIALOG_H_
 
+#include <QCoreApplication>
 #include <QDialog>
 #include <QStringList>
 
@@ -11,6 +12,8 @@ class QTreeWidgetItem;
 class QWidget;
 
 class InputMappingDialog final: public QDialog {
+	Q_DECLARE_TR_FUNCTIONS(InputMappingDialog)
+
 public:
 	explicit InputMappingDialog(const QStringList& mapping, QWidget* parent = nullptr);
 

@@ -1,0 +1,2 @@
+// CMake substitutes the source directory before passing this file to the resource compiler.
+1 ICON "@CMAKE_CURRENT_SOURCE_DIR@/icons/tohi-gt7.ico"

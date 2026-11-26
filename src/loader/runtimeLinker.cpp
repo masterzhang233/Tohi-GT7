@@ -994,6 +994,32 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	// Report whatever guest context can be read safely before terminating: which guest thread
 	// faulted, the register file, the faulting code bytes and the top of its stack.
 	{
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (info->type == Common::HostException::ExceptionType::AccessViolation) {
+			// Query the host before taking any guest-memory locks: a fault may itself occur
+			// during mapping work. Flush this evidence even if later guest diagnostics stall.
+			std::string mapping_report;
+			MEMORY_BASIC_INFORMATION mapping {};
+			const auto address = info->access_violation_vaddr;
+			if (VirtualQuery(reinterpret_cast<const void*>(address), &mapping, sizeof(mapping)) != 0) {
+				mapping_report += fmt::format(
+				    "fault host mapping: address={:#x} base={:#x} size={:#x} allocation={:#x} state={:#x} "
+				    "protect={:#x} allocation_protect={:#x} type={:#x}\n",
+				    address, reinterpret_cast<uintptr_t>(mapping.BaseAddress), mapping.RegionSize,
+				    reinterpret_cast<uintptr_t>(mapping.AllocationBase), mapping.State,
+				    mapping.Protect, mapping.AllocationProtect, mapping.Type);
+			}
+			MEMORYSTATUSEX memory_status {};
+			memory_status.dwLength = sizeof(memory_status);
+			if (GlobalMemoryStatusEx(&memory_status)) {
+				mapping_report += fmt::format("host memory at fault: available_physical={} available_commit={}\n",
+				                              memory_status.ullAvailPhys, memory_status.ullAvailPageFile);
+			}
+			std::fputs(mapping_report.c_str(), stdout);
+			std::fflush(stdout);
+			LOGF("%s", mapping_report.c_str());
+		}
+#endif
 		char thread_name[64] = "(host thread)";
 		if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
 			if (Libs::LibKernel::PthreadGetname(self, thread_name) != 0) {

@@ -580,6 +580,8 @@ bool ExportRunBundle(const QString& run_directory, const QString& zip_path, QStr
 	    {PreflightOutFile, SmallLogTail},    {PreflightErrFile, SmallLogTail},
 	    {EmulatorOutFile, ProcessLogTail},   {EmulatorErrFile, ProcessLogTail},
 	    {EmulatorMainFile, EmulatorLogTail},
+	    {"framegen-status.json", SmallLogTail}, {"framegen-host.log", SmallLogTail},
+	    {"framegen-core.log", SmallLogTail},
 	};
 	std::vector<ZipEntry> entries;
 	QStringList           truncated_names;

@@ -1,0 +1,34 @@
+Official Gran Turismo 7 launcher artwork
+
+Source page: https://www.gran-turismo.com/cn/products/gt7/
+Retrieved: 2026-11-26
+
+Files are preserved as supplied by the official website, without cropping or
+recompression. The launcher crops them only while painting its bounded banners.
+These are promotional assets, not emulator screenshots or performance evidence.
+Rights remain with Sony Interactive Entertainment / Polyphony Digital and their
+respective rights holders. The repository's GPL license does not cover them.
+
+Used in the launcher:
+
+gt7-official-logo.png (720 x 240, transparent PNG)
+  GT7 product-page header logo / official wordmark
+  https://www.gran-turismo.com/images/c/i18MlHW5DMRvFz.png
+
+gt7-super-gt.jpg (1920 x 1080, JPEG)
+  Official gallery: Super GT Racing; home-page racing banner
+  https://www.gran-turismo.com/images/c/i1RMDMnD8IhLSdB.jpg
+
+gt7-official-hero.jpg (1920 x 1080, JPEG)
+  Official product-page header background; graphics-page track banner
+  https://www.gran-turismo.com/images/c/i17yNgMRdd9L78c.jpg
+
+Reference assets retained, not compiled into the launcher:
+
+gt7-official-wordmark.svg
+  Official website navigation logo
+  https://www.gran-turismo.com/common/front/css/2025/assets/logo_gt7.svg
+
+gt7-porsche.jpg (1920 x 1080, JPEG)
+  Official gallery: Porsche on Track; prior compact-banner reference
+  https://www.gran-turismo.com/images/c/i1PnRlMxomU9kuH.jpg

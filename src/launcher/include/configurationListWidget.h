@@ -60,7 +60,7 @@ public slots:
 	void WriteSettings();
 	void ReadSettings();
 
-protected slots:
+public slots:
 
 	void edit_configuration();
 	void delete_configuartion();

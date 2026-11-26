@@ -133,6 +133,8 @@ QString KeyName(const QKeyEvent& event) {
 }
 
 class InputCaptureDialog final: public QDialog {
+	Q_DECLARE_TR_FUNCTIONS(InputCaptureDialog)
+
 public:
 	explicit InputCaptureDialog(QWidget* parent): QDialog(parent) {
 		setWindowTitle(tr("Set Binding"));
@@ -224,13 +226,16 @@ double ParseMouseSensitivity(const QStringList& mapping) {
 InputMappingDialog::InputMappingDialog(const QStringList& mapping, QWidget* parent)
     : QDialog(parent) {
 	setWindowTitle(tr("Input Mapping"));
-	resize(460, 650);
+	resize(560, 640);
 
 	auto* layout = new QVBoxLayout(this);
-	layout->addWidget(
-	    new QLabel(tr("Map keyboard or mouse buttons to DualSense controls.\n"
-	                  "Press F7 in-game to toggle mouse movement on the right stick."),
-	               this));
+	layout->setContentsMargins(20, 20, 20, 20);
+	layout->setSpacing(12);
+	auto* description = new QLabel(
+	    tr("Map keyboard or mouse buttons to DualSense controls.\n"
+	       "Press F7 in-game to toggle mouse movement on the right stick."), this);
+	description->setWordWrap(true);
+	layout->addWidget(description);
 
 	const auto parsed = ParseMapping(mapping);
 	m_custom_bindings = !parsed.isEmpty();

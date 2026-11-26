@@ -1,6 +1,10 @@
 <RCC>
  <qresource prefix="/icons">
   <file alias="check.svg">icons/check.svg</file>
+  <file alias="chevron-down-light.svg">icons/chevron-down-light.svg</file>
+  <file alias="chevron-down-dark.svg">icons/chevron-down-dark.svg</file>
+  <file alias="chevron-up-light.svg">icons/chevron-up-light.svg</file>
+  <file alias="chevron-up-dark.svg">icons/chevron-up-dark.svg</file>
   <file alias="edit-configuration.svg">icons/edit-configuration.svg</file>
   <file alias="global-settings.svg">icons/global-settings.svg</file>
   <file alias="input-mapping.svg">icons/input-mapping.svg</file>
@@ -12,6 +16,8 @@
   <file alias="launcher.qss">styles/launcher.qss</file>
  </qresource>
  <qresource prefix="/images">
-  <file alias="gt7-wallpaper.jpg">images/gt7-wallpaper.jpg</file>
+  <file alias="gt7-official-logo.png">images/gt7-official-logo.png</file>
+  <file alias="gt7-official-hero.jpg">images/gt7-official-hero.jpg</file>
+  <file alias="gt7-super-gt.jpg">images/gt7-super-gt.jpg</file>
  </qresource>
 </RCC>

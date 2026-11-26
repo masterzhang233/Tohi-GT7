@@ -10,39 +10,54 @@ Tohi-GT7 is the GT7 desktop fork maintained by `masterzhang233`, based on
 [usa-ratt/KytyPS5-GT7](https://github.com/usa-ratt/KytyPS5-GT7) and
 [KytyPS5](https://github.com/KytyPS5/KytyPS5). It retains the upstream emulator and its
 contributors' work, with a Chinese launcher, GT7 render profiles, native PSSR request
-handling through DLSS Super Resolution. The original emulator is based on
+handling through DLSS Super Resolution, and optional external 2X frame generation.
+The original emulator is based on
 [Kyty](https://github.com/InoriRus/Kyty).
 
 **[Downloads and update notes](https://github.com/masterzhang233/Tohi-GT7/releases)** ·
 **[Report a Tohi-GT7 issue](https://github.com/masterzhang233/Tohi-GT7/issues)**
 
-**[Current release: Tohi-GT7 1.0.4](https://github.com/masterzhang233/Tohi-GT7/releases/tag/v1.0.4).**
+**[Current release: Tohi-GT7 1.0.5](https://github.com/masterzhang233/Tohi-GT7/releases/tag/v1.0.5).**
 
 > [!IMPORTANT]
 > **This release supports only NVIDIA GeForce RTX 40 / 50 series GPUs.**
 > **本版本仅支持 NVIDIA GeForce RTX 40／50 系列显卡。** Other GPUs are outside this release's
 > support scope. Live testing used an **RTX 5080**, not every model in these series.
 
-The default graphics option uses **2560×1440 → 3840×2160 DLSS reconstruction**
-through GT7's native PSSR interface, with preset M. The 4K size is the reconstruction
-target; fullscreen display follows the desktop's physical resolution and uses
-Mailbox presentation. PC reconstruction uses the NVIDIA DLSS backend, not Sony's
-PSSR neural model. **NVIDIA FG/MFG and FSR frame generation are unavailable in
-1.0.4, and the added 30 FPS cap is removed.** Each presented game frame comes from
-an actual rendered frame after reconstruction; the release inserts no interpolated
-frames or their additional latency. This is not native 4K rendering or a latency benchmark.
+The default **PSSR 4K** option retains the 1.0.4 path: **2560×1440 → 3840×2160**
+reconstruction through GT7's native PSSR interface, using **NVIDIA DLSS Super Resolution,
+preset M** on PC. This does not run Sony's PSSR neural model. The 4K size is the reconstruction
+target; the fullscreen output follows the desktop's physical resolution and uses Mailbox
+presentation.
 
-This quality-focused preset retains more input detail than the earlier 1080p preset.
-Two RTX 5080 driving runs of the preceding 1440p SR-only test baseline confirmed
-consistent native DLSS evaluations with no logged spatial fallback. They are not
-repeat driving tests of the final FG-disabled release artifact. The player reported that slow motion disappeared
-and stutter was substantially reduced, with some minor stutter remaining. These
-observations do not establish constant FPS or zero stutter in all scenes.
-Version 1.0.4 retains the eight graphics, memory, timing and shader-cache changes
-selectively ported from the November 25 KytyPS5 mainline in 1.0.3. It preserves the
-GT7 background and dark/red launcher styling. See the
-[1.0.4 release notes](docs/RELEASE-1.0.4.zh-CN.md) and
-[native PSSR/DLSS notes](docs/NATIVE-PSSR-DLSS.md).
+Version 1.0.5 adds **FG2X**, enabled by default: a separate, reduced Magpie-derived component
+captures the completed game window through **Windows Graphics Capture (WGC)** and requests
+**DLSS frame generation at 2X with the Auto preset**. Auto is the requested setting, not a claim
+that a particular internal model has been verified. This capture-based path does not consume
+the game's native motion vectors or a separate HUD buffer. The emulator's older built-in
+NVIDIA/FSR frame-generation paths remain disabled, and no additional base-FPS cap is applied.
+Turn **FG2X** off to return to the 1.0.4 SR-only rendering path while keeping PSSR 4K enabled.
+
+The launcher now uses a square UWP-style layout with GT7 official imagery, consistent typography
+and scrollable secondary settings. Graphics contains just **PSSR 4K** and **FG2X**; **Logs**
+provides the log path, open-folder, copy-latest-path and diagnostic-export actions. The external
+component's Magpie settings window, toolbar and performance overlay are omitted. The launcher
+tracks actual generated-frame progress; RTSS can be used to observe post-generation presentation
+FPS. A bounded startup retry handles the specific pre-capture **MP error 45** window-unresponsive
+case without repeatedly restarting an established frame-generation session.
+
+An RTX 5080 game test observed approximately **31 captured FPS → 61 presented FPS**. This is
+one observed result, not a promised frame rate, a guarantee of continuous doubling, or an input
+latency measurement. **High-speed ghosting around car-window edges was reproduced in an
+FG on/off comparison and disappeared with FG disabled in that comparison.** It remains a known
+limitation of this release. Generated frames do not double game simulation or input response.
+
+Version 1.0.5 retains the eight graphics, memory, timing and shader-cache changes selectively
+ported from the November 25 KytyPS5 mainline in 1.0.3. This is not a new full mainline merge.
+See the [1.0.5 release notes](docs/RELEASE-1.0.5.zh-CN.md) and
+[native PSSR/DLSS notes](docs/NATIVE-PSSR-DLSS.md). Corresponding GPL source and build materials
+for the modified external component are supplied with the release assets; the emulator and
+external component retain their respective licenses.
 
 The earlier 1.0.2 release selectively ports timer-event deletion, HTile/depth-descriptor fixes,
 save-mount error handling, and font-writing advances/iteration from the November 6
@@ -84,7 +99,7 @@ and configuration locations are kept compatible with previous builds.
 
 > [!NOTE]
 > Start the Windows package through `launcher.exe` or `Start-GT7-Desktop.cmd` and follow the
-> [Tohi-GT7 1.0.4 release notes](docs/RELEASE-1.0.4.zh-CN.md).
+> [Tohi-GT7 1.0.5 release notes](docs/RELEASE-1.0.5.zh-CN.md).
 > [GT7 documentation](docs/GT7.md) also retains the upstream settings and change log
 > as historical context; they do not replace the current default DLSS preset.
 > In the game, use performance (frame rate) mode. Ray tracing (RT) is not recommended.
@@ -127,45 +142,43 @@ Community game test results are available in the
 ## Bugs and Issues
 
 Compatibility, stability, and performance can vary between versions. You may encounter crashes
-or graphical glitches, so please include the version you tested and whether **DLSS** was
-enabled when [reporting a Tohi-GT7 issue](https://github.com/masterzhang233/Tohi-GT7/issues).
+or graphical glitches, so please include the version you tested and whether **PSSR 4K** and
+**FG2X** were enabled when [reporting a Tohi-GT7 issue](https://github.com/masterzhang233/Tohi-GT7/issues).
 
-## Screenshots
+## Gran Turismo 7 Gallery
 
 <table align="center">
   <tr>
     <td align="center">
-      <strong>Astro Bot</strong><br>
-      <img src="docs/screenshots/ps5-01.png" width="300" alt="Astro Bot running in KytyPS5">
+      <strong>Super GT Racing</strong><br>
+      <a href="docs/screenshots/gt7-official/gt7-super-gt.jpg"><img src="docs/screenshots/gt7-official/gt7-super-gt.jpg" width="360" alt="Gran Turismo 7: Super GT race cars battling on track"></a>
     </td>
     <td align="center">
-      <strong>Dreaming Sarah</strong><br>
-      <img src="docs/screenshots/ps5-03.png" width="300" alt="Dreaming Sarah running in KytyPS5">
-    </td>
-  </tr>
-  <tr>
-    <td align="center">
-      <strong>Neptunia ReVerse</strong><br>
-      <img src="docs/screenshots/ps5-04.png" width="300" alt="Neptunia ReVerse running in KytyPS5">
-    </td>
-    <td align="center">
-      <strong>SILENT HILL: The Short Message</strong><br>
-      <img src="docs/screenshots/ps5-05.png" width="300" alt="SILENT HILL: The Short Message running in KytyPS5">
+      <strong>Tokyo Expressway at Night</strong><br>
+      <a href="docs/screenshots/gt7-official/gt7-tokyo-night.jpg"><img src="docs/screenshots/gt7-official/gt7-tokyo-night.jpg" width="360" alt="Gran Turismo 7: road cars racing through Tokyo Expressway at night"></a>
     </td>
   </tr>
   <tr>
     <td align="center">
-      <strong>Demon's Souls</strong><br>
-      <img src="docs/screenshots/ps5-02.png" width="300" alt="Demon's Souls running in KytyPS5">
+      <strong>Porsche on Track</strong><br>
+      <a href="docs/screenshots/gt7-official/gt7-porsche.jpg"><img src="docs/screenshots/gt7-official/gt7-porsche.jpg" width="360" alt="Gran Turismo 7: a Porsche race car with classic Porsches ahead"></a>
     </td>
     <td align="center">
-      <strong>UFC 6</strong><br>
-      <img src="docs/screenshots/ps5-06.jpg" width="300" alt="UFC 6 running in KytyPS5">
+      <strong>Nürburgring Karussell</strong><br>
+      <a href="docs/screenshots/gt7-official/gt7-nurburgring.jpg"><img src="docs/screenshots/gt7-official/gt7-nurburgring.jpg" width="360" alt="Gran Turismo 7: the banked Karussell corner at the Nürburgring"></a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <strong>Sunlit Mountain Racing</strong><br>
+      <a href="docs/screenshots/gt7-official/gt7-sunlit-race.jpg"><img src="docs/screenshots/gt7-official/gt7-sunlit-race.jpg" width="360" alt="Gran Turismo 7: race cars beneath sunlit mountains"></a>
+    </td>
+    <td align="center">
+      <strong>Wet-Weather Racing</strong><br>
+      <a href="docs/screenshots/gt7-official/gt7-wet-weather.jpg"><img src="docs/screenshots/gt7-official/gt7-wet-weather.jpg" width="360" alt="Gran Turismo 7: race cars navigating a wet circuit"></a>
     </td>
   </tr>
 </table>
-
-<p align="center"><em>And many more...</em></p>
 
 ## Contributing
 
@@ -215,11 +228,12 @@ the Vulkan/SPIR-V validation rules.
 
 ### System requirements
 
-The **Tohi-GT7 1.0.4 Windows release** requires an **NVIDIA GeForce RTX 40 / 50 series**
-GPU and a driver/runtime configuration accepted by NVIDIA DLSS Super Resolution.
-Its live validation used Windows and an RTX 5080. Other GPU families are unsupported
-for this release. The following are the underlying emulator's general source-build
-requirements, not a broader compatibility claim for the 1.0.4 package.
+The **Tohi-GT7 1.0.5 Windows release** requires an **NVIDIA GeForce RTX 40 / 50 series**
+GPU and a driver/runtime configuration accepted by NVIDIA DLSS Super Resolution and the
+external DLSS frame-generation component. The latter also requires Windows Graphics Capture.
+Live validation used Windows and an RTX 5080. Other GPU families are unsupported for this
+release. The following are the underlying emulator's general source-build requirements,
+not a broader compatibility claim for the 1.0.5 package.
 
 - Windows 10 version 1803, a current Linux distribution, or macOS on Apple Silicon
 - A 64-bit x86 processor (on macOS, an Apple Silicon processor with Rosetta 2)

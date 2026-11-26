@@ -26,7 +26,18 @@ if(LINUX)
 	target_link_libraries(launcher Qt6::DBus)
 endif()
 if(WIN32)
+	if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/icons/tohi-gt7.ico")
+		enable_language(RC)
+		# Use an absolute ICO path so rc.exe does not depend on its build working directory.
+		configure_file(launcher.rc "${CMAKE_CURRENT_BINARY_DIR}/launcher.rc" @ONLY)
+		target_sources(launcher PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/launcher.rc")
+	endif()
 target_link_libraries(launcher setupapi)
+endif()
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/icons/tohi-gt7.ico")
+	set(launcher_icon "${CMAKE_CURRENT_SOURCE_DIR}/icons/tohi-gt7.ico")
+	set_source_files_properties("${launcher_icon}" PROPERTIES QT_RESOURCE_ALIAS "tohi-gt7.ico")
+	qt_add_resources(launcher launcher_icon PREFIX "/icons" FILES "${launcher_icon}")
 endif()
 if (CLANG AND NOT KYTY_CLANG_CL)
 target_compile_options(launcher PRIVATE -frtti)
@@ -34,6 +45,11 @@ target_link_libraries(launcher pthread)
 endif()
 target_include_directories(launcher PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/src")
 set_target_properties(launcher PROPERTIES AUTOUIC ON AUTOMOC ON AUTORCC ON)
+# Keep form consumers dirty in the same incremental build that regenerates UIC headers.
+set_property(SOURCE src/mainDialog.cpp APPEND PROPERTY OBJECT_DEPENDS
+	"${CMAKE_CURRENT_SOURCE_DIR}/forms/main_dialog.ui")
+set_property(SOURCE src/configurationEditDialog.cpp APPEND PROPERTY OBJECT_DEPENDS
+	"${CMAKE_CURRENT_SOURCE_DIR}/forms/configuration_edit_dialog.ui")
 
 set(launcher_translation_source
 	"${CMAKE_CURRENT_SOURCE_DIR}/translations/launcher_zh_CN.ts")
@@ -95,6 +111,17 @@ if(BUILD_TESTING)
 		target_link_libraries(launcher_diagnostics_tests PRIVATE user32)
 	endif()
 	add_test(NAME launcher_diagnostics COMMAND $<TARGET_FILE:launcher_diagnostics_tests>)
+
+	add_executable(launcher_frame_generation_tests EXCLUDE_FROM_ALL
+		"${CMAKE_CURRENT_SOURCE_DIR}/tests/FrameGenerationControllerTests.cpp"
+		"${CMAKE_CURRENT_SOURCE_DIR}/src/frameGenerationController.cpp"
+		"${CMAKE_CURRENT_SOURCE_DIR}/include/frameGenerationController.h")
+	target_include_directories(launcher_frame_generation_tests PRIVATE
+		"${CMAKE_CURRENT_SOURCE_DIR}/include")
+	target_link_libraries(launcher_frame_generation_tests PRIVATE Qt6::Core)
+	set_target_properties(launcher_frame_generation_tests PROPERTIES AUTOMOC ON)
+	add_test(NAME launcher_frame_generation COMMAND $<TARGET_FILE:launcher_frame_generation_tests>)
+	set_tests_properties(launcher_frame_generation PROPERTIES TIMEOUT 30)
 endif()
 
 if(WIN32 AND NOT KYTY_CLANG_CL)

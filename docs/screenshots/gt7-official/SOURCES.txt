@@ -1,0 +1,33 @@
+Official Gran Turismo 7 gallery images
+
+Source page: https://www.gran-turismo.com/cn/products/gt7/
+Retrieved: 2026-11-26
+
+Original 1920 x 1080 JPEG files, preserved without cropping or recompression.
+These are official promotional images, not emulator captures or performance evidence.
+Image rights remain with Sony Interactive Entertainment / Polyphony Digital and
+the respective rights holders; the repository's GPL license does not apply to them.
+
+gt7-super-gt.jpg
+  Caption: Super GT Racing
+  Original: https://www.gran-turismo.com/images/c/i1RMDMnD8IhLSdB.jpg
+
+gt7-tokyo-night.jpg
+  Caption: Tokyo Expressway at Night
+  Original: https://www.gran-turismo.com/images/c/i17oFyJlwnfmI.jpg
+
+gt7-porsche.jpg
+  Caption: Porsche on Track
+  Original: https://www.gran-turismo.com/images/c/i1PnRlMxomU9kuH.jpg
+
+gt7-nurburgring.jpg
+  Caption: Nürburgring Karussell
+  Original: https://www.gran-turismo.com/images/c/i1qJX9bQZFMXh.jpg
+
+gt7-sunlit-race.jpg
+  Caption: Sunlit Mountain Racing
+  Original: https://www.gran-turismo.com/images/c/i1x3VZnN7fMmEC.jpg
+
+gt7-wet-weather.jpg
+  Caption: Wet-Weather Racing
+  Original: https://www.gran-turismo.com/images/c/i1n4shJqB1yFcb.jpg

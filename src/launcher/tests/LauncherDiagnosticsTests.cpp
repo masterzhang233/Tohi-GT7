@@ -89,6 +89,9 @@ int main(int argc, char** argv) {
 	                                            private_game_path.toUtf8() +
 	                                            QByteArray("/private-location\n")),
 	      "main emulator log fixture");
+	Check(WriteFile(QDir(run->Directory()).filePath(QStringLiteral("framegen-core.log")),
+	                QByteArray("FG error at ") + private_game_path.toUtf8()),
+	      "frame generation core log fixture");
 
 	const auto summary_data =
 	    ReadFile(QDir(run->Directory()).filePath(QStringLiteral("session.json")));
@@ -125,6 +128,8 @@ int main(int argc, char** argv) {
 	      "ZIP contains allow-listed diagnostics");
 	Check(zip.contains("main emulator diagnostic") && zip.contains("diagnostic-child-stderr"),
 	      "ZIP contains captured diagnostic text");
+	Check(zip.contains("framegen-core.log") && zip.contains("FG error at <redacted-path>"),
+	      "ZIP includes and redacts frame generation failures");
 	Check(zip.contains("<redacted-path>/private-location") &&
 	          !zip.contains(private_game_path.toUtf8()) && !zip.contains(".redact-paths"),
 	      "ZIP redacts private paths and excludes its private redaction sidecar");

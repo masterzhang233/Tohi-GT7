@@ -131,43 +131,38 @@ enabled when [reporting a Tohi-GT7 issue](https://github.com/masterzhang233/Tohi
 
 ## Gran Turismo 7 Gallery
 
-Official images from the [Gran Turismo 7 website](https://www.gran-turismo.com/cn/products/gt7/).
-These are promotional images, not captures from Tohi-GT7. Click an image to view it at full size.
-
 <table align="center">
   <tr>
     <td align="center">
       <strong>Super GT Racing</strong><br>
-      <a href="docs/screenshots/gt7-official/gt7-super-gt.jpg"><img src="docs/screenshots/gt7-official/gt7-super-gt.jpg" width="360" alt="Official Gran Turismo 7 image of Super GT race cars battling on track"></a>
+      <a href="docs/screenshots/gt7-official/gt7-super-gt.jpg"><img src="docs/screenshots/gt7-official/gt7-super-gt.jpg" width="360" alt="Gran Turismo 7: Super GT race cars battling on track"></a>
     </td>
     <td align="center">
       <strong>Tokyo Expressway at Night</strong><br>
-      <a href="docs/screenshots/gt7-official/gt7-tokyo-night.jpg"><img src="docs/screenshots/gt7-official/gt7-tokyo-night.jpg" width="360" alt="Official Gran Turismo 7 image of road cars racing through Tokyo Expressway at night"></a>
+      <a href="docs/screenshots/gt7-official/gt7-tokyo-night.jpg"><img src="docs/screenshots/gt7-official/gt7-tokyo-night.jpg" width="360" alt="Gran Turismo 7: road cars racing through Tokyo Expressway at night"></a>
     </td>
   </tr>
   <tr>
     <td align="center">
       <strong>Porsche on Track</strong><br>
-      <a href="docs/screenshots/gt7-official/gt7-porsche.jpg"><img src="docs/screenshots/gt7-official/gt7-porsche.jpg" width="360" alt="Official Gran Turismo 7 image of a Porsche race car with classic Porsches ahead"></a>
+      <a href="docs/screenshots/gt7-official/gt7-porsche.jpg"><img src="docs/screenshots/gt7-official/gt7-porsche.jpg" width="360" alt="Gran Turismo 7: a Porsche race car with classic Porsches ahead"></a>
     </td>
     <td align="center">
       <strong>Nürburgring Karussell</strong><br>
-      <a href="docs/screenshots/gt7-official/gt7-nurburgring.jpg"><img src="docs/screenshots/gt7-official/gt7-nurburgring.jpg" width="360" alt="Official Gran Turismo 7 image of the banked Karussell corner at the Nürburgring"></a>
+      <a href="docs/screenshots/gt7-official/gt7-nurburgring.jpg"><img src="docs/screenshots/gt7-official/gt7-nurburgring.jpg" width="360" alt="Gran Turismo 7: the banked Karussell corner at the Nürburgring"></a>
     </td>
   </tr>
   <tr>
     <td align="center">
       <strong>Sunlit Mountain Racing</strong><br>
-      <a href="docs/screenshots/gt7-official/gt7-sunlit-race.jpg"><img src="docs/screenshots/gt7-official/gt7-sunlit-race.jpg" width="360" alt="Official Gran Turismo 7 image of race cars beneath sunlit mountains"></a>
+      <a href="docs/screenshots/gt7-official/gt7-sunlit-race.jpg"><img src="docs/screenshots/gt7-official/gt7-sunlit-race.jpg" width="360" alt="Gran Turismo 7: race cars beneath sunlit mountains"></a>
     </td>
     <td align="center">
       <strong>Wet-Weather Racing</strong><br>
-      <a href="docs/screenshots/gt7-official/gt7-wet-weather.jpg"><img src="docs/screenshots/gt7-official/gt7-wet-weather.jpg" width="360" alt="Official Gran Turismo 7 image of race cars navigating a wet circuit"></a>
+      <a href="docs/screenshots/gt7-official/gt7-wet-weather.jpg"><img src="docs/screenshots/gt7-official/gt7-wet-weather.jpg" width="360" alt="Gran Turismo 7: race cars navigating a wet circuit"></a>
     </td>
   </tr>
 </table>
-
-<p align="center"><em>Image rights belong to Sony Interactive Entertainment / Polyphony Digital. <a href="docs/screenshots/gt7-official/SOURCES.txt">Image sources</a></em></p>
 
 ## Contributing
 

@@ -129,42 +129,45 @@ Compatibility, stability, and performance can vary between versions. You may enc
 or graphical glitches, so please include the version you tested and whether **DLSS** was
 enabled when [reporting a Tohi-GT7 issue](https://github.com/masterzhang233/Tohi-GT7/issues).
 
-## Screenshots
+## Gran Turismo 7 Gallery
+
+Official images from the [Gran Turismo 7 website](https://www.gran-turismo.com/cn/products/gt7/).
+These are promotional images, not captures from Tohi-GT7. Click an image to view it at full size.
 
 <table align="center">
   <tr>
     <td align="center">
-      <strong>Astro Bot</strong><br>
-      <img src="docs/screenshots/ps5-01.png" width="300" alt="Astro Bot running in KytyPS5">
+      <strong>Super GT Racing</strong><br>
+      <a href="docs/screenshots/gt7-official/gt7-super-gt.jpg"><img src="docs/screenshots/gt7-official/gt7-super-gt.jpg" width="360" alt="Official Gran Turismo 7 image of Super GT race cars battling on track"></a>
     </td>
     <td align="center">
-      <strong>Dreaming Sarah</strong><br>
-      <img src="docs/screenshots/ps5-03.png" width="300" alt="Dreaming Sarah running in KytyPS5">
-    </td>
-  </tr>
-  <tr>
-    <td align="center">
-      <strong>Neptunia ReVerse</strong><br>
-      <img src="docs/screenshots/ps5-04.png" width="300" alt="Neptunia ReVerse running in KytyPS5">
-    </td>
-    <td align="center">
-      <strong>SILENT HILL: The Short Message</strong><br>
-      <img src="docs/screenshots/ps5-05.png" width="300" alt="SILENT HILL: The Short Message running in KytyPS5">
+      <strong>Tokyo Expressway at Night</strong><br>
+      <a href="docs/screenshots/gt7-official/gt7-tokyo-night.jpg"><img src="docs/screenshots/gt7-official/gt7-tokyo-night.jpg" width="360" alt="Official Gran Turismo 7 image of road cars racing through Tokyo Expressway at night"></a>
     </td>
   </tr>
   <tr>
     <td align="center">
-      <strong>Demon's Souls</strong><br>
-      <img src="docs/screenshots/ps5-02.png" width="300" alt="Demon's Souls running in KytyPS5">
+      <strong>Porsche on Track</strong><br>
+      <a href="docs/screenshots/gt7-official/gt7-porsche.jpg"><img src="docs/screenshots/gt7-official/gt7-porsche.jpg" width="360" alt="Official Gran Turismo 7 image of a Porsche race car with classic Porsches ahead"></a>
     </td>
     <td align="center">
-      <strong>UFC 6</strong><br>
-      <img src="docs/screenshots/ps5-06.jpg" width="300" alt="UFC 6 running in KytyPS5">
+      <strong>Nürburgring Karussell</strong><br>
+      <a href="docs/screenshots/gt7-official/gt7-nurburgring.jpg"><img src="docs/screenshots/gt7-official/gt7-nurburgring.jpg" width="360" alt="Official Gran Turismo 7 image of the banked Karussell corner at the Nürburgring"></a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <strong>Sunlit Mountain Racing</strong><br>
+      <a href="docs/screenshots/gt7-official/gt7-sunlit-race.jpg"><img src="docs/screenshots/gt7-official/gt7-sunlit-race.jpg" width="360" alt="Official Gran Turismo 7 image of race cars beneath sunlit mountains"></a>
+    </td>
+    <td align="center">
+      <strong>Wet-Weather Racing</strong><br>
+      <a href="docs/screenshots/gt7-official/gt7-wet-weather.jpg"><img src="docs/screenshots/gt7-official/gt7-wet-weather.jpg" width="360" alt="Official Gran Turismo 7 image of race cars navigating a wet circuit"></a>
     </td>
   </tr>
 </table>
 
-<p align="center"><em>And many more...</em></p>
+<p align="center"><em>Image rights belong to Sony Interactive Entertainment / Polyphony Digital. <a href="docs/screenshots/gt7-official/SOURCES.txt">Image sources</a></em></p>
 
 ## Contributing
 
